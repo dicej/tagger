@@ -200,16 +200,17 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
 
     for path in obsolete.iter() {
         info!("delete {}", path);
-        let lock = lock(conn)?;
-        let mut stmt = lock.prepare("SELECT hash from paths WHERE path = ?1")?;
+        let mut lock = lock(conn)?;
+        let transaction = lock.transaction()?;
+        let mut stmt = transaction.prepare("SELECT hash from paths WHERE path = ?1")?;
         if let Some(hash) = stmt.query_map(&[path], |row| row.get::<_, String>(0))?
             .filter_map(Result::ok)
             .next()
         {
-            lock.execute("DELETE FROM paths WHERE path = ?1", &[path])?;
-            let mut stmt = lock.prepare("SELECT 1 from paths WHERE hash = ?1")?;
+            transaction.execute("DELETE FROM paths WHERE path = ?1", &[path])?;
+            let mut stmt = transaction.prepare("SELECT 1 from paths WHERE hash = ?1")?;
             if let None = stmt.query_map(&[path], |_| ())?.next() {
-                lock.execute("DELETE FROM images WHERE hash = ?1", &[&hash])?;
+                transaction.execute("DELETE FROM images WHERE hash = ?1", &[&hash])?;
             }
             drop(stmt);
         }
@@ -265,10 +266,32 @@ fn state(conn: &Arc<Mutex<Connection>>) -> Result<Value, Error> {
     Ok(Value::Object(map))
 }
 
-fn apply(_conn: &Arc<Mutex<Connection>>, _patch: Value) -> Result<(), Error> {
-    Err(format_err!(
-        "todo: add and/or remove tags according to patch content"
-    ))
+fn apply(conn: &Arc<Mutex<Connection>>, patch: Value) -> Result<(), Error> {
+    let hash = patch["hash"]
+        .as_str()
+        .ok_or_else(|| format_err!("hash not found in {}", patch))?;
+
+    let tag = patch["tag"]
+        .as_str()
+        .ok_or_else(|| format_err!("tag not found in {}", patch))?;
+
+    match patch["action"].as_str() {
+        Some("add") => lock(conn)?
+            .execute(
+                "INSERT INTO tags (hash, tag) VALUES (?1, ?2)",
+                &[&hash, &tag],
+            )
+            .map(drop)
+            .map_err(Error::from),
+        Some("remove") => lock(conn)?
+            .execute(
+                "DELETE FROM tags WHERE hash = ?1 AND tag = ?2",
+                &[&hash, &tag],
+            )
+            .map(drop)
+            .map_err(Error::from),
+        _ => Err(format_err!("missing or unexpected action in {}", patch)),
+    }
 }
 
 fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<Vec<u8>, Error> {
