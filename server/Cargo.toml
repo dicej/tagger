@@ -1,0 +1,18 @@
+[package]
+name = "server"
+version = "0.1.0"
+authors = ["Joel Dice <joel.dice@gmail.com>"]
+
+[dependencies]
+rusqlite = { version = "*", features = ["bundled"] }
+failure = "*"
+serde_json = "*"
+hyper = "*"
+env_logger = "*"
+log = "*"
+mime = "*"
+chrono = "*"
+rexiv2 = "0.5.0"
+regex = "*"
+sha2 = "*"
+futures = "*"
