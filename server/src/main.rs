@@ -1,4 +1,4 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 
 extern crate chrono;
 extern crate env_logger;
@@ -35,7 +35,7 @@ use rusqlite::Connection;
 use rexiv2::Metadata;
 use regex::Regex;
 use sha2::{Digest, Sha256};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use hyper::{Get, Post, Request, Response, StatusCode};
 use hyper::server::{Http, Service};
 use hyper::header::{ContentLength, ContentType};
@@ -63,31 +63,29 @@ fn open(state_file: &str) -> Result<Connection, Error> {
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS paths (
-                    path      TEXT NOT NULL PRIMARY KEY,
-                    hash      TEXT NOT NULL
-                  )",
+           path      TEXT NOT NULL PRIMARY KEY,
+           hash      TEXT NOT NULL
+         )",
         &[],
     )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS images (
-                    hash      TEXT NOT NULL PRIMARY KEY,
-                    datetime  TEXT NOT NULL,
-                    thumbnail BLOB,
-
-                    FOREIGN KEY (hash) REFERENCES paths(hash) ON DELETE CASCADE
-                  )",
+           hash      TEXT NOT NULL PRIMARY KEY,
+           datetime  TEXT NOT NULL,
+           thumbnail BLOB
+         )",
         &[],
     )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tags (
-                    hash      TEXT NOT NULL,
-                    tag       TEXT NOT NULL,
+           hash      TEXT NOT NULL,
+           tag       TEXT NOT NULL,
 
-                    PRIMARY KEY (hash, tag),
-                    FOREIGN KEY (hash) REFERENCES images(hash) ON DELETE CASCADE
-                  )",
+           PRIMARY KEY (hash, tag),
+           FOREIGN KEY (hash) REFERENCES images(hash) ON DELETE CASCADE
+         )",
         &[],
     )?;
 
@@ -124,6 +122,7 @@ fn find_new<P: AsRef<Path>>(
     dir: P,
     pattern: &Regex,
 ) -> Result<(), Error> {
+    let dir_buf = dir.as_ref().to_path_buf();
     for entry in read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -131,28 +130,28 @@ fn find_new<P: AsRef<Path>>(
             if let Some(name) = entry.file_name().to_str() {
                 let lowercase = name.to_lowercase();
                 if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
-                    if let Some(datetime) = Metadata::new_from_path(&path)
-                        .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
-                        .ok()
-                        .and_then(|s| {
-                            pattern.captures(&s).map(|c| {
-                                format!(
-                                    "{}-{}-{} {}:{}:{}",
-                                    &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
-                                )
-                            })
-                        }) {
-                        let path = PathBuf::from(name);
-                        let path = path.strip_prefix(root)?
-                            .to_str()
-                            .ok_or_else(|| format_err!("bad utf8"))?;
-                        let lock = lock(conn)?;
-                        let mut stmt = lock.prepare("SELECT true from paths WHERE path = ?1")?;
-                        if let None = stmt.query_map(&[&path], |_| ())?.next() {
+                    let utf = || format_err!("bad utf8");
+                    let mut path = dir_buf.clone();
+                    path.push(name);
+                    let path = path.strip_prefix(root)?.to_str().ok_or_else(utf)?;
+                    let lock = lock(conn)?;
+                    let mut stmt = lock.prepare("SELECT 1 from paths WHERE path = ?1")?;
+                    if let None = stmt.query_map(&[&path], |_| ())?.next() {
+                        if let Some(datetime) = Metadata::new_from_path(&path)
+                            .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
+                            .ok()
+                            .and_then(|s| {
+                                pattern.captures(&s).map(|c| {
+                                    format!(
+                                        "{}-{}-{} {}:{}:{}",
+                                        &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
+                                    )
+                                })
+                            }) {
                             result.push((path.to_string(), datetime))
                         }
-                        drop(stmt);
                     }
+                    drop(stmt);
                 }
             }
         } else if path.is_dir() {
@@ -201,7 +200,20 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
 
     for path in obsolete.iter() {
         info!("delete {}", path);
-        lock(conn)?.execute("DELETE FROM paths WHERE path = ?1", &[path])?;
+        let lock = lock(conn)?;
+        let mut stmt = lock.prepare("SELECT hash from paths WHERE path = ?1")?;
+        if let Some(hash) = stmt.query_map(&[path], |row| row.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .next()
+        {
+            lock.execute("DELETE FROM paths WHERE path = ?1", &[path])?;
+            let mut stmt = lock.prepare("SELECT 1 from paths WHERE hash = ?1")?;
+            if let None = stmt.query_map(&[path], |_| ())?.next() {
+                lock.execute("DELETE FROM images WHERE hash = ?1", &[&hash])?;
+            }
+            drop(stmt);
+        }
+        drop(stmt);
     }
 
     info!(
@@ -215,29 +227,42 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
 }
 
 fn state(conn: &Arc<Mutex<Connection>>) -> Result<Value, Error> {
-    let mut value = Value::Null;
+    let mut map = Map::new();
     let lock = lock(conn)?;
-    let mut stmt = lock
-    .prepare("SELECT (i.hash, i.datetime, t.tag) FROM images AS i LEFT JOIN tags AS t WHERE i.hash == t.hash")?;
+    let mut stmt = lock.prepare(
+        "SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash",
+    )?;
     for (hash, datetime, tag) in stmt.query_map(&[], |row| {
-        (row.get::<_, String>(0), row.get(1), row.get::<_, String>(2))
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, Option<String>>(2),
+        )
     })?
         .filter_map(Result::ok)
     {
-        value[&hash]["datetime"] = Value::String(datetime);
-        let tags = &mut value[&hash]["tags"];
-        let found = if let Some(v) = tags.as_array_mut() {
-            v.push(Value::String(tag.clone()));
-            true
+        let found = if let Some(&mut Value::Object(ref mut map)) = map.get_mut(&hash) {
+            if let Some(&mut Value::Array(ref mut tags)) = map.get_mut("tags") {
+                tags.extend(tag.iter().cloned().map(Value::String));
+                true
+            } else {
+                unimplemented!()
+            }
         } else {
             false
         };
 
         if !found {
-            *tags = json!([Value::String(tag)]);
+            map.insert(
+                hash,
+                json!({
+                    "datetime": datetime,
+                    "tags": tag.iter().collect::<Vec<_>>(),
+                }),
+            );
         }
     }
-    Ok(value)
+    Ok(Value::Object(map))
 }
 
 fn apply(_conn: &Arc<Mutex<Connection>>, _patch: Value) -> Result<(), Error> {
@@ -345,39 +370,39 @@ fn handle(
     }
 }
 
-struct Server {
-    conn: Arc<Mutex<Connection>>,
-    image_dir: Rc<String>,
-    public_dir: Rc<String>,
-}
-
-impl Service for Server {
-    type Request = Request;
-    type Response = Response;
-    type Error = hyper::Error;
-    type Future = Box<Future<Item = Response, Error = hyper::Error>>;
-
-    fn call(&self, req: Request) -> Self::Future {
-        Box::new(
-            handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
-                error!("request error: {:?}", e);
-                let response = format!("{:?}", e);
-                Box::new(ok(Response::new()
-                    .with_status(StatusCode::InternalServerError)
-                    .with_header(ContentLength(response.len() as u64))
-                    .with_header(ContentType::plaintext())
-                    .with_body(response)))
-            }),
-        )
-    }
-}
-
 fn serve(
     conn: &Arc<Mutex<Connection>>,
     address: &str,
     image_dir: &str,
     public_dir: &str,
 ) -> Result<(), Error> {
+    struct Server {
+        conn: Arc<Mutex<Connection>>,
+        image_dir: Rc<String>,
+        public_dir: Rc<String>,
+    }
+
+    impl Service for Server {
+        type Request = Request;
+        type Response = Response;
+        type Error = hyper::Error;
+        type Future = Box<Future<Item = Response, Error = hyper::Error>>;
+
+        fn call(&self, req: Request) -> Self::Future {
+            Box::new(
+                handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
+                    error!("request error: {:?}", e);
+                    let response = format!("{:?}", e);
+                    Box::new(ok(Response::new()
+                        .with_status(StatusCode::InternalServerError)
+                        .with_header(ContentLength(response.len() as u64))
+                        .with_header(ContentType::plaintext())
+                        .with_body(response)))
+                }),
+            )
+        }
+    }
+
     let conn = conn.clone();
     let image_dir = Rc::new(image_dir.to_string());
     let public_dir = Rc::new(public_dir.to_string());
