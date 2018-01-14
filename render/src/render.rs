@@ -3,6 +3,8 @@ mod dom {
         fn set_attribute(&self, name: &str, value: &str);
 
         fn append_child(&self, child: &Element);
+
+        fn remove_child(&self, child: &Element);
     }
 
     pub trait TextNode {
@@ -20,14 +22,18 @@ mod dom {
     }
 }
 
-trait Update<D: dom::Document, S, M> {
+trait Update<S> {
     fn update(&mut self, _state: &S) {
         // ignore
     }
 }
 
+trait Remove {
+    fn remove(&mut self);
+}
+
 pub trait Node<S, M> {
-    fn render<D: dom::Document>(&self, document: &D; parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>>;
+    fn add<D: dom::Document>(&self, document: &D; parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>;
 }
 
 pub trait Value<S> {
@@ -57,9 +63,9 @@ impl<S, M> Element<S, M> {
 }
 
 impl<S, M> Node for Element<S, M> {
-    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+    fn add<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let element = document.create_element(&self.name);
-        let children = self.children.iter().filter_map(|n| n.render(element, state)).collect::<Vec<_>>();
+        let children = self.children.iter().filter_map(|n| n.add(document, element, state).0).collect::<Vec<_>>();
         for handler in self.handlers.iter() {
             handler.attach(&element);
         }
@@ -67,23 +73,37 @@ impl<S, M> Node for Element<S, M> {
 
         struct MyUpdate {
             element: D::Element,
-            children: Vec<Box<Update<D, S, M>>>,
+            children: Vec<Box<Update<S>>>,
         }
 
-        impl Update<D, S, M> for MyUpdate {
+        impl Update<S> for MyUpdate {
             fn update(&mut self, state: &S) {
                 self.children.for_each(|u| u.update(state))
             }            
         }
+
+        struct MyRemove {
+            parent: D::Element,
+            element: D::Element,
+        }
+
+        impl Remove for MyRemove {
+            fn remove(&mut self) {
+                self.parent.remove_child(self.element);
+            }
+        }
         
-        if children.is_empty() {
+        (if children.is_empty() {
             None
         } else {
             Some(Box::new(MyUpdate {
                 element: element.clone(),
                 children
             }))
-        }
+        }, Some(Box::new(MyRemove {
+            parent: parent.clone(),
+            element: element.clone(),
+        })))
     }
 }
 
@@ -97,7 +117,7 @@ pub struct Attribute<S, V: Value<S>> {
 }
 
 impl<S, M, V: Value<S>> Node<S, M> for Attribute<S, V> {
-    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+    fn add<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let (text, render) = self.value.render(state);
         parent.set_attribute(&self.name, &text);
 
@@ -107,7 +127,7 @@ impl<S, M, V: Value<S>> Node<S, M> for Attribute<S, V> {
             render: V::R<S>,
         }
 
-        impl Update<D, S, M> for MyUpdate {
+        impl Update<S> for MyUpdate {
             fn update(&mut self, state: &S) {
                 text = self.render.render(state);
                 if text != self.text {
@@ -117,15 +137,29 @@ impl<S, M, V: Value<S>> Node<S, M> for Attribute<S, V> {
             }
         }
 
-        if let Some(render) = render {
-            Some(MyUpdate {
+        struct MyRemove {
+            parent: D::Element,
+            name: Rc<String>,
+        }
+
+        impl Remove for MyRemove {
+            fn remove(&mut self) {
+                self.parent.remove_attribute(self.name);
+            }
+        }
+
+        (if let Some(render) = render {
+            Some(Box::new(MyUpdate {
                 name: self.name.clone(),
                 text,
                 render
-            })
+            }))
         } else {
             None
-        }
+        }, Some(Box::new(MyRemove {
+            parent: parent.clone(),
+            name: name.clone();
+        })))
     }    
 }
 
@@ -153,10 +187,26 @@ pub fn attribute<S, T: ToValue<S>>(name: &str, value: T) -> Box<Node<S, M>> {
 }
 
 impl<S, M> Node<S, M> for String {
-    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
-        parent.append_child(document.create_text_node(&self.0));
+    fn add<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>)  {
+        let node = document.create_text_node(&self.0);
+        parent.append_child(&node);
 
-        None
+        struct MyRemove {
+            parent: D::Element,
+            node: D::TextNode,
+        }
+
+        impl Remove for MyRemove {
+            fn remove(&mut self) {
+                self.parent.remove_child(&self.node);
+            }
+        }
+
+        (None,
+         Some(Box::new(MyRemove {
+             parent: parent.clone(),
+             node: node.clone(),
+         })))
     }
 }
 
@@ -189,12 +239,12 @@ impl<S, T: ToString> ToValue<S> for T {
 }
 
 impl<S, M, T: ToString, F: Fn(S) -> T> Node<S, M> for Rc<F> {
-    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+    fn add<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let text = self(state).to_string();
         let node = document.create_text_node(&text);
         parent.append_child(&node);
 
-        struct MyUpdate {
+        struct Tracker {
             text: String,
             document: D,
             parent: D::Element,
@@ -202,26 +252,36 @@ impl<S, M, T: ToString, F: Fn(S) -> T> Node<S, M> for Rc<F> {
             function: Rc<F>
         }
 
-        impl Update<D, S, M> for MyUpdate {
+        impl Update<S> for Rc<RefCell<Tracker>> {
             fn update(&mut self, state: &S) {
-                let text = self.function(state).to_string();
-                if text != self.text {
-                    self.parent.remove_child(&self.node);
-                    let node = self.document.create_text_node(&text);
-                    self.parent.append_child(&node);
-                    self.text = text;
-                    self.node = node;
+                let t = self.borrow_mut();
+                let text = t.function(state).to_string();
+                if text != t.text {
+                    t.parent.remove_child(&t.node);
+                    let node = t.document.create_text_node(&text);
+                    t.parent.append_child(&node);
+                    t.text = text;
+                    t.node = node;
                 }
             }            
         }
 
-        Some(Box::new(MyUpdate {
+        impl Remove for Rc<RefCell<Tracker>> {
+            fn remove(&mut self) {
+                let t = self.borrow();
+                t.parent.remove_child(&t.node);
+            }
+        }
+
+        let tracker = Rc::new(Tracker {
             text,
             parent: parent.clone(),
             document: document.clone(),
             element,
             function: self.clone(),
-        }))
+        });
+        
+        (Some(Box::new(tracker.clone())), Some(Box::new(tracker)))
     }    
 }
 
@@ -269,17 +329,17 @@ impl<S, SubS, M, F: Fn(S) -> SubS, N: Node<SubS, M>> ToNode<S, M> for Apply<S, S
 }
 
 impl<S, SubS, M, F: Fn(&S) -> SubS> Node<S, M> for Apply<S, SubS, M, F> {
-    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+    fn add<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let substate = self.function(state);
-        let update = self.node.render(document, parent, &substate);
+        let (update, remove) = self.node.add(document, parent, &substate);
 
         struct MyUpdate {
             substate: SubS;
-            update: Box<Update<D, SubS, M>>;
+            update: Box<Update<SubS>>;
             function: Rc<F>,
         }
 
-        impl Update<D, S, M> for MyUpdate {
+        impl Update<S> for MyUpdate {
             fn update(&mut self, state: &S) {
                 let substate = self.function(state);
                 if self.substate != substate {
@@ -289,11 +349,11 @@ impl<S, SubS, M, F: Fn(&S) -> SubS> Node<S, M> for Apply<S, SubS, M, F> {
             }            
         }
         
-        update.map(|update| Box::new(MyUpdate {
+        (update.map(|update| Box::new(MyUpdate {
             substate,
             update,
             function: function.clone(),
-        }))
+        })), remove)
     }
 }
 
@@ -326,37 +386,46 @@ impl<S, K: Ord, V, SubS: Diff<K, V>>, M, F: Fn(S) -> SubS, N: Node<V, M>> ToNode
 }
 
 impl<S, K: Ord, V, SubS: Diff<K, V>>, M, F: Fn(S) -> SubS, N: Node<V, M>> Node<S, M> for ApplyAll<S, K, V, SubS, M, F> {
-    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+    fn add<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<S>>> {
         let substate = self.function(state);
-        let updates = substate.iter().map(|(k, v)| (k, (v, self.node.render(document, parent, &v)))).collect::BTreeMap<_>();
+        let map = substate.iter().map(|(k, v)| (k, (v, self.node.add(document, parent, &v)))).collect::BTreeMap<_>();
 
-        struct MyUpdate {
+        struct Tracker {
             node: Rc<N>
             substate: SubS;
-            updates: BTreeMap<K, (V, Option<Box<Update<D, SubS, M>>>)>;
+            map: BTreeMap<K, (V, (Option<Box<Update<SubS>>>, Option<Box<Remove>>))>;
             function: Rc<F>
         }
 
-        impl Update<D, S, M> for MyUpdate {
+        impl Update<S> for Rc<RefCell<Tracker>> {
             fn update(&mut self, state: &S) {
-                let substate = self.function(state);
-                self.substate.diff(&substate).for_each(|event| match event {
-                    Add(k, v) => self.updates.insert(k, (v, self.node.render(document, parent, &v)));, 
-                    Update(k, v) => if let Entry::Occupied(e) = self.updates.entry(&k) {
-                        let (old, update) = e.get_mut();
+                let t = self.borrow_mut();
+                let substate = t.function(state);
+                t.substate.diff(&substate).for_each(|event| match event {
+                    Add(k, v) => t.map.insert(k, (v, t.node.add(document, parent, &v)));, 
+                    Update(k, v) => if let Entry::Occupied(e) = t.map.entry(&k) {
+                        let (old, (update, _)) = e.get_mut();
                         update.map(|u| u.update(v));
                         *old = v;
                     },
-                    Remove(k) => todo(), // how do we do this?  Might need to have render return both and Option<Box<Update>> and an Option<Box<Remove>>
+                    Remove(k) => t.map.remove().map(|(k, (_, (_, remove)))| remove.map(|r| r.remove())),
                 });
-                self.substate = substate;
+                t.substate = substate;
             }            
         }
 
-        Some(Box::new(MyUpdate {
+        impl Remove for Rc<RefCell<Tracker>> {
+            fn remove(&mut self) {
+                self.borrow_mut().iter().for_each(|(_, (_, (_, remove)))| remove.map(|r| r.remove()));
+            }
+        }
+        
+        let tracker = Rc::new(Tracker {
             substate,
             updates,
             function: function.clone(),
-        }))
+        });
+        
+        (Some(Box::new(tracker.clone())), Some(Box::new(tracker)))
     }
 }
