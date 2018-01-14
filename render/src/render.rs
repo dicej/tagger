@@ -1,5 +1,3 @@
-// todo: reduce boxiness
-
 mod dom {
     pub trait Element {
         fn set_attribute(&self, name: &str, value: &str);
@@ -163,10 +161,16 @@ impl<S, M> Node<S, M> for String {
 }
 
 impl<S> Value<S> for String {
-    type Render = String;
+    type Render = ();
     
     fn render(&self, _state: &S) -> (String, Option<Self::Render>) {
         (self.clone(), None)
+    }
+}
+
+impl<S> Render<S> for () {
+    fn render(&self, _state: &S) -> String {
+        unimplemented!()
     }
 }
 
@@ -222,7 +226,7 @@ impl<S, M, T: ToString, F: Fn(S) -> T> Node<S, M> for Rc<F> {
 }
 
 impl<S, T: ToString, F: Fn(S) -> T> Value<S> for Rc<F> {
-    type Render = Rc<F>;
+    type Render = Self;
     
     fn render(&self, state: &S) -> (String, Option<Self::Render>>) {
         (self(state).to_string(), Some(self.clone()))
@@ -243,10 +247,116 @@ impl<S, T: ToString, F: Fn(S) -> T> ToValue<S> for T {
     }
 }
 
-impl<S, M, T: ToString, F: Fn(S) -> T> ToNode<S, M> for F {
+impl<S, M, T: ToString, F: Fn(&S) -> T> ToNode<S, M> for F {
     type Node = Rc<F>;
 
     fn to_node(self) -> Self::Node {
-        Function(Rc::new(self))
+        Rc::new(self)
     }    
+}
+
+struct Apply<S, SubS, M, F: Fn(&S) -> SubS, N: Node<SubS, M>> {
+    node: N;
+    function: Rc<F>;
+}
+
+impl<S, SubS, M, F: Fn(S) -> SubS, N: Node<SubS, M>> ToNode<S, M> for Apply<S, SubS, M, F, N> {
+    type Node = Self;
+
+    fn to_node(self) -> Self::Node {
+        self
+    }
+}
+
+impl<S, SubS, M, F: Fn(&S) -> SubS> Node<S, M> for Apply<S, SubS, M, F> {
+    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+        let substate = self.function(state);
+        let update = self.node.render(document, parent, &substate);
+
+        struct MyUpdate {
+            substate: SubS;
+            update: Box<Update<D, SubS, M>>;
+            function: Rc<F>,
+        }
+
+        impl Update<D, S, M> for MyUpdate {
+            fn update(&mut self, state: &S) {
+                let substate = self.function(state);
+                if self.substate != substate {
+                    self.substate = substate;
+                    self.update.update(&substate);
+                }
+            }            
+        }
+        
+        update.map(|update| Box::new(MyUpdate {
+            substate,
+            update,
+            function: function.clone(),
+        }))
+    }
+}
+
+enum DiffEvent<K, V> {
+    Add(K, V),
+    Update(K, V),
+    Remove(K),
+}
+
+trait Diff<K, V> {
+    type Iterator: Iterator<(K, V)>;
+    type DiffIterator: Iterator<DiffEvent<K, V>>;        
+        
+    fn iter(&self) -> Iterator;
+
+    fn diff(&self, new: &Self) -> DiffIterator;
+}
+
+struct ApplyAll<S, K: Ord, V, SubS: Diff<K, V>, M, F: Fn(&S) -> SubS, N: Node<V, M>> {
+    node: Rc<N>;
+    function: Rc<F>;
+}
+
+impl<S, K: Ord, V, SubS: Diff<K, V>>, M, F: Fn(S) -> SubS, N: Node<V, M>> ToNode<S, M> for ApplyAll<S, K, V, SubS, M, F> {
+    type Node = Self;
+
+    fn to_node(self) -> Self::Node {
+        self
+    }
+}
+
+impl<S, K: Ord, V, SubS: Diff<K, V>>, M, F: Fn(S) -> SubS, N: Node<V, M>> Node<S, M> for ApplyAll<S, K, V, SubS, M, F> {
+    fn render<D: dom::Document>(&self, document: &D, parent: &D::Element, state: &S) -> Option<Box<Update<D, S, M>>> {
+        let substate = self.function(state);
+        let updates = substate.iter().map(|(k, v)| (k, (v, self.node.render(document, parent, &v)))).collect::BTreeMap<_>();
+
+        struct MyUpdate {
+            node: Rc<N>
+            substate: SubS;
+            updates: BTreeMap<K, (V, Option<Box<Update<D, SubS, M>>>)>;
+            function: Rc<F>
+        }
+
+        impl Update<D, S, M> for MyUpdate {
+            fn update(&mut self, state: &S) {
+                let substate = self.function(state);
+                self.substate.diff(&substate).for_each(|event| match event {
+                    Add(k, v) => self.updates.insert(k, (v, self.node.render(document, parent, &v)));, 
+                    Update(k, v) => if let Entry::Occupied(e) = self.updates.entry(&k) {
+                        let (old, update) = e.get_mut();
+                        update.map(|u| u.update(v));
+                        *old = v;
+                    },
+                    Remove(k) => todo(), // how do we do this?  Might need to have render return both and Option<Box<Update>> and an Option<Box<Remove>>
+                });
+                self.substate = substate;
+            }            
+        }
+
+        Some(Box::new(MyUpdate {
+            substate,
+            updates,
+            function: function.clone(),
+        }))
+    }
 }
