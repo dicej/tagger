@@ -1,15 +1,17 @@
 mod dom {
-    pub trait Element {
+    pub trait Node {
+
+    }
+
+    pub trait Element: Node {
         fn set_attribute(&self, name: &str, value: &str);
 
-        fn append_child(&self, child: &Element);
+        fn append_child(&self, child: &Node);
 
-        fn remove_child(&self, child: &Element);
+        fn remove_child(&self, child: &Node);
     }
 
-    pub trait TextNode {
-
-    }
+    pub trait TextNode: Node { }
     
     pub trait Document {
         type Element: Element;
@@ -19,6 +21,35 @@ mod dom {
         fn create_element(&self, name: &str) -> Self::Element;
 
         fn create_text_node(&self, value: &str) -> Self::TextNode;
+    }
+
+    mod server {
+        struct Element {
+            attributes: BTreeMap<String, String>,
+            children: Vec<Node>,
+        }
+
+        impl dom::Element for Rc<RefCell<Element>> {
+            fn set_attribute(&self, name: &str, value: &str) {
+                self.borrow_mut().attributes.insert(name, value.to_string());
+            }
+
+            fn append_child(&self, child: &Node) {
+                self.borrow_mut().children.push(Box::new(child.clone()));
+            }
+            
+            fn remove_child(&self, child: &Child) {
+                self.borrow_mut().children.retain(|c| (c as *const Self) != (child as *const Self));
+            }
+        }
+
+        struct TextNode {
+            value: String
+        }
+
+        impl dom::TextNode for Rc<Element> {
+            
+        }
     }
 }
 
@@ -33,7 +64,7 @@ trait Remove {
 }
 
 pub trait Node<S, M> {
-    fn add<D: dom::Document>(&self, document: &D; parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>;
+    fn add<D: dom::Document>(&self, document: &D; parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>);
 }
 
 pub trait Value<S> {
