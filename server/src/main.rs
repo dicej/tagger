@@ -1,4 +1,4 @@
-//#![deny(warnings)]
+#![deny(warnings)]
 
 extern crate chrono;
 extern crate env_logger;
@@ -141,12 +141,9 @@ fn find_new<P: AsRef<Path>>(
                             .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
                             .ok()
                             .and_then(|s| {
-                                pattern.captures(&s).map(|c| {
-                                    format!(
-                                        "{}-{}-{} {}:{}:{}",
-                                        &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
-                                    )
-                                })
+                                pattern
+                                    .captures(&s)
+                                    .map(|c| format!("{}-{}-{} {}:{}:{}", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]))
                             }) {
                             result.push((path.to_string(), datetime))
                         }
@@ -187,10 +184,7 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
         info!("insert {} (hash {})", path, hash);
         let mut lock = lock(conn)?;
         let transaction = lock.transaction()?;
-        transaction.execute(
-            "INSERT INTO paths (path, hash) VALUES (?1, ?2)",
-            &[path, &hash],
-        )?;
+        transaction.execute("INSERT INTO paths (path, hash) VALUES (?1, ?2)", &[path, &hash])?;
         transaction.execute(
             "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
             &[&hash, datetime],
@@ -230,9 +224,8 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
 fn state(conn: &Arc<Mutex<Connection>>) -> Result<Value, Error> {
     let mut map = Map::new();
     let lock = lock(conn)?;
-    let mut stmt = lock.prepare(
-        "SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash",
-    )?;
+    let mut stmt =
+        lock.prepare("SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash")?;
     for (hash, datetime, tag) in stmt.query_map(&[], |row| {
         (
             row.get::<_, String>(0),
@@ -277,17 +270,11 @@ fn apply(conn: &Arc<Mutex<Connection>>, patch: Value) -> Result<(), Error> {
 
     match patch["action"].as_str() {
         Some("add") => lock(conn)?
-            .execute(
-                "INSERT INTO tags (hash, tag) VALUES (?1, ?2)",
-                &[&hash, &tag],
-            )
+            .execute("INSERT INTO tags (hash, tag) VALUES (?1, ?2)", &[&hash, &tag])
             .map(drop)
             .map_err(Error::from),
         Some("remove") => lock(conn)?
-            .execute(
-                "DELETE FROM tags WHERE hash = ?1 AND tag = ?2",
-                &[&hash, &tag],
-            )
+            .execute("DELETE FROM tags WHERE hash = ?1 AND tag = ?2", &[&hash, &tag])
             .map(drop)
             .map_err(Error::from),
         _ => Err(format_err!("missing or unexpected action in {}", patch)),
@@ -359,8 +346,7 @@ fn handle(
             ) as F
         }
 
-        (&Post, _) => Box::new(ok(Response::new()
-            .with_status(StatusCode::MethodNotAllowed))) as F,
+        (&Post, _) => Box::new(ok(Response::new().with_status(StatusCode::MethodNotAllowed))) as F,
 
         (&Get, "/state") => Box::new(result(state(conn).map(|state| {
             let state = state.to_string().as_bytes().to_vec();
@@ -378,27 +364,19 @@ fn handle(
                     .with_body(image)
             }))) as F
         } else {
-            Box::new(result(public(public_dir, &path[1..]).map(
-                |(file, content_type)| {
-                    Response::new()
-                        .with_header(ContentLength(file.len() as u64))
-                        .with_header(content_type)
-                        .with_body(file)
-                },
-            ))) as F
+            Box::new(result(public(public_dir, &path[1..]).map(|(file, content_type)| {
+                Response::new()
+                    .with_header(ContentLength(file.len() as u64))
+                    .with_header(content_type)
+                    .with_body(file)
+            }))) as F
         },
 
-        _ => Box::new(ok(Response::new()
-            .with_status(StatusCode::MethodNotAllowed))) as F,
+        _ => Box::new(ok(Response::new().with_status(StatusCode::MethodNotAllowed))) as F,
     }
 }
 
-fn serve(
-    conn: &Arc<Mutex<Connection>>,
-    address: &str,
-    image_dir: &str,
-    public_dir: &str,
-) -> Result<(), Error> {
+fn serve(conn: &Arc<Mutex<Connection>>, address: &str, image_dir: &str, public_dir: &str) -> Result<(), Error> {
     struct Server {
         conn: Arc<Mutex<Connection>>,
         image_dir: Rc<String>,
@@ -412,17 +390,15 @@ fn serve(
         type Future = Box<Future<Item = Response, Error = hyper::Error>>;
 
         fn call(&self, req: Request) -> Self::Future {
-            Box::new(
-                handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
-                    error!("request error: {:?}", e);
-                    let response = format!("{:?}", e);
-                    Box::new(ok(Response::new()
-                        .with_status(StatusCode::InternalServerError)
-                        .with_header(ContentLength(response.len() as u64))
-                        .with_header(ContentType::plaintext())
-                        .with_body(response)))
-                }),
-            )
+            Box::new(handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
+                error!("request error: {:?}", e);
+                let response = format!("{:?}", e);
+                Box::new(ok(Response::new()
+                    .with_status(StatusCode::InternalServerError)
+                    .with_header(ContentLength(response.len() as u64))
+                    .with_header(ContentType::plaintext())
+                    .with_body(response)))
+            }))
         }
     }
 

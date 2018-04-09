@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 #[macro_export]
 macro_rules! html_impl {
     ($stack:ident (< $name:ident $($tail:tt)*)) => {
