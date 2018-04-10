@@ -130,7 +130,7 @@ pub struct Element<S, M, D: dom::Document> {
 }
 
 impl<S, M, D: dom::Document> Element<S, M, D> {
-    fn new<N: ToString>(name: N) -> Self {
+    pub fn new<N: ToString>(name: N) -> Self {
         Element {
             name: name.to_string(),
             handlers: Vec::new(),
@@ -149,14 +149,13 @@ impl<S: 'static, M, D: dom::Document + 'static> Node<S, M, D> for Element<S, M, 
         self.handlers.iter().for_each(|handler| handler.attach(&element));
         document.append_child(parent, &element);
 
-        struct MyUpdate<E, S> {
-            element: E,
+        struct MyUpdate<S> {
             children: Vec<Box<Update<S>>>,
         }
 
-        impl<E, S> Update<S> for MyUpdate<E, S> {
+        impl<S> Update<S> for MyUpdate<S> {
             fn update(&mut self, state: &S) {
-                self.children.iter().for_each(|u| u.update(state))
+                self.children.iter_mut().for_each(|u| u.update(state))
             }
         }
 
@@ -176,10 +175,7 @@ impl<S: 'static, M, D: dom::Document + 'static> Node<S, M, D> for Element<S, M, 
             if children.is_empty() {
                 None
             } else {
-                Some(Box::new(MyUpdate {
-                    element: element.clone(),
-                    children,
-                }))
+                Some(Box::new(MyUpdate { children }))
             },
             Some(Box::new(MyRemove {
                 document: document.clone(),
@@ -368,7 +364,7 @@ impl<S, M, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> No
 
         impl<D: dom::Document, T: ToString, F: Fn(&S) -> T, S> Update<S> for Rc<RefCell<Tracker<D, F>>> {
             fn update(&mut self, state: &S) {
-                let t = self.borrow_mut();
+                let mut t = self.borrow_mut();
                 let text = (t.function)(state).to_string();
                 if text != t.text {
                     t.document.remove_child(&t.parent, &t.node);
@@ -429,7 +425,7 @@ impl<S, M, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> To
     }
 }
 
-struct Apply<F, N> {
+pub struct Apply<F, N> {
     node: N,
     function: Rc<F>,
 }
@@ -468,7 +464,7 @@ impl<S, SubS: PartialEq + 'static, M, D: dom::Document, F: Fn(&S) -> SubS + 'sta
                 let substate = (self.function)(state);
                 if self.substate != substate {
                     self.substate = substate;
-                    self.update.update(&substate);
+                    self.update.update(&self.substate);
                 }
             }
         }
@@ -486,13 +482,13 @@ impl<S, SubS: PartialEq + 'static, M, D: dom::Document, F: Fn(&S) -> SubS + 'sta
     }
 }
 
-enum DiffEvent<K, V> {
+pub enum DiffEvent<K, V> {
     Add(K, V),
     Update(K, V),
     Remove(K),
 }
 
-trait Diff<K, V> {
+pub trait Diff<K, V> {
     type Iterator: Iterator<Item = (K, V)>;
     type DiffIterator: Iterator<Item = DiffEvent<K, V>>;
 
@@ -501,7 +497,7 @@ trait Diff<K, V> {
     fn diff(&self, new: &Self) -> Self::DiffIterator;
 }
 
-struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(&S) -> Di, N> {
+pub struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(&S) -> Di, N> {
     _s: PhantomData<S>,
     _k: PhantomData<K>,
     _subs: PhantomData<SubS>,
@@ -542,7 +538,10 @@ impl<
         let substate = (self.function)(state);
         let map = substate
             .iter()
-            .map(|(k, v)| (k, (v, self.node.as_ref().add(document, parent, &v))))
+            .map(|(k, v)| {
+                let add = self.node.as_ref().add(document, parent, &v);
+                (k, (v, add))
+            })
             .collect::<BTreeMap<_, _>>();
 
         struct Tracker<Di: Diff<K, SubS>, M, D: dom::Document, N, SubS, K, F> {
@@ -559,19 +558,20 @@ impl<
             for Rc<RefCell<Tracker<Di, M, D, N, SubS, K, F>>>
         {
             fn update(&mut self, state: &S) {
-                let t = self.borrow_mut();
+                let mut t = self.borrow_mut();
                 let substate = (t.function)(state);
                 t.substate.diff(&substate).for_each(|event| match event {
                     DiffEvent::Add(k, v) => {
-                        t.map.insert(k, (v, t.node.as_ref().add(&t.document, &t.parent, &v)));
+                        let add = t.node.as_ref().add(&t.document, &t.parent, &v);
+                        t.map.insert(k, (v, add));
                     }
-                    DiffEvent::Update(k, v) => if let Entry::Occupied(e) = t.map.entry(k) {
-                        let &mut (ref mut old, (ref update, _)) = e.get_mut();
-                        update.map(|u| u.update(&v));
+                    DiffEvent::Update(k, v) => if let Entry::Occupied(mut e) = t.map.entry(k) {
+                        let &mut (ref mut old, (ref mut update, _)) = e.get_mut();
+                        update.as_mut().map(|u| u.update(&v));
                         *old = v;
                     },
                     DiffEvent::Remove(k) => {
-                        t.map.remove(&k).map(|(_, (_, remove))| remove.map(|r| r.remove()));
+                        t.map.remove(&k).map(|(_, (_, remove))| remove.map(|mut r| r.remove()));
                     }
                 });
                 t.substate = substate;
@@ -580,9 +580,12 @@ impl<
 
         impl<Di: Diff<K, SubS>, M, D: dom::Document, N, SubS, K, F> Remove for Rc<RefCell<Tracker<Di, M, D, N, SubS, K, F>>> {
             fn remove(&mut self) {
-                self.borrow_mut().map.iter().for_each(|(_, &(_, (_, remove)))| {
-                    remove.map(|r| r.remove());
-                });
+                self.borrow_mut()
+                    .map
+                    .iter_mut()
+                    .for_each(|(_, &mut (_, (_, ref mut remove)))| {
+                        remove.as_mut().map(|r| r.remove());
+                    });
             }
         }
 
