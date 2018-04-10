@@ -2,6 +2,7 @@
 
 #[macro_use]
 pub mod macros;
+pub mod dom;
 pub mod render;
 
 #[cfg(test)]
