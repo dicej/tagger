@@ -27,17 +27,17 @@ pub trait Document: Clone {
     fn remove_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>);
 }
 
-mod server {
+pub mod server {
     use std::collections::BTreeMap;
     use std::rc::Rc;
     use std::fmt;
     use std::cell::RefCell;
     use super::{Node, ToNode};
 
-    struct Element {
-        name: String,
-        attributes: BTreeMap<String, String>,
-        children: Vec<Node<Rc<RefCell<Element>>, Rc<String>>>,
+    pub struct Element {
+        pub name: String,
+        pub attributes: BTreeMap<String, String>,
+        pub children: Vec<Node<Rc<RefCell<Element>>, Rc<String>>>,
     }
 
     impl ToNode<Rc<RefCell<Element>>, Rc<String>> for Rc<RefCell<Element>> {
@@ -64,9 +64,6 @@ mod server {
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct Document;
-
     impl fmt::Display for Node<Rc<RefCell<Element>>, Rc<String>> {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             match self {
@@ -91,6 +88,9 @@ mod server {
             }
         }
     }
+
+    #[derive(Clone, Copy)]
+    pub struct Document;
 
     impl super::Document for Document {
         type Element = Rc<RefCell<Element>>;

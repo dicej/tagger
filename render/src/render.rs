@@ -18,7 +18,7 @@ pub trait Remove {
     fn remove(&mut self);
 }
 
-pub trait Node<S, M, D: dom::Document> {
+pub trait Node<S, D: dom::Document> {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>);
 }
 
@@ -32,13 +32,13 @@ pub trait Render<S> {
     fn render(&self, state: &S) -> String;
 }
 
-pub struct Element<S, M, D: dom::Document> {
+pub struct Element<S, D: dom::Document> {
     name: String,
-    handlers: Vec<Box<Handler<M, D>>>,
-    children: Vec<Box<Node<S, M, D>>>,
+    pub handlers: Vec<Box<Handler<D>>>,
+    pub children: Vec<Box<Node<S, D>>>,
 }
 
-impl<S, M, D: dom::Document> Element<S, M, D> {
+impl<S, D: dom::Document> Element<S, D> {
     pub fn new<N: ToString>(name: N) -> Self {
         Element {
             name: name.to_string(),
@@ -48,7 +48,7 @@ impl<S, M, D: dom::Document> Element<S, M, D> {
     }
 }
 
-impl<S: 'static, M, D: dom::Document + 'static> Node<S, M, D> for Element<S, M, D> {
+impl<S: 'static, D: dom::Document + 'static> Node<S, D> for Element<S, D> {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let element = document.create_element(&self.name);
         let children = self.children
@@ -95,7 +95,7 @@ impl<S: 'static, M, D: dom::Document + 'static> Node<S, M, D> for Element<S, M, 
     }
 }
 
-pub trait Handler<M, D: dom::Document> {
+pub trait Handler<D: dom::Document> {
     fn attach(&self, element: &D::Element);
 }
 
@@ -104,7 +104,7 @@ pub struct Attribute<V> {
     value: V,
 }
 
-impl<S, M, D: dom::Document + 'static, V: Value<S>> Node<S, M, D> for Attribute<V>
+impl<S, D: dom::Document + 'static, V: Value<S>> Node<S, D> for Attribute<V>
 where
     V::R: 'static,
 {
@@ -163,13 +163,13 @@ where
     }
 }
 
-pub trait ToNode<S, M, D: dom::Document> {
-    type Node: Node<S, M, D>;
+pub trait ToNode<S, D: dom::Document> {
+    type Node: Node<S, D>;
 
     fn to_node(self) -> Self::Node;
 }
 
-pub fn to_node<S, M, D: dom::Document, T: ToNode<S, M, D>>(n: T) -> Box<Node<S, M, D>>
+pub fn to_node<S, D: dom::Document, T: ToNode<S, D>>(n: T) -> Box<Node<S, D>>
 where
     T::Node: 'static,
 {
@@ -182,7 +182,7 @@ pub trait ToValue<S> {
     fn to_value(self) -> Self::Value;
 }
 
-pub fn attribute<S, M, D: dom::Document + 'static, T: ToValue<S>>(name: &str, value: T) -> Box<Node<S, M, D>>
+pub fn attribute<S, D: dom::Document + 'static, T: ToValue<S>>(name: &str, value: T) -> Box<Node<S, D>>
 where
     T::Value: 'static,
     <T::Value as Value<S>>::R: 'static,
@@ -193,7 +193,7 @@ where
     })
 }
 
-impl<S, M, D: dom::Document + 'static> Node<S, M, D> for String
+impl<S, D: dom::Document + 'static> Node<S, D> for String
 where
     D::TextNode: 'static,
 {
@@ -238,7 +238,7 @@ impl<S> Render<S> for () {
     }
 }
 
-impl<'a, S, M, D: dom::Document + 'static> ToNode<S, M, D> for &'a str
+impl<'a, S, D: dom::Document + 'static> ToNode<S, D> for &'a str
 where
     D::TextNode: 'static,
 {
@@ -257,7 +257,7 @@ impl<'a, S> ToValue<S> for &'a str {
     }
 }
 
-impl<S, M, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> Node<S, M, D> for Rc<F> {
+impl<S, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> Node<S, D> for Rc<F> {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let text = self(state).to_string();
         let node = document.create_text_node(&text);
@@ -326,7 +326,7 @@ impl<S, T: ToString, F: Fn(&S) -> T> ToValue<S> for F {
     }
 }
 
-impl<S, M, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> ToNode<S, M, D> for F {
+impl<S, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> ToNode<S, D> for F {
     type Node = Rc<F>;
 
     fn to_node(self) -> Self::Node {
@@ -339,14 +339,8 @@ pub struct Apply<F, N> {
     function: Rc<F>,
 }
 
-impl<
-    S,
-    SubS: PartialEq + 'static,
-    M,
-    D: dom::Document,
-    F: Fn(&S) -> SubS + 'static,
-    N: Node<SubS, M, D>,
-> ToNode<S, M, D> for Apply<F, N>
+impl<S, SubS: PartialEq + 'static, D: dom::Document, F: Fn(&S) -> SubS + 'static, N: Node<SubS, D>> ToNode<S, D>
+    for Apply<F, N>
 {
     type Node = Self;
 
@@ -355,7 +349,7 @@ impl<
     }
 }
 
-impl<S, SubS: PartialEq + 'static, M, D: dom::Document, F: Fn(&S) -> SubS + 'static, N: Node<SubS, M, D>> Node<S, M, D>
+impl<S, SubS: PartialEq + 'static, D: dom::Document, F: Fn(&S) -> SubS + 'static, N: Node<SubS, D>> Node<S, D>
     for Apply<F, N>
 {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
@@ -419,11 +413,10 @@ impl<
     K: Ord + 'static,
     SubS: 'static,
     Di: Diff<K, SubS> + 'static,
-    M: 'static,
     D: dom::Document + 'static,
     F: Fn(&S) -> Di + 'static,
-    N: Node<SubS, M, D> + 'static,
-> ToNode<S, M, D> for ApplyAll<S, K, SubS, Di, F, N>
+    N: Node<SubS, D> + 'static,
+> ToNode<S, D> for ApplyAll<S, K, SubS, Di, F, N>
 {
     type Node = Self;
 
@@ -437,11 +430,10 @@ impl<
     K: Ord + 'static,
     SubS: 'static,
     Di: Diff<K, SubS> + 'static,
-    M: 'static,
     D: dom::Document + 'static,
     F: Fn(&S) -> Di + 'static,
-    N: Node<SubS, M, D> + 'static,
-> Node<S, M, D> for ApplyAll<S, K, SubS, Di, F, N>
+    N: Node<SubS, D> + 'static,
+> Node<S, D> for ApplyAll<S, K, SubS, Di, F, N>
 {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let substate = (self.function)(state);
@@ -453,8 +445,7 @@ impl<
             })
             .collect::<BTreeMap<_, _>>();
 
-        struct Tracker<Di: Diff<K, SubS>, M, D: dom::Document, N, SubS, K, F> {
-            _m: PhantomData<M>,
+        struct Tracker<Di: Diff<K, SubS>, D: dom::Document, N, SubS, K, F> {
             document: D,
             parent: D::Element,
             node: Rc<N>,
@@ -463,8 +454,8 @@ impl<
             function: Rc<F>,
         }
 
-        impl<Di: Diff<K, SubS>, M, D: dom::Document, N: Node<SubS, M, D>, SubS, K: Ord, F: Fn(&S) -> Di, S> Update<S>
-            for Rc<RefCell<Tracker<Di, M, D, N, SubS, K, F>>>
+        impl<Di: Diff<K, SubS>, D: dom::Document, N: Node<SubS, D>, SubS, K: Ord, F: Fn(&S) -> Di, S> Update<S>
+            for Rc<RefCell<Tracker<Di, D, N, SubS, K, F>>>
         {
             fn update(&mut self, state: &S) {
                 let mut t = self.borrow_mut();
@@ -487,7 +478,7 @@ impl<
             }
         }
 
-        impl<Di: Diff<K, SubS>, M, D: dom::Document, N, SubS, K, F> Remove for Rc<RefCell<Tracker<Di, M, D, N, SubS, K, F>>> {
+        impl<Di: Diff<K, SubS>, D: dom::Document, N, SubS, K, F> Remove for Rc<RefCell<Tracker<Di, D, N, SubS, K, F>>> {
             fn remove(&mut self) {
                 self.borrow_mut()
                     .map
@@ -499,7 +490,6 @@ impl<
         }
 
         let tracker = Rc::new(RefCell::new(Tracker {
-            _m: PhantomData,
             document: document.clone(),
             parent: parent.clone(),
             node: self.node.clone(),

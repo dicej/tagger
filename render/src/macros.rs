@@ -3,19 +3,20 @@
 #[macro_export]
 macro_rules! html_impl {
     ($stack:ident (< $name:ident $($tail:tt)*)) => {
-        let mut $stack = ($crate::dom::Element::new(stringify!($name)), $stack);
+        #[allow(unused_mut)]        
+        let mut $stack = ($crate::render::Element::new(stringify!($name)), $stack);
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident (onclick = $handler:expr, $($tail:tt)*)) => {
-        $stack.0.handlers.push($crate::dom::onclick($handler));
+        $stack.0.handlers.push($crate::render::onclick($handler));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident ($name:ident = $value:expr, $($tail:tt)*)) => {
-        $stack.0.children.push($crate::dom::attribute(stringify!($name), $value));
+        $stack.0.children.push($crate::render::attribute(stringify!($name), $value));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident ({ $value:expr } $($tail:tt)*)) => {
-        $stack.0.children.push($crate::dom::to_node($value));
+        $stack.0.children.push($crate::render::to_node($value));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident (> $($tail:tt)*)) => {
@@ -23,7 +24,7 @@ macro_rules! html_impl {
     };
     ($stack:ident (/ > $($tail:tt)*)) => {
         let (car, mut $stack) = $stack;
-        $stack.0.children.push(Rc::new(Box::new(car)));
+        $stack.0.children.push(Box::new(car));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident (< / $end:ident > $($tail:tt)*)) => {
@@ -38,14 +39,15 @@ macro_rules! html_impl {
         if $stack.0.children.len() != 1 {
             panic!("expected single root element");
         }
-        $stack.0.children().pop().unwrap();
+        $stack.0.children.pop().unwrap()
     };
 }
 
 #[macro_export]
 macro_rules! html {
     ($($tail:tt)*) => {{
-        let mut stack = ($crate::dom::Element::new("root"), ());
+        #[allow(unused_mut)]
+        let mut stack = ($crate::render::Element::new("root"), ());
         html_impl! { stack ($($tail)*) }
     }};
 }
