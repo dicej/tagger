@@ -36,7 +36,7 @@ mod tests {
     fn function_attribute() {
         assert_eq!(
             "<foo bar=\"baz\"/>",
-            &render(&html!(<foo bar=|s: &_| s,/>), &"baz".to_string())
+            &render(&html!(<foo bar=|s| s,/>), &"baz".to_string())
         );
     }
 
@@ -49,7 +49,7 @@ mod tests {
     fn function_node() {
         assert_eq!(
             "<foo>baz</foo>",
-            &render(&html!(<foo>{|s: &_| s}</foo>), &"baz".to_string())
+            &render(&html!(<foo>{|s| s}</foo>), &"baz".to_string())
         );
     }
 
@@ -58,7 +58,7 @@ mod tests {
         assert_eq!(
             "<foo><bar um=\"bim\"/>baz</foo>",
             &render(
-                &html!(<foo><bar um=|&(_, ref s): &_| s,/>{|&(ref s, _): &_| s}</foo>),
+                &html!(<foo><bar um=|(_, s)| s,/>{|(s, _)| s}</foo>),
                 &("baz".to_string(), "bim".to_string())
             )
         );

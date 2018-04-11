@@ -258,9 +258,9 @@ impl<'a, S> ToValue<S> for &'a str {
     }
 }
 
-impl<S, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> Node<S, D> for Rc<F> {
+impl<S: Clone, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static> Node<S, D> for Rc<F> {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
-        let text = self(state).to_string();
+        let text = self(state.clone()).to_string();
         let node = document.create_text_node(&text);
         document.append_child(parent, &node);
 
@@ -272,10 +272,10 @@ impl<S, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> Node<
             function: Rc<F>,
         }
 
-        impl<D: dom::Document, T: ToString, F: Fn(&S) -> T, S> Update<S> for Rc<RefCell<Tracker<D, F>>> {
+        impl<D: dom::Document, T: ToString, F: Fn(S) -> T, S: Clone> Update<S> for Rc<RefCell<Tracker<D, F>>> {
             fn update(&mut self, state: &S) {
                 let mut t = self.borrow_mut();
-                let text = (t.function)(state).to_string();
+                let text = (t.function)(state.clone()).to_string();
                 if text != t.text {
                     t.document.remove_child(&t.parent, &t.node);
                     let node = t.document.create_text_node(&text);
@@ -305,21 +305,21 @@ impl<S, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> Node<
     }
 }
 
-impl<S, T: ToString, F: Fn(&S) -> T> Value<S> for Rc<F> {
+impl<S: Clone, T: ToString, F: Fn(S) -> T> Value<S> for Rc<F> {
     type R = Self;
 
     fn render(&self, state: &S) -> (String, Option<Self::R>) {
-        (self(state).to_string(), Some(self.clone()))
+        (self(state.clone()).to_string(), Some(self.clone()))
     }
 }
 
-impl<S, T: ToString, F: Fn(&S) -> T> Render<S> for Rc<F> {
+impl<S: Clone, T: ToString, F: Fn(S) -> T> Render<S> for Rc<F> {
     fn render(&self, state: &S) -> String {
-        self(state).to_string()
+        self(state.clone()).to_string()
     }
 }
 
-impl<S, T: ToString, F: Fn(&S) -> T> ToValue<S> for F {
+impl<S: Clone, T: ToString, F: Fn(S) -> T> ToValue<S> for F {
     type Value = Rc<F>;
 
     fn to_value(self) -> Self::Value {
@@ -327,7 +327,7 @@ impl<S, T: ToString, F: Fn(&S) -> T> ToValue<S> for F {
     }
 }
 
-impl<S, D: dom::Document + 'static, T: ToString, F: Fn(&S) -> T + 'static> ToNode<S, D> for F {
+impl<S: Clone, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static> ToNode<S, D> for F {
     type Node = Rc<F>;
 
     fn to_node(self) -> Self::Node {
@@ -340,7 +340,7 @@ pub struct Apply<F, N> {
     function: Rc<F>,
 }
 
-impl<S, SubS: PartialEq + 'static, D: dom::Document, F: Fn(&S) -> SubS + 'static, N: Node<SubS, D>> ToNode<S, D>
+impl<S: Clone, SubS: PartialEq + 'static, D: dom::Document, F: Fn(S) -> SubS + 'static, N: Node<SubS, D>> ToNode<S, D>
     for Apply<F, N>
 {
     type Node = Self;
@@ -350,11 +350,11 @@ impl<S, SubS: PartialEq + 'static, D: dom::Document, F: Fn(&S) -> SubS + 'static
     }
 }
 
-impl<S, SubS: PartialEq + 'static, D: dom::Document, F: Fn(&S) -> SubS + 'static, N: Node<SubS, D>> Node<S, D>
+impl<S: Clone, SubS: PartialEq + 'static, D: dom::Document, F: Fn(S) -> SubS + 'static, N: Node<SubS, D>> Node<S, D>
     for Apply<F, N>
 {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
-        let substate = (self.function)(state);
+        let substate = (self.function)(state.clone());
         let (update, remove) = self.node.add(document, parent, &substate);
 
         struct MyUpdate<SubS, F> {
@@ -363,9 +363,9 @@ impl<S, SubS: PartialEq + 'static, D: dom::Document, F: Fn(&S) -> SubS + 'static
             function: Rc<F>,
         }
 
-        impl<SubS: PartialEq, F: Fn(&S) -> SubS, S> Update<S> for MyUpdate<SubS, F> {
+        impl<SubS: PartialEq, F: Fn(S) -> SubS, S: Clone> Update<S> for MyUpdate<SubS, F> {
             fn update(&mut self, state: &S) {
-                let substate = (self.function)(state);
+                let substate = (self.function)(state.clone());
                 if self.substate != substate {
                     self.substate = substate;
                     self.update.update(&self.substate);
@@ -401,7 +401,7 @@ pub trait Diff<K, V> {
     fn diff(&self, new: &Self) -> Self::DiffIterator;
 }
 
-pub struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(&S) -> Di, N> {
+pub struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(S) -> Di, N> {
     _s: PhantomData<S>,
     _k: PhantomData<K>,
     _subs: PhantomData<SubS>,
@@ -410,12 +410,12 @@ pub struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(&S) -> Di, N> {
 }
 
 impl<
-    S,
+    S: Clone,
     K: Ord + 'static,
     SubS: 'static,
     Di: Diff<K, SubS> + 'static,
     D: dom::Document + 'static,
-    F: Fn(&S) -> Di + 'static,
+    F: Fn(S) -> Di + 'static,
     N: Node<SubS, D> + 'static,
 > ToNode<S, D> for ApplyAll<S, K, SubS, Di, F, N>
 {
@@ -427,17 +427,17 @@ impl<
 }
 
 impl<
-    S,
+    S: Clone,
     K: Ord + 'static,
     SubS: 'static,
     Di: Diff<K, SubS> + 'static,
     D: dom::Document + 'static,
-    F: Fn(&S) -> Di + 'static,
+    F: Fn(S) -> Di + 'static,
     N: Node<SubS, D> + 'static,
 > Node<S, D> for ApplyAll<S, K, SubS, Di, F, N>
 {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
-        let substate = (self.function)(state);
+        let substate = (self.function)(state.clone());
         let map = substate
             .iter()
             .map(|(k, v)| {
@@ -455,12 +455,12 @@ impl<
             function: Rc<F>,
         }
 
-        impl<Di: Diff<K, SubS>, D: dom::Document, N: Node<SubS, D>, SubS, K: Ord, F: Fn(&S) -> Di, S> Update<S>
+        impl<Di: Diff<K, SubS>, D: dom::Document, N: Node<SubS, D>, SubS, K: Ord, F: Fn(S) -> Di, S: Clone> Update<S>
             for Rc<RefCell<Tracker<Di, D, N, SubS, K, F>>>
         {
             fn update(&mut self, state: &S) {
                 let mut t = self.borrow_mut();
-                let substate = (t.function)(state);
+                let substate = (t.function)(state.clone());
                 t.substate.diff(&substate).for_each(|event| match event {
                     DiffEvent::Add(k, v) => {
                         let add = t.node.as_ref().add(&t.document, &t.parent, &v);
