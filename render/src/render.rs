@@ -33,7 +33,7 @@ pub trait Render<S> {
 }
 
 pub struct Element<S, D: dom::Document> {
-    name: String,
+    pub name: String,
     pub handlers: Vec<Box<Handler<D>>>,
     pub children: Vec<Box<Node<S, D>>>,
 }
@@ -238,6 +238,7 @@ impl<S> Render<S> for () {
     }
 }
 
+// once Rust supports specialization, we can implement ToNode for all ToString here instead of just &str
 impl<'a, S, D: dom::Document + 'static> ToNode<S, D> for &'a str
 where
     D::TextNode: 'static,

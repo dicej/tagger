@@ -23,7 +23,44 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
+    fn simple() {
         assert_eq!("<foo/>", &render(&html!(<foo/>), &()));
+    }
+
+    #[test]
+    fn string_attribute() {
+        assert_eq!("<foo bar=\"baz\"/>", &render(&html!(<foo bar="baz",/>), &()));
+    }
+
+    #[test]
+    fn function_attribute() {
+        assert_eq!(
+            "<foo bar=\"baz\"/>",
+            &render(&html!(<foo bar=|s: &_| s,/>), &"baz".to_string())
+        );
+    }
+
+    #[test]
+    fn string_node() {
+        assert_eq!("<foo>baz</foo>", &render(&html!(<foo>{"baz"}</foo>), &()));
+    }
+
+    #[test]
+    fn function_node() {
+        assert_eq!(
+            "<foo>baz</foo>",
+            &render(&html!(<foo>{|s: &_| s}</foo>), &"baz".to_string())
+        );
+    }
+
+    #[test]
+    fn nested() {
+        assert_eq!(
+            "<foo><bar um=\"bim\"/>baz</foo>",
+            &render(
+                &html!(<foo><bar um=|&(_, ref s): &_| s,/>{|&(ref s, _): &_| s}</foo>),
+                &("baz".to_string(), "bim".to_string())
+            )
+        );
     }
 }

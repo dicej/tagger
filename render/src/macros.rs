@@ -29,10 +29,10 @@ macro_rules! html_impl {
     };
     ($stack:ident (< / $end:ident > $($tail:tt)*)) => {
         if stringify!($end) != $stack.0.name {
-            panic!("mismatched tags: <{}> vs. </{}>", $stack.0.name, $end);
+            panic!("mismatched tags: <{}> vs. </{}>", $stack.0.name, stringify!($end));
         }
         let (car, mut $stack) = $stack;
-        $stack.0.children.push(car);
+        $stack.0.children.push(Box::new(car));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident ()) => {
