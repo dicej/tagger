@@ -22,6 +22,12 @@ pub trait Node<S, D: dom::Document> {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>);
 }
 
+impl<S, D: dom::Document> Node<S, D> for Box<Node<S, D>> {
+    fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
+        self.as_ref().add(document, parent, state)
+    }
+}
+
 pub trait Value<S> {
     type R: Render<S>;
 
@@ -335,6 +341,22 @@ impl<S: Clone + Sync, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + '
     }
 }
 
+pub fn apply<
+    S: Clone + Sync,
+    SubS: PartialEq + 'static,
+    D: dom::Document,
+    F: Fn(S) -> SubS + 'static,
+    N: Node<SubS, D>,
+>(
+    function: F,
+    node: N,
+) -> Apply<F, N> {
+    Apply {
+        node,
+        function: Rc::new(function),
+    }
+}
+
 pub struct Apply<F, N> {
     node: N,
     function: Rc<F>,
@@ -409,6 +431,19 @@ pub trait Diff<K, V> {
     fn iter(&self) -> Self::Iterator;
 
     fn diff(&self, new: &Self) -> Self::DiffIterator;
+}
+
+pub fn apply_all<S, K, SubS, Di: Diff<K, SubS>, F: Fn(S) -> Di, N>(
+    function: F,
+    node: N,
+) -> ApplyAll<S, K, SubS, Di, F, N> {
+    ApplyAll {
+        _s: PhantomData,
+        _k: PhantomData,
+        _subs: PhantomData,
+        node: Rc::new(node),
+        function: Rc::new(function),
+    }
 }
 
 pub struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(S) -> Di, N> {

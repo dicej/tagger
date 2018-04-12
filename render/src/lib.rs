@@ -63,4 +63,15 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn apply() {
+        assert_eq!(
+            "<foo><bar um=\"bim\"/></foo>",
+            &render(
+                &html!(<foo>{render::apply(|(_, s)| s, html!(<bar um=|s| s,/>))}</foo>),
+                &("baz".to_string(), "bim".to_string())
+            )
+        );
+    }
 }
