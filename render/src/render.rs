@@ -258,7 +258,7 @@ impl<'a, S> ToValue<S> for &'a str {
     }
 }
 
-impl<S: Clone, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static> Node<S, D> for Rc<F> {
+impl<S: Clone + Sync, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static> Node<S, D> for Rc<F> {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let text = self(state.clone()).to_string();
         let node = document.create_text_node(&text);
@@ -305,7 +305,7 @@ impl<S: Clone, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static>
     }
 }
 
-impl<S: Clone, T: ToString, F: Fn(S) -> T> Value<S> for Rc<F> {
+impl<S: Clone + Sync, T: ToString, F: Fn(S) -> T> Value<S> for Rc<F> {
     type R = Self;
 
     fn render(&self, state: &S) -> (String, Option<Self::R>) {
@@ -313,13 +313,13 @@ impl<S: Clone, T: ToString, F: Fn(S) -> T> Value<S> for Rc<F> {
     }
 }
 
-impl<S: Clone, T: ToString, F: Fn(S) -> T> Render<S> for Rc<F> {
+impl<S: Clone + Sync, T: ToString, F: Fn(S) -> T> Render<S> for Rc<F> {
     fn render(&self, state: &S) -> String {
         self(state.clone()).to_string()
     }
 }
 
-impl<S: Clone, T: ToString, F: Fn(S) -> T> ToValue<S> for F {
+impl<S: Clone + Sync, T: ToString, F: Fn(S) -> T> ToValue<S> for F {
     type Value = Rc<F>;
 
     fn to_value(self) -> Self::Value {
@@ -327,7 +327,7 @@ impl<S: Clone, T: ToString, F: Fn(S) -> T> ToValue<S> for F {
     }
 }
 
-impl<S: Clone, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static> ToNode<S, D> for F {
+impl<S: Clone + Sync, D: dom::Document + 'static, T: ToString, F: Fn(S) -> T + 'static> ToNode<S, D> for F {
     type Node = Rc<F>;
 
     fn to_node(self) -> Self::Node {
@@ -340,8 +340,13 @@ pub struct Apply<F, N> {
     function: Rc<F>,
 }
 
-impl<S: Clone, SubS: PartialEq + 'static, D: dom::Document, F: Fn(S) -> SubS + 'static, N: Node<SubS, D>> ToNode<S, D>
-    for Apply<F, N>
+impl<
+    S: Clone + Sync,
+    SubS: PartialEq + 'static,
+    D: dom::Document,
+    F: Fn(S) -> SubS + 'static,
+    N: Node<SubS, D>,
+> ToNode<S, D> for Apply<F, N>
 {
     type Node = Self;
 
@@ -350,8 +355,13 @@ impl<S: Clone, SubS: PartialEq + 'static, D: dom::Document, F: Fn(S) -> SubS + '
     }
 }
 
-impl<S: Clone, SubS: PartialEq + 'static, D: dom::Document, F: Fn(S) -> SubS + 'static, N: Node<SubS, D>> Node<S, D>
-    for Apply<F, N>
+impl<
+    S: Clone + Sync,
+    SubS: PartialEq + 'static,
+    D: dom::Document,
+    F: Fn(S) -> SubS + 'static,
+    N: Node<SubS, D>,
+> Node<S, D> for Apply<F, N>
 {
     fn add(&self, document: &D, parent: &D::Element, state: &S) -> (Option<Box<Update<S>>>, Option<Box<Remove>>) {
         let substate = (self.function)(state.clone());
@@ -410,7 +420,7 @@ pub struct ApplyAll<S, K, SubS, Di: Diff<K, SubS>, F: Fn(S) -> Di, N> {
 }
 
 impl<
-    S: Clone,
+    S: Clone + Sync,
     K: Ord + 'static,
     SubS: 'static,
     Di: Diff<K, SubS> + 'static,
@@ -427,7 +437,7 @@ impl<
 }
 
 impl<
-    S: Clone,
+    S: Clone + Sync,
     K: Ord + 'static,
     SubS: 'static,
     Di: Diff<K, SubS> + 'static,
