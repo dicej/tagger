@@ -433,7 +433,15 @@ pub trait Diff<K, V> {
     fn diff(&self, new: &Self) -> Self::DiffIterator;
 }
 
-pub fn apply_all<S, K, SubS, Di: Diff<K, SubS>, F: Fn(S) -> Di, N>(
+pub fn apply_all<
+    S: Clone + Sync,
+    K: Ord + 'static,
+    SubS: 'static,
+    Di: Diff<K, SubS> + 'static,
+    D: dom::Document + 'static,
+    F: Fn(S) -> Di + 'static,
+    N: Node<SubS, D> + 'static,
+>(
     function: F,
     node: N,
 ) -> ApplyAll<S, K, SubS, Di, F, N> {

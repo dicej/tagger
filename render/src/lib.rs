@@ -7,6 +7,7 @@ pub mod render;
 
 #[cfg(test)]
 mod tests {
+    use std::vec::IntoIter;
     use std::fmt::Write;
     use dom::{server, Document};
     use render;
@@ -71,6 +72,34 @@ mod tests {
             &render(
                 &html!(<foo>{render::apply(|(_, s)| s, html!(<bar um=|s| s,/>))}</foo>),
                 &("baz".to_string(), "bim".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn apply_all() {
+        impl render::Diff<char, char> for Vec<char> {
+            type Iterator = IntoIter<(char, char)>;
+            type DiffIterator = IntoIter<render::DiffEvent<char, char>>;
+
+            fn iter(&self) -> Self::Iterator {
+                self.into_iter()
+                    .cloned()
+                    .zip(self.into_iter().cloned())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            }
+
+            fn diff(&self, _new: &Self) -> Self::DiffIterator {
+                unimplemented!()
+            }
+        }
+
+        assert_eq!(
+            "<foo><bar um=\"a\"/><bar um=\"b\"/><bar um=\"c\"/><bar um=\"d\"/></foo>",
+            &render(
+                &html!(<foo>{render::apply_all(|s| s, html!(<bar um=|s| s,/>))}</foo>),
+                &vec!['a', 'b', 'c', 'd']
             )
         );
     }
