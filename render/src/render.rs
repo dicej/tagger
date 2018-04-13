@@ -149,17 +149,15 @@ where
         }
 
         (
-            if let Some(render) = render {
-                Some(Box::new(MyUpdate {
+            render.map(|render| {
+                Box::new(MyUpdate {
                     document: document.clone(),
                     parent: parent.clone(),
                     name: self.name.clone(),
                     text,
                     render,
-                }))
-            } else {
-                None
-            },
+                }) as Box<Update<S>>
+            }),
             Some(Box::new(MyRemove {
                 document: document.clone(),
                 parent: parent.clone(),
