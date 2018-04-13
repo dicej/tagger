@@ -78,16 +78,12 @@ mod tests {
 
     #[test]
     fn apply_all() {
-        impl render::Diff<char, char> for Vec<char> {
-            type Iterator = IntoIter<(char, char)>;
-            type DiffIterator = IntoIter<render::DiffEvent<char, char>>;
+        impl render::Diff<u32, char> for Vec<(u32, char)> {
+            type Iterator = IntoIter<(u32, char)>;
+            type DiffIterator = IntoIter<render::DiffEvent<u32, char>>;
 
             fn iter(&self) -> Self::Iterator {
-                self.into_iter()
-                    .cloned()
-                    .zip(self.into_iter().cloned())
-                    .collect::<Vec<_>>()
-                    .into_iter()
+                self.clone().into_iter()
             }
 
             fn diff(&self, _new: &Self) -> Self::DiffIterator {
@@ -96,10 +92,10 @@ mod tests {
         }
 
         assert_eq!(
-            "<foo><bar um=\"a\"/><bar um=\"b\"/><bar um=\"c\"/><bar um=\"d\"/></foo>",
+            "<foo>abcd</foo>",
             &render(
-                &html!(<foo>{render::apply_all(|s| s, html!(<bar um=|s| s,/>))}</foo>),
-                &vec!['a', 'b', 'c', 'd']
+                &html!(<foo>{render::apply_all(|s| s, html!({|s| s}))}</foo>),
+                &vec![(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')]
             )
         );
     }
