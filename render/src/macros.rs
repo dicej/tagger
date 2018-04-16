@@ -8,7 +8,7 @@ macro_rules! html_impl {
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident (onclick = $handler:expr, $($tail:tt)*)) => {
-        $stack.0.handlers.push($crate::render::onclick($handler));
+        $stack.0.handlers.push($crate::render::on_click($handler));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident ($name:ident = $value:expr, $($tail:tt)*)) => {

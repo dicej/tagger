@@ -9,6 +9,9 @@ pub trait ToNode<E, T> {
     fn to_node(&self) -> Node<E, T>;
 }
 
+#[derive(Clone)]
+pub struct ClickEvent {}
+
 pub trait Document: Clone {
     type Element: ToNode<Self::Element, Self::TextNode> + Clone;
 
@@ -25,6 +28,8 @@ pub trait Document: Clone {
     fn append_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>);
 
     fn remove_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>);
+
+    fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F);
 }
 
 pub mod server {
@@ -32,12 +37,17 @@ pub mod server {
     use std::rc::Rc;
     use std::fmt;
     use std::cell::RefCell;
-    use super::{Node, ToNode};
+    use super::{ClickEvent, Node, ToNode};
+
+    pub enum Handler {
+        Click(Box<Fn(ClickEvent)>),
+    }
 
     pub struct Element {
         pub name: String,
         pub attributes: BTreeMap<String, String>,
         pub children: Vec<Node<Rc<RefCell<Element>>, Rc<String>>>,
+        pub handlers: Vec<Handler>,
     }
 
     impl ToNode<Rc<RefCell<Element>>, Rc<String>> for Rc<RefCell<Element>> {
@@ -101,6 +111,7 @@ pub mod server {
                 name: name.to_string(),
                 attributes: BTreeMap::new(),
                 children: Vec::new(),
+                handlers: Vec::new(),
             }))
         }
 
@@ -126,6 +137,10 @@ pub mod server {
         fn remove_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>) {
             let child = child.to_node();
             element.borrow_mut().children.retain(|c| !same(c, &child));
+        }
+
+        fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
+            element.borrow_mut().handlers.push(Handler::Click(Box::new(handle)));
         }
     }
 }

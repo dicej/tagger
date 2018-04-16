@@ -1,5 +1,11 @@
 #![deny(warnings)]
 
+// add render_with_updates and render_with_inputs and use them to test
+
+// implement dom::client
+
+// implement tagger front end
+
 #[macro_use]
 pub mod macros;
 pub mod dom;
@@ -9,13 +15,19 @@ pub mod render;
 mod tests {
     use std::vec::IntoIter;
     use std::fmt::Write;
+    use std::rc::Rc;
     use dom::{server, Document};
     use render;
 
-    fn render<S>(node: &Box<render::Node<S, server::Document>>, state: &S) -> String {
+    fn render<S>(node: &Box<render::Node<S, S, server::Document>>, state: &S) -> String {
         let document = server::Document;
         let root = document.create_element("root");
-        node.add(&document, &root, state);
+        node.add(
+            &document,
+            &root,
+            &(Rc::new(|_| unimplemented!()) as render::Dispatch<S>),
+            state,
+        );
         let mut s = String::new();
         for child in &root.borrow().children {
             write!(s, "{}", child).unwrap();
