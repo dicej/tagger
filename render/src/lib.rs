@@ -124,8 +124,28 @@ mod tests {
             self.clone().into_iter()
         }
 
-        fn diff(&self, _new: &Self) -> Self::DiffIterator {
-            unimplemented!()
+        fn diff(&self, new: &Self) -> Self::DiffIterator {
+            self.into_iter()
+                .filter_map(|(k, v)| {
+                    if let Some(c) = new.get(k) {
+                        if c == v {
+                            None
+                        } else {
+                            Some(render::DiffEvent::Update(*k, *c))
+                        }
+                    } else {
+                        Some(render::DiffEvent::Remove(*k))
+                    }
+                })
+                .chain(new.into_iter().filter_map(|(k, v)| {
+                    if self.get(k).is_some() {
+                        None
+                    } else {
+                        Some(render::DiffEvent::Add(*k, *v))
+                    }
+                }))
+                .collect::<Vec<_>>()
+                .into_iter()
         }
     }
 
@@ -143,13 +163,16 @@ mod tests {
     #[test]
     fn apply_all_with_updates() {
         assert_eq!(
-            &vec!["<foo>abcd</foo>", "<foo>abCd</foo>"],
+            &vec!["<foo>abcd</foo>", "<foo>zbCde</foo>"],
             &render_with_updates(
                 &html!(<foo>{render::apply_all(|s| s, html!({|s| s}))}</foo>),
                 &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],
                 &[
                     &|mut s| {
+                        s.insert(0, 'z');
+                        s.remove(&1);
                         s.insert(3, 'C');
+                        s.insert(5, 'e');
                         s
                     }
                 ],
