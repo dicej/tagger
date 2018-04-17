@@ -10,7 +10,7 @@ pub trait ToNode<E, T> {
 }
 
 #[derive(Clone)]
-pub struct ClickEvent {}
+pub struct ClickEvent;
 
 pub trait Document: Clone {
     type Element: ToNode<Self::Element, Self::TextNode> + Clone;
@@ -33,14 +33,16 @@ pub trait Document: Clone {
 }
 
 pub mod server {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::rc::Rc;
     use std::fmt;
     use std::cell::RefCell;
     use super::{ClickEvent, Node, ToNode};
 
+    #[derive(Clone)]
     pub enum Handler {
-        Click(Box<Fn(ClickEvent)>),
+        Click(Rc<Fn(ClickEvent)>),
+        None,
     }
 
     pub struct Element {
@@ -99,8 +101,22 @@ pub mod server {
         }
     }
 
-    #[derive(Clone, Copy)]
-    pub struct Document;
+    #[derive(Clone)]
+    pub struct Document {
+        by_id: RefCell<HashMap<String, Rc<RefCell<Element>>>>,
+    }
+
+    impl Document {
+        pub fn new() -> Document {
+            Document {
+                by_id: RefCell::new(HashMap::new()),
+            }
+        }
+
+        pub fn get_element_by_id(&self, id: &str) -> Option<Rc<RefCell<Element>>> {
+            self.by_id.borrow().get(id).map(Clone::clone)
+        }
+    }
 
     impl super::Document for Document {
         type Element = Rc<RefCell<Element>>;
@@ -120,13 +136,27 @@ pub mod server {
         }
 
         fn set_attribute(&self, element: &Self::Element, name: &str, value: &str) {
+            self.remove_attribute(element, name);
+
             element
                 .borrow_mut()
                 .attributes
                 .insert(name.to_string(), value.to_string());
+
+            if name == "id" {
+                self.by_id.borrow_mut().insert(value.to_string(), element.clone());
+            }
         }
 
         fn remove_attribute(&self, element: &Self::Element, name: &str) {
+            if name == "id" {
+                element
+                    .borrow()
+                    .attributes
+                    .get(name)
+                    .map(|value| self.by_id.borrow_mut().remove(value));
+            }
+
             element.borrow_mut().attributes.remove(name);
         }
 
@@ -140,7 +170,7 @@ pub mod server {
         }
 
         fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
-            element.borrow_mut().handlers.push(Handler::Click(Box::new(handle)));
+            element.borrow_mut().handlers.push(Handler::Click(Rc::new(handle)));
         }
     }
 }

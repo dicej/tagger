@@ -1,6 +1,8 @@
 #![deny(warnings)]
 
-// add render_with_updates and render_with_inputs and use them to test
+// make onclick inferable
+
+// fix failures
 
 // implement dom::client
 
@@ -22,7 +24,8 @@ mod tests {
     use std::vec;
     use std::fmt::Write;
     use std::rc::Rc;
-    use dom::{server, Document};
+    use std::cell::RefCell;
+    use dom::{self, server, Document};
     use render;
 
     fn render<S: Clone>(node: &Box<render::Node<S, S, server::Document>>, state: &S) -> String {
@@ -45,7 +48,7 @@ mod tests {
         state: &S,
         updates: &[&Fn(S) -> S],
     ) -> Vec<String> {
-        let document = server::Document;
+        let document = server::Document::new();
         let root = document.create_element("root");
         let (mut update, _) = node.add(
             &document,
@@ -58,6 +61,37 @@ mod tests {
         for u in updates {
             state = u(state);
             update.as_mut().map(|ref mut update| update.update(&state));
+            v.push(render_children(&root));
+        }
+        v
+    }
+
+    fn render_with_inputs<S: Clone + 'static>(
+        node: &Box<render::Node<S, S, server::Document>>,
+        state: &S,
+        inputs: &[(&str, &Fn(server::Handler))],
+    ) -> Vec<String> {
+        let document = server::Document::new();
+        let root = document.create_element("root");
+        let state = Rc::new(RefCell::new(state.clone() as S));
+        let state2 = state.clone();
+        let (mut update, _) = node.add(
+            &document,
+            &root,
+            &(Rc::new(move |update: Box<Fn(S) -> S>| {
+                let new = update(state2.borrow().clone());
+                *state2.borrow_mut() = new;
+            }) as render::Dispatch<S>),
+            &state.borrow(),
+        );
+        let mut v = vec![render_children(&root)];
+        for i in inputs {
+            if let Some(e) = document.get_element_by_id(i.0) {
+                for h in &e.borrow().handlers {
+                    i.1(h.clone());
+                }
+            }
+            update.as_mut().map(|ref mut update| update.update(&state.borrow()));
             v.push(render_children(&root));
         }
         v
@@ -176,6 +210,34 @@ mod tests {
                         s
                     }
                 ],
+            )
+        );
+    }
+
+    #[test]
+    fn apply_all_with_inputs() {
+        let click = |handler| {
+            if let server::Handler::Click(handle) = handler {
+                handle(dom::ClickEvent)
+            }
+        };
+
+        assert_eq!(
+            &vec![
+                "<foo id=\"42\"><bar id=\"43\"/>abcd</foo>",
+                "<foo id=\"42\"><bar id=\"43\"/>aBcd</foo>",
+                "<foo id=\"42\"><bar id=\"43\"/>aBcD</foo>",
+            ],
+            &render_with_inputs(
+                &html!(<foo id="42", onclick=|_, mut s: BTreeMap<_, _>| {
+                    s.insert(2, 'B');
+                    s
+                },><bar id="43", onclick=|_, mut s:	BTreeMap<_, _>| {
+      	      	    s.insert(4, 'D');
+		                s
+		            },/>{render::apply_all(|s| s, html!({|s| s}))}</foo>),
+                &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],
+                &[("42", &click), ("43", &click)],
             )
         );
     }
