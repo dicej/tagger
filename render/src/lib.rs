@@ -1,9 +1,5 @@
 #![deny(warnings)]
 
-// make onclick inferable
-
-// fix failures
-
 // implement dom::client
 
 // implement tagger front end
@@ -50,9 +46,10 @@ mod tests {
     ) -> Vec<String> {
         let document = server::Document::new();
         let root = document.create_element("root");
-        let (mut update, _) = node.add(
+        let mut added = node.add(
             &document,
             &root,
+            None,
             &(Rc::new(|_| unimplemented!()) as render::Dispatch<S>),
             state,
         );
@@ -60,7 +57,7 @@ mod tests {
         let mut state = state.clone() as S;
         for u in updates {
             state = u(state);
-            update.as_mut().map(|ref mut update| update.update(&state));
+            added.update.as_mut().map(|ref mut update| update.update(&state));
             v.push(render_children(&root));
         }
         v
@@ -75,9 +72,10 @@ mod tests {
         let root = document.create_element("root");
         let state = Rc::new(RefCell::new(state.clone() as S));
         let state2 = state.clone();
-        let (mut update, _) = node.add(
+        let mut added = node.add(
             &document,
             &root,
+            None,
             &(Rc::new(move |update: Box<Fn(S) -> S>| {
                 let new = update(state2.borrow().clone());
                 *state2.borrow_mut() = new;
@@ -91,7 +89,10 @@ mod tests {
                     i.1(h.clone());
                 }
             }
-            update.as_mut().map(|ref mut update| update.update(&state.borrow()));
+            added
+                .update
+                .as_mut()
+                .map(|ref mut update| update.update(&state.borrow()));
             v.push(render_children(&root));
         }
         v
@@ -232,8 +233,8 @@ mod tests {
                 &html!(<foo id="42", onclick=|_, mut s: BTreeMap<_, _>| {
                     s.insert(2, 'B');
                     s
-                },><bar id="43", onclick=|_, mut s:	BTreeMap<_, _>| {
-      	      	    s.insert(4, 'D');
+                },><bar id="43", onclick=|_, mut s: BTreeMap<_, _>| {
+                    s.insert(4, 'D');
 		                s
 		            },/>{render::apply_all(|s| s, html!({|s| s}))}</foo>),
                 &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],

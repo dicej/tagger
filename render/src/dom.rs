@@ -1,21 +1,28 @@
 #![deny(warnings)]
 
-pub enum Node<E, T> {
-    Element(E),
-    TextNode(T),
+#[derive(Clone)]
+pub enum Node<D: Document> {
+    Element(D::Element),
+    TextNode(D::TextNode),
 }
 
-pub trait ToNode<E, T> {
-    fn to_node(&self) -> Node<E, T>;
+pub trait ToNode<D: Document> {
+    fn to_node(&self) -> Node<D>;
+}
+
+impl<D: Document> ToNode<D> for Node<D> {
+    fn to_node(&self) -> Node<D> {
+        self.clone() as Node<D>
+    }
 }
 
 #[derive(Clone)]
 pub struct ClickEvent;
 
 pub trait Document: Clone {
-    type Element: ToNode<Self::Element, Self::TextNode> + Clone;
+    type Element: ToNode<Self> + Clone;
 
-    type TextNode: ToNode<Self::Element, Self::TextNode> + Clone;
+    type TextNode: ToNode<Self> + Clone;
 
     fn create_element(&self, name: &str) -> Self::Element;
 
@@ -25,9 +32,21 @@ pub trait Document: Clone {
 
     fn remove_attribute(&self, element: &Self::Element, name: &str);
 
-    fn append_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>);
+    fn insert(&self, element: &Self::Element, next: Option<&ToNode<Self>>, child: &ToNode<Self>) {
+        if let Some(next) = next {
+            self.insert_before(element, next, child);
+        } else {
+            self.append_child(element, child);
+        }
+    }
 
-    fn remove_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>);
+    fn insert_before(&self, element: &Self::Element, next: &ToNode<Self>, child: &ToNode<Self>);
+
+    fn replace_child(&self, element: &Self::Element, replaced: &ToNode<Self>, replacement: &ToNode<Self>);
+
+    fn append_child(&self, element: &Self::Element, child: &ToNode<Self>);
+
+    fn remove_child(&self, element: &Self::Element, child: &ToNode<Self>);
 
     fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F);
 }
@@ -48,23 +67,23 @@ pub mod server {
     pub struct Element {
         pub name: String,
         pub attributes: BTreeMap<String, String>,
-        pub children: Vec<Node<Rc<RefCell<Element>>, Rc<String>>>,
+        pub children: Vec<Node<Document>>,
         pub handlers: Vec<Handler>,
     }
 
-    impl ToNode<Rc<RefCell<Element>>, Rc<String>> for Rc<RefCell<Element>> {
-        fn to_node(&self) -> Node<Rc<RefCell<Element>>, Rc<String>> {
+    impl ToNode<Document> for Rc<RefCell<Element>> {
+        fn to_node(&self) -> Node<Document> {
             Node::Element(self.clone())
         }
     }
 
-    impl ToNode<Rc<RefCell<Element>>, Rc<String>> for Rc<String> {
-        fn to_node(&self) -> Node<Rc<RefCell<Element>>, Rc<String>> {
+    impl ToNode<Document> for Rc<String> {
+        fn to_node(&self) -> Node<Document> {
             Node::TextNode(self.clone())
         }
     }
 
-    fn same(a: &Node<Rc<RefCell<Element>>, Rc<String>>, b: &Node<Rc<RefCell<Element>>, Rc<String>>) -> bool {
+    fn same(a: &Node<Document>, b: &Node<Document>) -> bool {
         match (a, b) {
             (&Node::Element(ref a), &Node::Element(ref b)) => {
                 &a.borrow() as &Element as *const Element == &b.borrow() as &Element as *const Element
@@ -76,7 +95,7 @@ pub mod server {
         }
     }
 
-    impl fmt::Display for Node<Rc<RefCell<Element>>, Rc<String>> {
+    impl fmt::Display for Node<Document> {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
             match self {
                 &Node::Element(ref e) => {
@@ -160,11 +179,28 @@ pub mod server {
             element.borrow_mut().attributes.remove(name);
         }
 
-        fn append_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>) {
+        fn insert_before(&self, element: &Self::Element, next: &ToNode<Self>, child: &ToNode<Self>) {
+            let next = next.to_node();
+            let index = element.borrow().children.iter().position(|c| same(c, &next)).unwrap();
+            element.borrow_mut().children.insert(index, child.to_node());
+        }
+
+        fn replace_child(&self, element: &Self::Element, replaced: &ToNode<Self>, replacement: &ToNode<Self>) {
+            let replaced = replaced.to_node();
+            let index = element
+                .borrow()
+                .children
+                .iter()
+                .position(|c| same(c, &replaced))
+                .unwrap();
+            element.borrow_mut().children[index] = replacement.to_node();
+        }
+
+        fn append_child(&self, element: &Self::Element, child: &ToNode<Self>) {
             element.borrow_mut().children.push(child.to_node());
         }
 
-        fn remove_child(&self, element: &Self::Element, child: &ToNode<Self::Element, Self::TextNode>) {
+        fn remove_child(&self, element: &Self::Element, child: &ToNode<Self>) {
             let child = child.to_node();
             element.borrow_mut().children.retain(|c| !same(c, &child));
         }
