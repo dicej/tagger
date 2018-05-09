@@ -1,0 +1,15 @@
+[package]
+name = "tagger-client"
+description = "Image tagging webapp frontend"
+version = "0.1.0"
+authors = ["Joel Dice <joel.dice@gmail.com>"]
+
+[dependencies]
+im = "*"
+serde = "*"
+serde_derive = "*"
+serde_json = "*"
+stdweb = "*"
+failure = "*"
+derive_deref = "*"
+render = { path = "../render" }

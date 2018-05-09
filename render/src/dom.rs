@@ -32,17 +32,17 @@ pub trait Document: Clone {
 
     fn remove_attribute(&self, element: &Self::Element, name: &str);
 
-    fn insert(&self, element: &Self::Element, next: Option<&ToNode<Self>>, child: &ToNode<Self>) {
-        if let Some(next) = next {
-            self.insert_before(element, next, child);
+    fn insert(&self, element: &Self::Element, new: &ToNode<Self>, existing: Option<&ToNode<Self>>) {
+        if let Some(existing) = existing {
+            self.insert_before(element, new, existing);
         } else {
-            self.append_child(element, child);
+            self.append_child(element, new);
         }
     }
 
-    fn insert_before(&self, element: &Self::Element, next: &ToNode<Self>, child: &ToNode<Self>);
+    fn insert_before(&self, element: &Self::Element, new: &ToNode<Self>, existing: &ToNode<Self>);
 
-    fn replace_child(&self, element: &Self::Element, replaced: &ToNode<Self>, replacement: &ToNode<Self>);
+    fn replace_child(&self, element: &Self::Element, new: &ToNode<Self>, existing: &ToNode<Self>);
 
     fn append_child(&self, element: &Self::Element, child: &ToNode<Self>);
 
@@ -52,11 +52,11 @@ pub trait Document: Clone {
 }
 
 pub mod server {
-    use std::collections::{BTreeMap, HashMap};
-    use std::rc::Rc;
-    use std::fmt;
-    use std::cell::RefCell;
     use super::{ClickEvent, Node, ToNode};
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, HashMap};
+    use std::fmt;
+    use std::rc::Rc;
 
     #[derive(Clone)]
     pub enum Handler {
@@ -86,7 +86,8 @@ pub mod server {
     fn same(a: &Node<Document>, b: &Node<Document>) -> bool {
         match (a, b) {
             (&Node::Element(ref a), &Node::Element(ref b)) => {
-                &a.borrow() as &Element as *const Element == &b.borrow() as &Element as *const Element
+                &a.borrow() as &Element as *const Element
+                    == &b.borrow() as &Element as *const Element
             }
             (&Node::TextNode(ref a), &Node::TextNode(ref b)) => {
                 a.as_ref() as *const String == b.as_ref() as *const String
@@ -163,7 +164,9 @@ pub mod server {
                 .insert(name.to_string(), value.to_string());
 
             if name == "id" {
-                self.by_id.borrow_mut().insert(value.to_string(), element.clone());
+                self.by_id
+                    .borrow_mut()
+                    .insert(value.to_string(), element.clone());
             }
         }
 
@@ -179,21 +182,36 @@ pub mod server {
             element.borrow_mut().attributes.remove(name);
         }
 
-        fn insert_before(&self, element: &Self::Element, next: &ToNode<Self>, child: &ToNode<Self>) {
-            let next = next.to_node();
-            let index = element.borrow().children.iter().position(|c| same(c, &next)).unwrap();
-            element.borrow_mut().children.insert(index, child.to_node());
-        }
-
-        fn replace_child(&self, element: &Self::Element, replaced: &ToNode<Self>, replacement: &ToNode<Self>) {
-            let replaced = replaced.to_node();
+        fn insert_before(
+            &self,
+            element: &Self::Element,
+            new: &ToNode<Self>,
+            existing: &ToNode<Self>,
+        ) {
+            let existing = existing.to_node();
             let index = element
                 .borrow()
                 .children
                 .iter()
-                .position(|c| same(c, &replaced))
+                .position(|c| same(c, &existing))
                 .unwrap();
-            element.borrow_mut().children[index] = replacement.to_node();
+            element.borrow_mut().children.insert(index, new.to_node());
+        }
+
+        fn replace_child(
+            &self,
+            element: &Self::Element,
+            new: &ToNode<Self>,
+            existing: &ToNode<Self>,
+        ) {
+            let existing = existing.to_node();
+            let index = element
+                .borrow()
+                .children
+                .iter()
+                .position(|c| same(c, &existing))
+                .unwrap();
+            element.borrow_mut().children[index] = new.to_node();
         }
 
         fn append_child(&self, element: &Self::Element, child: &ToNode<Self>) {
@@ -206,7 +224,94 @@ pub mod server {
         }
 
         fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
-            element.borrow_mut().handlers.push(Handler::Click(Rc::new(handle)));
+            element
+                .borrow_mut()
+                .handlers
+                .push(Handler::Click(Rc::new(handle)));
+        }
+    }
+}
+
+pub mod client {
+    use super::{ClickEvent, Node, ToNode};
+    use stdweb::web::{self, IElement, IEventTarget, INode};
+
+    #[derive(Clone)]
+    pub struct Document(web::Document);
+
+    impl Document {
+        pub fn from(doc: web::Document) -> Document {
+            Document(doc)
+        }
+    }
+
+    fn as_node(n: &Node<Document>) -> &web::Node {
+        match n {
+            &Node::Element(ref e) => e.as_node(),
+            &Node::TextNode(ref t) => t.as_node(),
+        }
+    }
+
+    impl ToNode<Document> for web::Element {
+        fn to_node(&self) -> Node<Document> {
+            Node::Element(self.clone())
+        }
+    }
+
+    impl ToNode<Document> for web::TextNode {
+        fn to_node(&self) -> Node<Document> {
+            Node::TextNode(self.clone())
+        }
+    }
+
+    impl super::Document for Document {
+        type Element = web::Element;
+        type TextNode = web::TextNode;
+
+        fn create_element(&self, name: &str) -> Self::Element {
+            self.0.create_element(name).unwrap()
+        }
+
+        fn create_text_node(&self, value: &str) -> Self::TextNode {
+            self.0.create_text_node(value)
+        }
+
+        fn set_attribute(&self, element: &Self::Element, name: &str, value: &str) {
+            drop(element.set_attribute(name, value))
+        }
+
+        fn remove_attribute(&self, element: &Self::Element, name: &str) {
+            element.remove_attribute(name)
+        }
+
+        fn insert_before(
+            &self,
+            element: &Self::Element,
+            new: &ToNode<Self>,
+            existing: &ToNode<Self>,
+        ) {
+            drop(element.insert_before(as_node(&new.to_node()), as_node(&existing.to_node())))
+        }
+
+        fn replace_child(
+            &self,
+            element: &Self::Element,
+            new: &ToNode<Self>,
+            existing: &ToNode<Self>,
+        ) {
+            drop(element.replace_child(as_node(&new.to_node()), as_node(&existing.to_node())))
+        }
+
+        fn append_child(&self, element: &Self::Element, child: &ToNode<Self>) {
+            drop(element.append_child(as_node(&child.to_node())))
+        }
+
+        fn remove_child(&self, element: &Self::Element, child: &ToNode<Self>) {
+            drop(element.remove_child(as_node(&child.to_node())))
+        }
+
+        fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
+            element.add_event_listener(move |_: web::event::ClickEvent| handle(ClickEvent));
         }
     }
 }

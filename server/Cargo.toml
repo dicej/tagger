@@ -1,5 +1,6 @@
 [package]
-name = "server"
+name = "tagger-server"
+description = "Image tagging webapp backend"
 version = "0.1.0"
 authors = ["Joel Dice <joel.dice@gmail.com>"]
 
@@ -16,3 +17,5 @@ rexiv2 = "0.5.0"
 regex = "*"
 sha2 = "*"
 futures = "*"
+clap = "*"
+unicase = "*"

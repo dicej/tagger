@@ -1,6 +1,7 @@
 #![deny(warnings)]
 
 extern crate chrono;
+extern crate clap;
 extern crate env_logger;
 #[macro_use]
 extern crate failure;
@@ -15,30 +16,34 @@ extern crate rusqlite;
 #[macro_use]
 extern crate serde_json;
 extern crate sha2;
+extern crate unicase;
 
-use futures::{Future, Stream};
-use futures::future::{ok, result};
-use failure::Error;
 use chrono::Local;
+use clap::{App, Arg};
 use env_logger::LogBuilder;
+use failure::Error;
+use futures::future::{ok, result};
+use futures::{Future, Stream};
+use hyper::header::{AccessControlAllowHeaders, AccessControlAllowMethods,
+                    AccessControlAllowOrigin, ContentLength, ContentType};
+use hyper::server::{Http, Service};
+use hyper::{Method, Request, Response, StatusCode};
+use regex::Regex;
+use rexiv2::Metadata;
+use rusqlite::Connection;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::env;
-use std::rc::Rc;
-use std::io::Read;
 use std::ffi::OsStr;
+use std::fs::{read_dir, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
-use std::fs::{read_dir, File};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-use rusqlite::Connection;
-use rexiv2::Metadata;
-use regex::Regex;
-use sha2::{Digest, Sha256};
-use serde_json::{Map, Value};
-use hyper::{Get, Post, Request, Response, StatusCode};
-use hyper::server::{Http, Service};
-use hyper::header::{ContentLength, ContentType};
+use unicase::Ascii;
 
 fn init_logger() -> Result<(), Error> {
     let mut builder = LogBuilder::new();
@@ -93,6 +98,7 @@ fn open(state_file: &str) -> Result<Connection, Error> {
 }
 
 fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Error> {
+    // todo: should use futures-fs instead
     let mut buffer = Vec::new();
     File::open(path)?.read_to_end(&mut buffer)?;
     Ok(buffer)
@@ -130,10 +136,11 @@ fn find_new<P: AsRef<Path>>(
             if let Some(name) = entry.file_name().to_str() {
                 let lowercase = name.to_lowercase();
                 if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
-                    let utf = || format_err!("bad utf8");
                     let mut path = dir_buf.clone();
                     path.push(name);
-                    let path = path.strip_prefix(root)?.to_str().ok_or_else(utf)?;
+                    let path = path.strip_prefix(root)?
+                        .to_str()
+                        .ok_or_else(|| format_err!("bad utf8"))?;
                     let lock = lock(conn)?;
                     let mut stmt = lock.prepare("SELECT 1 from paths WHERE path = ?1")?;
                     if let None = stmt.query_map(&[&path], |_| ())?.next() {
@@ -141,9 +148,12 @@ fn find_new<P: AsRef<Path>>(
                             .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
                             .ok()
                             .and_then(|s| {
-                                pattern
-                                    .captures(&s)
-                                    .map(|c| format!("{}-{}-{} {}:{}:{}", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]))
+                                pattern.captures(&s).map(|c| {
+                                    format!(
+                                        "{}-{}-{} {}:{}:{}",
+                                        &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
+                                    )
+                                })
                             }) {
                             result.push((path.to_string(), datetime))
                         }
@@ -184,7 +194,10 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
         info!("insert {} (hash {})", path, hash);
         let mut lock = lock(conn)?;
         let transaction = lock.transaction()?;
-        transaction.execute("INSERT INTO paths (path, hash) VALUES (?1, ?2)", &[path, &hash])?;
+        transaction.execute(
+            "INSERT INTO paths (path, hash) VALUES (?1, ?2)",
+            &[path, &hash],
+        )?;
         transaction.execute(
             "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
             &[&hash, datetime],
@@ -224,8 +237,9 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
 fn state(conn: &Arc<Mutex<Connection>>) -> Result<Value, Error> {
     let mut map = Map::new();
     let lock = lock(conn)?;
-    let mut stmt =
-        lock.prepare("SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash")?;
+    let mut stmt = lock.prepare(
+        "SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash",
+    )?;
     for (hash, datetime, tag) in stmt.query_map(&[], |row| {
         (
             row.get::<_, String>(0),
@@ -270,11 +284,17 @@ fn apply(conn: &Arc<Mutex<Connection>>, patch: Value) -> Result<(), Error> {
 
     match patch["action"].as_str() {
         Some("add") => lock(conn)?
-            .execute("INSERT INTO tags (hash, tag) VALUES (?1, ?2)", &[&hash, &tag])
+            .execute(
+                "INSERT INTO tags (hash, tag) VALUES (?1, ?2)",
+                &[&hash, &tag],
+            )
             .map(drop)
             .map_err(Error::from),
         Some("remove") => lock(conn)?
-            .execute("DELETE FROM tags WHERE hash = ?1 AND tag = ?2", &[&hash, &tag])
+            .execute(
+                "DELETE FROM tags WHERE hash = ?1 AND tag = ?2",
+                &[&hash, &tag],
+            )
             .map(drop)
             .map_err(Error::from),
         _ => Err(format_err!("missing or unexpected action in {}", patch)),
@@ -314,6 +334,21 @@ fn public(public_dir: &str, path: &str) -> Result<(Vec<u8>, ContentType), Error>
     })
 }
 
+fn response() -> Response {
+    Response::new()
+        .with_header(AccessControlAllowOrigin::Any)
+        .with_header(AccessControlAllowHeaders(vec![
+            Ascii::new("content-type".to_string()),
+            Ascii::new("content-length".to_string()),
+        ]))
+        .with_header(AccessControlAllowMethods(vec![
+            Method::Get,
+            Method::Post,
+            Method::Options,
+            Method::Head,
+        ]))
+}
+
 fn handle(
     conn: &Arc<Mutex<Connection>>,
     image_dir: &str,
@@ -323,12 +358,12 @@ fn handle(
     type F = Box<Future<Item = Response, Error = Error>>;
 
     match (req.method(), req.path().to_string().as_ref()) {
-        (&Post, "/patch") => {
+        (&Method::Post, "/patch") => {
             let conn = conn.clone();
             Box::new(
                 req.body()
                     .concat2()
-                    .map_err(Error::from)
+                    .from_err()
                     .and_then(move |body| {
                         result(
                             serde_json::from_slice(&body)
@@ -337,46 +372,55 @@ fn handle(
                         )
                     })
                     .map(|_| {
-                        let response = "OK";
-                        Response::new()
-                            .with_header(ContentLength(response.len() as u64))
+                        let body = "OK";
+                        response()
+                            .with_header(ContentLength(body.len() as u64))
                             .with_header(ContentType::plaintext())
-                            .with_body(response)
+                            .with_body(body)
                     }),
             ) as F
         }
 
-        (&Post, _) => Box::new(ok(Response::new().with_status(StatusCode::MethodNotAllowed))) as F,
+        (&Method::Post, _) => {
+            Box::new(ok(response().with_status(StatusCode::MethodNotAllowed))) as F
+        }
 
-        (&Get, "/state") => Box::new(result(state(conn).map(|state| {
+        (&Method::Get, "/state") => Box::new(result(state(conn).map(|state| {
             let state = state.to_string().as_bytes().to_vec();
-            Response::new()
+            response()
                 .with_header(ContentLength(state.len() as u64))
                 .with_header(ContentType::json())
                 .with_body(state)
         }))) as F,
 
-        (&Get, path) => if path.starts_with("/images/") {
+        (&Method::Get, path) => if path.starts_with("/images/") {
             Box::new(result(image(conn, image_dir, &path[8..]).map(|image| {
-                Response::new()
+                response()
                     .with_header(ContentLength(image.len() as u64))
                     .with_header(ContentType::jpeg())
                     .with_body(image)
             }))) as F
         } else {
-            Box::new(result(public(public_dir, &path[1..]).map(|(file, content_type)| {
-                Response::new()
-                    .with_header(ContentLength(file.len() as u64))
-                    .with_header(content_type)
-                    .with_body(file)
-            }))) as F
+            Box::new(result(public(public_dir, &path[1..]).map(
+                |(file, content_type)| {
+                    response()
+                        .with_header(ContentLength(file.len() as u64))
+                        .with_header(content_type)
+                        .with_body(file)
+                },
+            ))) as F
         },
 
-        _ => Box::new(ok(Response::new().with_status(StatusCode::MethodNotAllowed))) as F,
+        _ => Box::new(ok(response().with_status(StatusCode::MethodNotAllowed))) as F,
     }
 }
 
-fn serve(conn: &Arc<Mutex<Connection>>, address: &str, image_dir: &str, public_dir: &str) -> Result<(), Error> {
+fn serve(
+    conn: &Arc<Mutex<Connection>>,
+    address: &str,
+    image_dir: &str,
+    public_dir: &str,
+) -> Result<(), Error> {
     struct Server {
         conn: Arc<Mutex<Connection>>,
         image_dir: Rc<String>,
@@ -390,15 +434,17 @@ fn serve(conn: &Arc<Mutex<Connection>>, address: &str, image_dir: &str, public_d
         type Future = Box<Future<Item = Response, Error = hyper::Error>>;
 
         fn call(&self, req: Request) -> Self::Future {
-            Box::new(handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
-                error!("request error: {:?}", e);
-                let response = format!("{:?}", e);
-                Box::new(ok(Response::new()
-                    .with_status(StatusCode::InternalServerError)
-                    .with_header(ContentLength(response.len() as u64))
-                    .with_header(ContentType::plaintext())
-                    .with_body(response)))
-            }))
+            Box::new(
+                handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
+                    error!("request error: {:?}", e);
+                    let body = format!("{:?}", e);
+                    Box::new(ok(response()
+                        .with_status(StatusCode::InternalServerError)
+                        .with_header(ContentLength(body.len() as u64))
+                        .with_header(ContentType::plaintext())
+                        .with_body(body)))
+                }),
+            )
         }
     }
 
@@ -443,20 +489,26 @@ fn run(address: &str, image_dir: &str, state_file: &str, public_dir: &str) -> Re
     serve(&conn, address, image_dir, public_dir)
 }
 
+fn arg(name: &str) -> Arg {
+    Arg::with_name(name).takes_value(true).required(true)
+}
+
 fn main() {
-    let mut args = std::env::args();
+    let matches = App::new(env!("CARGO_PKG_DESCRIPTION"))
+        .version(env!("CARGO_PKG_VERSION"))
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .arg(arg("address").help("address to which to bind"))
+        .arg(arg("image directory").help("directoring containing image files"))
+        .arg(arg("state file").help("SQLite database of image metadata to create or reuse"))
+        .arg(arg("public directory").help("directory containing static resources"))
+        .get_matches();
 
-    let usage = format!(
-        "usage: {} <address> <image directory> <state file> <public directory>",
-        args.next().expect("program has no name?")
-    );
-
-    let address = args.next().expect(&usage);
-    let image_dir = args.next().expect(&usage);
-    let state_file = args.next().expect(&usage);
-    let public_dir = args.next().expect(&usage);
-
-    if let Err(e) = run(&address, &image_dir, &state_file, &public_dir) {
+    if let Err(e) = run(
+        matches.value_of("address").unwrap(),
+        matches.value_of("image directory").unwrap(),
+        matches.value_of("state file").unwrap(),
+        matches.value_of("public directory").unwrap(),
+    ) {
         error!("exit on error: {:?}", e);
         exit(-1)
     }

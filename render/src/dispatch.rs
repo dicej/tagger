@@ -1,17 +1,62 @@
 #![deny(warnings)]
 
 use std::cell::RefCell;
-use std::marker::PhantomData;
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Unbounded};
-use std::rc::Rc;
+use std::marker::PhantomData;
 use std::mem::swap;
+use std::rc::Rc;
 
 use dom::{self, ToNode as DomToNode};
 
 fn identity<T>(t: T) -> T {
     t
+}
+
+pub struct Dispatcher<S, D: dom::Document> {
+    update: Rc<RefCell<Option<Box<Update<S, D>>>>>,
+    state: Rc<RefCell<S>>,
+}
+
+impl<S: Clone + 'static, D: dom::Document + 'static> Dispatcher<S, D> {
+    pub fn from(node: &Node<S, S, D>, document: &D, parent: &D::Element, state: &S) -> Self {
+        let state = Rc::new(RefCell::new(state.clone() as S));
+        let update = Rc::new(RefCell::new(None)) as Rc<RefCell<Option<Box<Update<S, D>>>>>;
+
+        *update.borrow_mut() = node.add(
+            document,
+            parent,
+            None,
+            {
+                let state = state.clone();
+                let update = update.clone(); // todo: should this be weak?
+
+                &(Rc::new(move |fun: Box<Fn(S) -> S>| {
+                    let s = state.borrow().clone();
+                    *state.borrow_mut() = fun(s);
+
+                    update
+                        .borrow_mut()
+                        .as_mut()
+                        .map(|ref mut update| update.update(&state.borrow()));
+                }) as Dispatch<S>)
+            },
+            &state.borrow(),
+        ).update;
+
+        Dispatcher { update, state }
+    }
+
+    pub fn dispatch(&self, fun: &Fn(S) -> S) {
+        let s = self.state.borrow().clone();
+        *self.state.borrow_mut() = fun(s);
+
+        self.update
+            .borrow_mut()
+            .as_mut()
+            .map(|ref mut update| update.update(&self.state.borrow()));
+    }
 }
 
 pub trait Update<S, D: dom::Document> {
@@ -99,7 +144,7 @@ impl<S: 'static, T, D: dom::Document + 'static> Node<S, T, D> for Element<S, T, 
         self.handlers
             .iter()
             .for_each(|handler| handler.attach(document, &element, dispatch));
-        document.insert(parent, next, &element);
+        document.insert(parent, &element, next);
 
         struct MyUpdate<S, D: dom::Document> {
             element: D::Element,
@@ -157,7 +202,9 @@ pub fn on_click<T: 'static, D: dom::Document, F: Fn(dom::ClickEvent, T) -> T + '
         handle: Rc<F>,
     }
 
-    impl<T: 'static, D: dom::Document, F: Fn(dom::ClickEvent, T) -> T + 'static> Handler<T, D> for MyHandler<F> {
+    impl<T: 'static, D: dom::Document, F: Fn(dom::ClickEvent, T) -> T + 'static> Handler<T, D>
+        for MyHandler<F>
+    {
         fn attach(&self, document: &D, element: &D::Element, dispatch: &Dispatch<T>) {
             let handle = self.handle.clone();
             let dispatch = dispatch.clone();
@@ -263,7 +310,10 @@ pub trait ToValue<S> {
     fn to_value(self) -> Self::Value;
 }
 
-pub fn attribute<S, T, D: dom::Document + 'static, TV: ToValue<S>>(name: &str, value: TV) -> Box<Node<S, T, D>>
+pub fn attribute<S, T, D: dom::Document + 'static, TV: ToValue<S>>(
+    name: &str,
+    value: TV,
+) -> Box<Node<S, T, D>>
 where
     TV::Value: 'static,
     <TV::Value as Value<S>>::R: 'static,
@@ -287,7 +337,7 @@ where
         _: &S,
     ) -> Added<S, D> {
         let node = document.create_text_node(&self);
-        document.insert(parent, next, &node);
+        document.insert(parent, &node, next);
 
         struct MyRemove<D: dom::Document> {
             document: D,
@@ -347,7 +397,9 @@ impl<'a, S> ToValue<S> for &'a str {
     }
 }
 
-impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'static> Node<S, T, D> for Rc<F> {
+impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'static> Node<S, T, D>
+    for Rc<F>
+{
     fn add(
         &self,
         document: &D,
@@ -358,7 +410,7 @@ impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'st
     ) -> Added<S, D> {
         let text = self(state.clone()).to_string();
         let node = document.create_text_node(&text);
-        document.insert(parent, next, &node);
+        document.insert(parent, &node, next);
 
         struct Tracker<D: dom::Document, F> {
             text: String,
@@ -368,14 +420,16 @@ impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'st
             function: Rc<F>,
         }
 
-        impl<D: dom::Document, TS: ToString, F: Fn(S) -> TS, S: Clone> Update<S, D> for Rc<RefCell<Tracker<D, F>>> {
+        impl<D: dom::Document, TS: ToString, F: Fn(S) -> TS, S: Clone> Update<S, D>
+            for Rc<RefCell<Tracker<D, F>>>
+        {
             fn update(&mut self, state: &S) -> Option<dom::Node<D>> {
                 let mut t = self.borrow_mut();
                 let text = (t.function)(state.clone()).to_string();
                 if text != t.text {
                     let node = t.document.create_text_node(&text);
 
-                    t.document.replace_child(&t.parent, &t.node, &node);
+                    t.document.replace_child(&t.parent, &node, &t.node);
                     t.text = text;
                     t.node = node;
                 }
@@ -428,7 +482,9 @@ impl<S: Clone, T: ToString, F: Fn(S) -> T> ToValue<S> for F {
     }
 }
 
-impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'static> ToNode<S, T, D> for F {
+impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'static>
+    ToNode<S, T, D> for F
+{
     type Node = Rc<F>;
 
     fn to_node(self) -> Self::Node {
@@ -436,7 +492,14 @@ impl<S: Clone, T, D: dom::Document + 'static, TS: ToString, F: Fn(S) -> TS + 'st
     }
 }
 
-pub fn apply<S: Clone, SS: PartialEq + 'static, T, D: dom::Document, F: Fn(S) -> SS + 'static, N: Node<SS, T, D>>(
+pub fn apply<
+    S: Clone,
+    SS: PartialEq + 'static,
+    T,
+    D: dom::Document,
+    F: Fn(S) -> SS + 'static,
+    N: Node<SS, T, D>,
+>(
     function: F,
     node: N,
 ) -> Apply<F, N> {
@@ -452,13 +515,13 @@ pub struct Apply<F, N> {
 }
 
 impl<
-    S: Clone,
-    SS: PartialEq + 'static,
-    T,
-    D: dom::Document + 'static,
-    F: Fn(S) -> SS + 'static,
-    N: Node<SS, T, D>,
-> ToNode<S, T, D> for Apply<F, N>
+        S: Clone,
+        SS: PartialEq + 'static,
+        T,
+        D: dom::Document + 'static,
+        F: Fn(S) -> SS + 'static,
+        N: Node<SS, T, D>,
+    > ToNode<S, T, D> for Apply<F, N>
 {
     type Node = Self;
 
@@ -468,13 +531,13 @@ impl<
 }
 
 impl<
-    S: Clone,
-    SS: PartialEq + 'static,
-    T,
-    D: dom::Document + 'static,
-    F: Fn(S) -> SS + 'static,
-    N: Node<SS, T, D>,
-> Node<S, T, D> for Apply<F, N>
+        S: Clone,
+        SS: PartialEq + 'static,
+        T,
+        D: dom::Document + 'static,
+        F: Fn(S) -> SS + 'static,
+        N: Node<SS, T, D>,
+    > Node<S, T, D> for Apply<F, N>
 {
     fn add(
         &self,
@@ -485,7 +548,11 @@ impl<
         state: &S,
     ) -> Added<S, D> {
         let substate = (self.function)(state.clone());
-        let Added { update, remove, first } = self.node.add(document, parent, next, dispatch, &substate);
+        let Added {
+            update,
+            remove,
+            first,
+        } = self.node.add(document, parent, next, dispatch, &substate);
 
         struct MyUpdate<SS, F, D: dom::Document> {
             substate: SS,
@@ -494,7 +561,9 @@ impl<
             function: Rc<F>,
         }
 
-        impl<SS: PartialEq, F: Fn(S) -> SS, S: Clone, D: dom::Document> Update<S, D> for MyUpdate<SS, F, D> {
+        impl<SS: PartialEq, F: Fn(S) -> SS, S: Clone, D: dom::Document> Update<S, D>
+            for MyUpdate<SS, F, D>
+        {
             fn update(&mut self, state: &S) -> Option<dom::Node<D>> {
                 let substate = (self.function)(state.clone());
                 if self.substate != substate {
@@ -566,15 +635,15 @@ pub struct ApplyAll<S, K, SS, DIF: Diff<K, SS>, F: Fn(S) -> DIF, N> {
 }
 
 impl<
-    S: Clone,
-    K: Ord + Clone + 'static,
-    SS: 'static,
-    DIF: Diff<K, SS> + 'static,
-    T: 'static,
-    D: dom::Document + 'static,
-    F: Fn(S) -> DIF + 'static,
-    N: Node<SS, T, D> + 'static,
-> ToNode<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
+        S: Clone,
+        K: Ord + Clone + 'static,
+        SS: 'static,
+        DIF: Diff<K, SS> + 'static,
+        T: 'static,
+        D: dom::Document + 'static,
+        F: Fn(S) -> DIF + 'static,
+        N: Node<SS, T, D> + 'static,
+    > ToNode<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
 {
     type Node = Self;
 
@@ -584,15 +653,15 @@ impl<
 }
 
 impl<
-    S: Clone,
-    K: Ord + Clone + 'static,
-    SS: 'static,
-    DIF: Diff<K, SS> + 'static,
-    T: 'static,
-    D: dom::Document + 'static,
-    F: Fn(S) -> DIF + 'static,
-    N: Node<SS, T, D> + 'static,
-> Node<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
+        S: Clone,
+        K: Ord + Clone + 'static,
+        SS: 'static,
+        DIF: Diff<K, SS> + 'static,
+        T: 'static,
+        D: dom::Document + 'static,
+        F: Fn(S) -> DIF + 'static,
+        N: Node<SS, T, D> + 'static,
+    > Node<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
 {
     fn add(
         &self,
@@ -622,15 +691,15 @@ impl<
         }
 
         impl<
-            DIF: Diff<K, SS>,
-            T,
-            D: dom::Document,
-            N: Node<SS, T, D>,
-            SS,
-            K: Ord + Clone,
-            F: Fn(S) -> DIF,
-            S: Clone,
-        > Update<S, D> for Rc<RefCell<Tracker<DIF, T, D, N, SS, K, F>>>
+                DIF: Diff<K, SS>,
+                T,
+                D: dom::Document,
+                N: Node<SS, T, D>,
+                SS,
+                K: Ord + Clone,
+                F: Fn(S) -> DIF,
+                S: Clone,
+            > Update<S, D> for Rc<RefCell<Tracker<DIF, T, D, N, SS, K, F>>>
         {
             fn update(&mut self, state: &S) -> Option<dom::Node<D>> {
                 let mut t = self.borrow_mut();
@@ -653,11 +722,17 @@ impl<
                     }
                     DiffEvent::Update(k, v) => if let Entry::Occupied(mut e) = t.map.entry(k) {
                         let &mut (ref mut old, ref mut added) = e.get_mut();
-                        added.first = added.update.as_mut().map(|u| u.update(&v)).and_then(identity);
+                        added.first = added
+                            .update
+                            .as_mut()
+                            .map(|u| u.update(&v))
+                            .and_then(identity);
                         *old = v;
                     },
                     DiffEvent::Remove(k) => {
-                        t.map.remove(&k).map(|(_, added)| added.remove.map(|mut r| r.remove()));
+                        t.map
+                            .remove(&k)
+                            .map(|(_, added)| added.remove.map(|mut r| r.remove()));
                     }
                 });
                 t.substate = substate;
@@ -668,7 +743,9 @@ impl<
             }
         }
 
-        impl<DIF: Diff<K, SS>, T, D: dom::Document, N, SS, K: Ord, F> Remove for Rc<RefCell<Tracker<DIF, T, D, N, SS, K, F>>> {
+        impl<DIF: Diff<K, SS>, T, D: dom::Document, N, SS, K: Ord, F> Remove
+            for Rc<RefCell<Tracker<DIF, T, D, N, SS, K, F>>>
+        {
             fn remove(&mut self) {
                 let mut map = BTreeMap::new();
                 swap(&mut map, &mut self.borrow_mut().map);

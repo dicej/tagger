@@ -5,3 +5,4 @@ authors = ["Joel Dice <joel.dice@gmail.com>"]
 
 [dependencies]
 maplit = "*"
+stdweb = "*"

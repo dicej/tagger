@@ -4,19 +4,19 @@
 macro_rules! html_impl {
     ($stack:ident (< $name:ident $($tail:tt)*)) => {
         #[allow(unused_mut)]        
-        let mut $stack = ($crate::render::Element::new(stringify!($name)), $stack);
+        let mut $stack = ($crate::dispatch::Element::new(stringify!($name)), $stack);
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident (onclick = $handler:expr, $($tail:tt)*)) => {
-        $stack.0.handlers.push($crate::render::on_click($handler));
+        $stack.0.handlers.push($crate::dispatch::on_click($handler));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident ($name:ident = $value:expr, $($tail:tt)*)) => {
-        $stack.0.children.push($crate::render::attribute(stringify!($name), $value));
+        $stack.0.children.push($crate::dispatch::attribute(stringify!($name), $value));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident ({ $value:expr } $($tail:tt)*)) => {
-        $stack.0.children.push($crate::render::to_node($value));
+        $stack.0.children.push($crate::dispatch::to_node($value));
         html_impl! { $stack ($($tail)*) }
     };
     ($stack:ident (> $($tail:tt)*)) => {
@@ -47,7 +47,7 @@ macro_rules! html_impl {
 macro_rules! html {
     ($($tail:tt)*) => {{
         #[allow(unused_mut)]
-        let mut stack = ($crate::render::Element::new("root"), ());
+        let mut stack = ($crate::dispatch::Element::new("root"), ());
         html_impl! { stack ($($tail)*) }
     }};
 }
