@@ -3,12 +3,20 @@
 #[cfg(test)]
 #[macro_use]
 extern crate maplit;
+
+#[cfg(feature = "stdweb")]
 extern crate stdweb;
+
+#[cfg(feature = "im")]
+extern crate im;
 
 #[macro_use]
 pub mod macros;
 pub mod dispatch;
 pub mod dom;
+
+#[cfg(feature = "im")]
+pub mod im_diff;
 
 #[cfg(test)]
 mod tests {
@@ -130,9 +138,9 @@ mod tests {
         );
     }
 
-    impl dispatch::Diff<u32, char> for BTreeMap<u32, char> {
+    impl dispatch::Diff<(u32, char)> for BTreeMap<u32, char> {
         type Iterator = btree_map::IntoIter<u32, char>;
-        type DiffIterator = vec::IntoIter<dispatch::DiffEvent<u32, char>>;
+        type DiffIterator = vec::IntoIter<dispatch::DiffEvent<(u32, char)>>;
 
         fn iter(&self) -> Self::Iterator {
             self.clone().into_iter()
@@ -145,17 +153,21 @@ mod tests {
                         if c == v {
                             None
                         } else {
-                            Some(dispatch::DiffEvent::Update(*k, *c))
+                            println!("new is {:?}", (*k, *c));
+                            Some(dispatch::DiffEvent::Update {
+                                old: (*k, *v),
+                                new: (*k, *c),
+                            })
                         }
                     } else {
-                        Some(dispatch::DiffEvent::Remove(*k))
+                        Some(dispatch::DiffEvent::Remove((*k, *v)))
                     }
                 })
                 .chain(new.into_iter().filter_map(|(k, v)| {
                     if self.get(k).is_some() {
                         None
                     } else {
-                        Some(dispatch::DiffEvent::Add(*k, *v))
+                        Some(dispatch::DiffEvent::Add((*k, *v)))
                     }
                 }))
                 .collect::<Vec<_>>()
@@ -168,7 +180,7 @@ mod tests {
         assert_eq!(
             "<foo>abcd</foo>",
             &render(
-                &html!(<foo>{dispatch::apply_all(|s| s, html!({|s| s}))}</foo>),
+                &html!(<foo>{dispatch::apply_all(|s| s, html!({|(_,v)| v}))}</foo>),
                 &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd']
             )
         );
@@ -179,7 +191,7 @@ mod tests {
         assert_eq!(
             &vec!["<foo>abcd</foo>", "<foo>zbCde</foo>"],
             &render_with_updates(
-                &html!(<foo>{dispatch::apply_all(|s| s, html!({|s| s}))}</foo>),
+                &html!(<foo>{dispatch::apply_all(|s| s, html!({|(_,v)| v}))}</foo>),
                 &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],
                 &[&|mut s| {
                     s.insert(0, 'z');
@@ -213,7 +225,7 @@ mod tests {
                 },><bar id="43", onclick=|_, mut s: BTreeMap<_, _>| {
                     s.insert(4, 'D');
 		                s
-		            },/>{dispatch::apply_all(|s| s, html!({|s| s}))}</foo>),
+		            },/>{dispatch::apply_all(|s| s, html!({|(_,v)| v}))}</foo>),
                 &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],
                 &[("42", &click), ("43", &click)],
             )

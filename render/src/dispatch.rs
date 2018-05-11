@@ -1,7 +1,6 @@
 #![deny(warnings)]
 
 use std::cell::RefCell;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::Bound::{Excluded, Unbounded};
 use std::marker::PhantomData;
@@ -589,15 +588,15 @@ impl<
     }
 }
 
-pub enum DiffEvent<K, V> {
-    Add(K, V),
-    Update(K, V),
-    Remove(K),
+pub enum DiffEvent<T> {
+    Add(T),
+    Update { old: T, new: T },
+    Remove(T),
 }
 
-pub trait Diff<K, V> {
-    type Iterator: Iterator<Item = (K, V)>;
-    type DiffIterator: Iterator<Item = DiffEvent<K, V>>;
+pub trait Diff<T> {
+    type Iterator: Iterator<Item = T>;
+    type DiffIterator: Iterator<Item = DiffEvent<T>>;
 
     fn iter(&self) -> Self::Iterator;
 
@@ -606,9 +605,8 @@ pub trait Diff<K, V> {
 
 pub fn apply_all<
     S: Clone,
-    K: Ord + 'static,
-    SS: 'static,
-    DIF: Diff<K, SS> + 'static,
+    SS: Ord + 'static,
+    DIF: Diff<SS> + 'static,
     T,
     D: dom::Document + 'static,
     F: Fn(S) -> DIF + 'static,
@@ -616,19 +614,17 @@ pub fn apply_all<
 >(
     function: F,
     node: N,
-) -> ApplyAll<S, K, SS, DIF, F, N> {
+) -> ApplyAll<S, SS, DIF, F, N> {
     ApplyAll {
         _s: PhantomData,
-        _k: PhantomData,
         _subs: PhantomData,
         node: Rc::new(node),
         function: Rc::new(function),
     }
 }
 
-pub struct ApplyAll<S, K, SS, DIF: Diff<K, SS>, F: Fn(S) -> DIF, N> {
+pub struct ApplyAll<S, SS, DIF: Diff<SS>, F: Fn(S) -> DIF, N> {
     _s: PhantomData<S>,
-    _k: PhantomData<K>,
     _subs: PhantomData<SS>,
     node: Rc<N>,
     function: Rc<F>,
@@ -636,14 +632,13 @@ pub struct ApplyAll<S, K, SS, DIF: Diff<K, SS>, F: Fn(S) -> DIF, N> {
 
 impl<
         S: Clone,
-        K: Ord + Clone + 'static,
-        SS: 'static,
-        DIF: Diff<K, SS> + 'static,
+        SS: Ord + Clone + 'static,
+        DIF: Diff<SS> + 'static,
         T: 'static,
         D: dom::Document + 'static,
         F: Fn(S) -> DIF + 'static,
         N: Node<SS, T, D> + 'static,
-    > ToNode<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
+    > ToNode<S, T, D> for ApplyAll<S, SS, DIF, F, N>
 {
     type Node = Self;
 
@@ -654,14 +649,13 @@ impl<
 
 impl<
         S: Clone,
-        K: Ord + Clone + 'static,
-        SS: 'static,
-        DIF: Diff<K, SS> + 'static,
+        SS: Ord + Clone + 'static,
+        DIF: Diff<SS> + 'static,
         T: 'static,
         D: dom::Document + 'static,
         F: Fn(S) -> DIF + 'static,
         N: Node<SS, T, D> + 'static,
-    > Node<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
+    > Node<S, T, D> for ApplyAll<S, SS, DIF, F, N>
 {
     fn add(
         &self,
@@ -674,82 +668,83 @@ impl<
         let substate = (self.function)(state.clone());
         let map = substate
             .iter()
-            .map(|(k, v)| {
+            .map(|v| {
                 let added = self.node.as_ref().add(document, parent, next, dispatch, &v);
-                (k, (v, added))
+                (v, added)
             })
             .collect::<BTreeMap<_, _>>();
 
-        struct Tracker<DIF: Diff<K, SS>, T, D: dom::Document, N, SS, K, F> {
+        struct Tracker<DIF: Diff<SS>, T, D: dom::Document, N, SS, F> {
             document: D,
             parent: D::Element,
             dispatch: Dispatch<T>,
             node: Rc<N>,
             substate: DIF,
-            map: BTreeMap<K, (SS, Added<SS, D>)>,
+            map: BTreeMap<SS, Added<SS, D>>,
             function: Rc<F>,
         }
 
         impl<
-                DIF: Diff<K, SS>,
+                DIF: Diff<SS>,
                 T,
                 D: dom::Document,
                 N: Node<SS, T, D>,
-                SS,
-                K: Ord + Clone,
+                SS: Ord + Clone,
                 F: Fn(S) -> DIF,
                 S: Clone,
-            > Update<S, D> for Rc<RefCell<Tracker<DIF, T, D, N, SS, K, F>>>
+            > Update<S, D> for Rc<RefCell<Tracker<DIF, T, D, N, SS, F>>>
         {
             fn update(&mut self, state: &S) -> Option<dom::Node<D>> {
                 let mut t = self.borrow_mut();
                 let substate = (t.function)(state.clone());
                 t.substate.diff(&substate).for_each(|event| match event {
-                    DiffEvent::Add(k, v) => {
+                    DiffEvent::Add(v) => {
                         let added = t.node.as_ref().add(
                             &t.document,
                             &t.parent,
                             t.map
-                                .range((Excluded(k.clone()), Unbounded))
-                                .filter_map(|(_, &(_, ref added))| added.first.clone())
+                                .range((Excluded(v.clone()), Unbounded))
+                                .filter_map(|(_, added)| added.first.clone())
                                 .next()
                                 .as_ref()
                                 .map(|n| n as &dom::ToNode<D>),
                             &t.dispatch,
                             &v,
                         );
-                        t.map.insert(k, (v, added));
+                        t.map.insert(v, added);
                     }
-                    DiffEvent::Update(k, v) => if let Entry::Occupied(mut e) = t.map.entry(k) {
-                        let &mut (ref mut old, ref mut added) = e.get_mut();
-                        added.first = added
-                            .update
-                            .as_mut()
-                            .map(|u| u.update(&v))
-                            .and_then(identity);
-                        *old = v;
-                    },
-                    DiffEvent::Remove(k) => {
+                    DiffEvent::Update { new, old } => {
+                        if let Some(mut added) = t.map.remove(&old) {
+                            added.first = added
+                                .update
+                                .as_mut()
+                                .map(|u| u.update(&new))
+                                .and_then(identity);
+
+                            t.map.insert(new, added);
+                        }
+                    }
+                    DiffEvent::Remove(v) => {
                         t.map
-                            .remove(&k)
-                            .map(|(_, added)| added.remove.map(|mut r| r.remove()));
+                            .remove(&v)
+                            .map(|added| added.remove.map(|mut r| r.remove()));
                     }
                 });
                 t.substate = substate;
                 t.map
                     .iter()
-                    .filter_map(|(_, &(_, ref added))| added.first.clone())
+                    .filter_map(|(_, added)| added.first.clone())
                     .next()
             }
         }
 
-        impl<DIF: Diff<K, SS>, T, D: dom::Document, N, SS, K: Ord, F> Remove
-            for Rc<RefCell<Tracker<DIF, T, D, N, SS, K, F>>>
+        impl<DIF: Diff<SS>, T, D: dom::Document, N, SS: Ord, F> Remove
+            for Rc<RefCell<Tracker<DIF, T, D, N, SS, F>>>
         {
             fn remove(&mut self) {
                 let mut map = BTreeMap::new();
                 swap(&mut map, &mut self.borrow_mut().map);
-                map.into_iter().for_each(|(_, (_, added))| {
+                map.into_iter().for_each(|(_, added)| {
                     added.remove.map(|mut r| r.remove());
                 });
             }
@@ -769,7 +764,7 @@ impl<
             .borrow()
             .map
             .iter()
-            .filter_map(|(_, &(_, ref added))| added.first.clone())
+            .filter_map(|(_, added)| added.first.clone())
             .next();
 
         Added {

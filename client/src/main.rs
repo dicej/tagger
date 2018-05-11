@@ -9,33 +9,28 @@ extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
 extern crate im;
-extern crate render;
 #[macro_use]
-extern crate derive_deref;
+extern crate render;
 
-mod collections;
-
-use collections::{Map, Set};
 use failure::Error;
-use render::dispatch::{Dispatcher, Node};
+use im::{OrdMap, OrdSet};
+use render::dispatch::{apply_all, Dispatcher, Node};
 use render::dom;
 use render::dom::client::Document;
+use render::im_diff::KeyValue;
 use stdweb::web::event::ReadyStateChangeEvent;
 use stdweb::web::{document, IEventTarget, XhrReadyState, XmlHttpRequest};
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 struct Image {
     datetime: String,
-    tags: Set<String>,
+    tags: OrdSet<String>,
 }
 
-#[derive(Clone, Deserialize)]
-struct State {
-    images: Map<String, Image>,
-}
+type State = OrdMap<String, Image>;
 
-fn node<D: dom::Document>() -> Box<Node<State, State, D>> {
-    unimplemented!()
+fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
+    html!({ apply_all(|s| s, html!(<div>{|KeyValue(k,_)| k}</div>)) })
 }
 
 fn render(state: &str) -> Result<(), Error> {

@@ -5,4 +5,5 @@ authors = ["Joel Dice <joel.dice@gmail.com>"]
 
 [dependencies]
 maplit = "*"
-stdweb = "*"
+stdweb = { version = "*", optional = true }
+im = { git = "https://github.com/bodil/im-rs", optional = true }

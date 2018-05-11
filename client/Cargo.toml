@@ -5,11 +5,10 @@ version = "0.1.0"
 authors = ["Joel Dice <joel.dice@gmail.com>"]
 
 [dependencies]
-im = "*"
+im = { git = "https://github.com/bodil/im-rs", features = ["serde"] }
 serde = "*"
 serde_derive = "*"
 serde_json = "*"
 stdweb = "*"
 failure = "*"
-derive_deref = "*"
-render = { path = "../render" }
+render = { path = "../render", features = ["stdweb", "im"] }

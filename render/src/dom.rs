@@ -232,6 +232,7 @@ pub mod server {
     }
 }
 
+#[cfg(feature = "stdweb")]
 pub mod client {
     use super::{ClickEvent, Node, ToNode};
     use stdweb::web::{self, IElement, IEventTarget, INode};
