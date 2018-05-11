@@ -138,9 +138,9 @@ mod tests {
         );
     }
 
-    impl dispatch::Diff<(u32, char)> for BTreeMap<u32, char> {
+    impl dispatch::Diff<u32, char> for BTreeMap<u32, char> {
         type Iterator = btree_map::IntoIter<u32, char>;
-        type DiffIterator = vec::IntoIter<dispatch::DiffEvent<(u32, char)>>;
+        type DiffIterator = vec::IntoIter<dispatch::DiffEvent<u32, char>>;
 
         fn iter(&self) -> Self::Iterator {
             self.clone().into_iter()
@@ -155,19 +155,26 @@ mod tests {
                         } else {
                             println!("new is {:?}", (*k, *c));
                             Some(dispatch::DiffEvent::Update {
-                                old: (*k, *v),
-                                new: (*k, *c),
+                                key: *k,
+                                old_value: *v,
+                                new_value: *c,
                             })
                         }
                     } else {
-                        Some(dispatch::DiffEvent::Remove((*k, *v)))
+                        Some(dispatch::DiffEvent::Remove {
+                            key: *k,
+                            old_value: *v,
+                        })
                     }
                 })
                 .chain(new.into_iter().filter_map(|(k, v)| {
                     if self.get(k).is_some() {
                         None
                     } else {
-                        Some(dispatch::DiffEvent::Add((*k, *v)))
+                        Some(dispatch::DiffEvent::Add {
+                            key: *k,
+                            new_value: *v,
+                        })
                     }
                 }))
                 .collect::<Vec<_>>()

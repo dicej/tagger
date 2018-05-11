@@ -17,7 +17,6 @@ use im::{OrdMap, OrdSet};
 use render::dispatch::{apply_all, Dispatcher, Node};
 use render::dom;
 use render::dom::client::Document;
-use render::im_diff::KeyValue;
 use stdweb::web::event::ReadyStateChangeEvent;
 use stdweb::web::{document, IEventTarget, XhrReadyState, XmlHttpRequest};
 
@@ -30,7 +29,7 @@ struct Image {
 type State = OrdMap<String, Image>;
 
 fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
-    html!({ apply_all(|s| s, html!(<div>{|KeyValue(k,_)| k}</div>)) })
+    html!({ apply_all(|s| s, html!(<div>{|(k,_)| k}</div>)) })
 }
 
 fn render(state: &str) -> Result<(), Error> {
