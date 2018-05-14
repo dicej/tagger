@@ -21,6 +21,8 @@ use std::sync::Arc;
 use stdweb::web::event::ReadyStateChangeEvent;
 use stdweb::web::{document, IEventTarget, XhrReadyState, XmlHttpRequest};
 
+static SERVER: &str = "http://localhost:2238";
+
 #[derive(Clone, Deserialize, PartialEq)]
 struct Image {
     datetime: String,
@@ -35,6 +37,7 @@ fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
         apply_all(|s| s,
           html!(
             <tr>
+              <td><img src=|(hash, _)| format!("{}/images/small/{}", SERVER, hash),/></td>
               <td>{|(hash, _)| hash}</td>
               <td>{|(_, image): (_, Arc<Image>)| image.datetime.clone()}</td>
               <td>{|(_, image): (_, Arc<Image>)| image.tags.iter().map(|s| String::from(&s as &str)).collect::<Vec<_>>().join(", ")}</td>
@@ -74,7 +77,7 @@ fn send_request() -> Result<(), Error> {
         }
     });
 
-    request.open("GET", "http://localhost:2237/state")?;
+    request.open("GET", &format!("{}/state", SERVER))?;
 
     request.send()?;
 
