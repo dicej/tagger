@@ -15,6 +15,7 @@ extern crate rexiv2;
 extern crate rusqlite;
 #[macro_use]
 extern crate serde_json;
+extern crate image;
 extern crate sha2;
 extern crate unicase;
 
@@ -28,9 +29,10 @@ use hyper::header::{AccessControlAllowHeaders, AccessControlAllowMethods,
                     AccessControlAllowOrigin, ContentLength, ContentType};
 use hyper::server::{Http, Service};
 use hyper::{Method, Request, Response, StatusCode};
+use image::{load_from_memory_with_format, FilterType, GenericImage, ImageFormat, ImageOutputFormat};
 use regex::Regex;
 use rexiv2::Metadata;
-use rusqlite::Connection;
+use rusqlite::{Connection, DatabaseName};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::env;
@@ -44,6 +46,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{sleep, spawn};
 use std::time::{Duration, Instant};
 use unicase::Ascii;
+
+const SMALL_BOUNDS: (u32, u32) = (320, 240);
+const LARGE_BOUNDS: (u32, u32) = (1920, 1440);
+const JPEG_QUALITY: u8 = 90;
+
+// todo: upgrade to a new Tokio and use `blocking` API for anywhere we
+// might block (e.g. filesystem, mutex, DB, image processing)
 
 fn init_logger() -> Result<(), Error> {
     let mut builder = LogBuilder::new();
@@ -78,7 +87,8 @@ fn open(state_file: &str) -> Result<Connection, Error> {
         "CREATE TABLE IF NOT EXISTS images (
            hash      TEXT NOT NULL PRIMARY KEY,
            datetime  TEXT NOT NULL,
-           thumbnail BLOB
+           small BLOB,
+           large BLOB
          )",
         &[],
     )?;
@@ -98,7 +108,6 @@ fn open(state_file: &str) -> Result<Connection, Error> {
 }
 
 fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Error> {
-    // todo: should use futures-fs instead
     let mut buffer = Vec::new();
     File::open(path)?.read_to_end(&mut buffer)?;
     Ok(buffer)
@@ -138,12 +147,12 @@ fn find_new<P: AsRef<Path>>(
                 if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
                     let mut path = dir_buf.clone();
                     path.push(name);
-                    let path = path.strip_prefix(root)?
+                    let stripped = path.strip_prefix(root)?
                         .to_str()
                         .ok_or_else(|| format_err!("bad utf8"))?;
                     let lock = lock(conn)?;
-                    let mut stmt = lock.prepare("SELECT 1 from paths WHERE path = ?1")?;
-                    if let None = stmt.query_map(&[&path], |_| ())?.next() {
+                    let mut stmt = lock.prepare("SELECT 1 FROM paths WHERE path = ?1")?;
+                    if let None = stmt.query_map(&[&stripped], |_| ())?.next() {
                         if let Some(datetime) = Metadata::new_from_path(&path)
                             .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
                             .ok()
@@ -155,7 +164,9 @@ fn find_new<P: AsRef<Path>>(
                                     )
                                 })
                             }) {
-                            result.push((path.to_string(), datetime))
+                            result.push((stripped.to_string(), datetime))
+                        } else {
+                            warn!("unable to get metadata for {}", lowercase);
                         }
                     }
                     drop(stmt);
@@ -209,13 +220,13 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
         info!("delete {}", path);
         let mut lock = lock(conn)?;
         let transaction = lock.transaction()?;
-        let mut stmt = transaction.prepare("SELECT hash from paths WHERE path = ?1")?;
+        let mut stmt = transaction.prepare("SELECT hash FROM paths WHERE path = ?1")?;
         if let Some(hash) = stmt.query_map(&[path], |row| row.get::<_, String>(0))?
             .filter_map(Result::ok)
             .next()
         {
             transaction.execute("DELETE FROM paths WHERE path = ?1", &[path])?;
-            let mut stmt = transaction.prepare("SELECT 1 from paths WHERE hash = ?1")?;
+            let mut stmt = transaction.prepare("SELECT 1 FROM paths WHERE hash = ?1")?;
             if let None = stmt.query_map(&[path], |_| ())?.next() {
                 transaction.execute("DELETE FROM images WHERE hash = ?1", &[&hash])?;
             }
@@ -301,22 +312,96 @@ fn apply(conn: &Arc<Mutex<Connection>>, patch: Value) -> Result<(), Error> {
     }
 }
 
-fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<Vec<u8>, Error> {
-    if path.starts_with("thumb/") {
-        Err(format_err!("todo: lazily create thumbs"))
+fn full_size_image(
+    conn: &Arc<Mutex<Connection>>,
+    image_dir: &str,
+    path: &str,
+) -> Result<Vec<u8>, Error> {
+    let lock = lock(conn)?;
+    let mut stmt = lock.prepare("SELECT path FROM paths WHERE hash = ?1 LIMIT 1")?;
+    let result = if let Some(path) = stmt.query_map(&[&path], |row| row.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .next()
+    {
+        content([image_dir, &path].iter().collect::<PathBuf>())
     } else {
-        let lock = lock(conn)?;
-        let mut stmt = lock.prepare("SELECT path from paths WHERE hash = ?1 LIMIT 1")?;
-        let result = if let Some(path) = stmt.query_map(&[&path], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .next()
-        {
-            content([image_dir, &path].iter().collect::<PathBuf>())
+        Err(format_err!("image not found: {}", path))
+    };
+    drop(stmt);
+    result
+}
+
+fn bound(
+    (native_width, native_height): (u32, u32),
+    (bound_width, bound_height): (u32, u32),
+) -> (u32, u32) {
+    if native_width * bound_height > bound_width * native_height {
+        (bound_width, (native_height * bound_width) / native_width)
+    } else {
+        ((native_width * bound_height) / native_height, bound_height)
+    }
+}
+
+fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<Vec<u8>, Error> {
+    if path.starts_with("small/") || path.starts_with("large/") {
+        let mut split = path.split('/');
+        if let (Some(size), Some(path)) = (split.next(), split.next()) {
+            let result = {
+                let lock = lock(conn)?;
+                let mut stmt = lock.prepare("SELECT rowid FROM images WHERE hash = ?1 LIMIT 1")?;
+                let row = stmt.query_map(&[&path], |row| row.get::<_, i64>(0))?
+                    .filter_map(Result::ok)
+                    .next();
+                drop(stmt);
+
+                let result = row.and_then(|row| {
+                    lock.blob_open(DatabaseName::Main, "images", size, row, true)
+                        .ok()
+                }).and_then(|mut blob| {
+                    let mut result = Vec::new();
+                    blob.read_to_end(&mut result).ok().map(|_| result)
+                });
+
+                result
+            };
+
+            if let Some(result) = result {
+                Ok(result)
+            } else {
+                let native_size = load_from_memory_with_format(
+                    &full_size_image(conn, image_dir, path)?,
+                    ImageFormat::JPEG,
+                )?;
+
+                let (width, height) = bound(
+                    native_size.dimensions(),
+                    if size == "small" {
+                        SMALL_BOUNDS
+                    } else {
+                        LARGE_BOUNDS
+                    },
+                );
+
+                let mut encoded = Vec::new();
+                native_size
+                    .resize(width, height, FilterType::Lanczos3)
+                    .write_to(&mut encoded, ImageOutputFormat::JPEG(JPEG_QUALITY))?;
+
+                lock(conn)?
+                    .execute(
+                        &format!("UPDATE images SET {} = ?1 WHERE hash = ?2", size),
+                        &[&encoded, &path],
+                    )
+                    .map(drop)
+                    .map_err(Error::from)?;
+
+                Ok(encoded)
+            }
         } else {
-            Err(format_err!("image not found: {}", path))
-        };
-        drop(stmt);
-        result
+            Err(format_err!("malformed image path: {}", path))
+        }
+    } else {
+        full_size_image(conn, image_dir, path)
     }
 }
 

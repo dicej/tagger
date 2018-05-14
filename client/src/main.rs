@@ -17,6 +17,7 @@ use im::{OrdMap, OrdSet};
 use render::dispatch::{apply_all, Dispatcher, Node};
 use render::dom;
 use render::dom::client::Document;
+use std::sync::Arc;
 use stdweb::web::event::ReadyStateChangeEvent;
 use stdweb::web::{document, IEventTarget, XhrReadyState, XmlHttpRequest};
 
@@ -29,7 +30,19 @@ struct Image {
 type State = OrdMap<String, Image>;
 
 fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
-    html!({ apply_all(|s| s, html!(<div>{|(k,_)| k}</div>)) })
+    html!(
+      <table>{
+        apply_all(|s| s,
+          html!(
+            <tr>
+              <td>{|(hash, _)| hash}</td>
+              <td>{|(_, image): (_, Arc<Image>)| image.datetime.clone()}</td>
+              <td>{|(_, image): (_, Arc<Image>)| image.tags.iter().map(|s| String::from(&s as &str)).collect::<Vec<_>>().join(", ")}</td>
+            </tr>
+          )
+        )
+      }</table>
+   )
 }
 
 fn render(state: &str) -> Result<(), Error> {
@@ -46,7 +59,7 @@ fn render(state: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn run() -> Result<(), Error> {
+fn send_request() -> Result<(), Error> {
     let request = XmlHttpRequest::new();
 
     request.add_event_listener({
@@ -56,7 +69,7 @@ fn run() -> Result<(), Error> {
                 (request.ready_state(), request.response_text())
             {
                 console!(log, format!("response is {}", response));
-                drop(log_error(render(&response)));
+                log_error(render(&response));
             }
         }
     });
@@ -68,17 +81,19 @@ fn run() -> Result<(), Error> {
     Ok(())
 }
 
-fn log_error(result: Result<(), Error>) -> Result<(), Error> {
+fn log_error(result: Result<(), Error>) -> bool {
     if let &Err(ref e) = &result {
         console!(error, format!("exit on error: {:?}", e));
+        true
+    } else {
+        false
     }
-    result
 }
 
 fn main() {
     stdweb::initialize();
 
-    if log_error(run()).is_ok() {
+    if !log_error(send_request()) {
         stdweb::event_loop();
     }
 }

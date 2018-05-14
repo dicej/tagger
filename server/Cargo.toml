@@ -5,7 +5,7 @@ version = "0.1.0"
 authors = ["Joel Dice <joel.dice@gmail.com>"]
 
 [dependencies]
-rusqlite = { version = "*", features = ["bundled"] }
+rusqlite = { version = "*", features = ["bundled", "blob"] }
 failure = "*"
 serde_json = "*"
 hyper = "*"
@@ -19,3 +19,4 @@ sha2 = "*"
 futures = "*"
 clap = "*"
 unicase = "*"
+image = "*"
