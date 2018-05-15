@@ -140,21 +140,26 @@ impl<S: 'static, T, D: dom::Document + 'static> Node<S, T, D> for Element<S, T, 
         let children = self.children
             .iter()
             .filter_map(|n| n.add(document, &element, None, dispatch, state).update)
-            .collect::<Vec<_>>();
-        self.handlers
+            .collect();
+        let handlers = self.handlers
             .iter()
-            .for_each(|handler| handler.attach(document, &element, dispatch));
+            .map(|handler| handler.attach(document, &element, dispatch, state))
+            .collect();
         document.insert(parent, &element, next);
 
         struct MyUpdate<S, D: dom::Document> {
             element: D::Element,
             children: Vec<Box<Update<S, D>>>,
+            handlers: Vec<Box<HandlerUpdate<S>>>,
         }
 
         impl<S, D: dom::Document> Update<S, D> for MyUpdate<S, D> {
             fn update(&mut self, state: &S) -> Option<dom::Node<D>> {
                 self.children.iter_mut().for_each(|u| {
                     u.update(state);
+                });
+                self.handlers.iter_mut().for_each(|h| {
+                    h.update(state);
                 });
                 Some(self.element.to_node())
             }
@@ -179,6 +184,7 @@ impl<S: 'static, T, D: dom::Document + 'static> Node<S, T, D> for Element<S, T, 
                 Some(Box::new(MyUpdate {
                     element: element.clone(),
                     children,
+                    handlers: self.handlers.clone(),
                 }))
             },
             remove: Some(Box::new(MyRemove {
@@ -191,27 +197,57 @@ impl<S: 'static, T, D: dom::Document + 'static> Node<S, T, D> for Element<S, T, 
     }
 }
 
-pub trait Handler<T, D: dom::Document> {
-    fn attach(&self, document: &D, element: &D::Element, dispatch: &Dispatch<T>);
+pub trait HandlerUpdate<S> {
+    fn update(&mut self, state: &S);
 }
 
-pub fn on_click<T: 'static, D: dom::Document, F: Fn(dom::ClickEvent, T) -> T + 'static>(
+pub trait Handler<S, T, D: dom::Document> {
+    fn attach(
+        &self,
+        document: &D,
+        element: &D::Element,
+        dispatch: &Dispatch<T>,
+    ) -> Box<HandlerUpdate<S>>;
+}
+
+pub fn on_click<S, T: 'static, D: dom::Document, F: Fn((S, dom::ClickEvent), T) -> T + 'static>(
     handle: F,
 ) -> Box<Handler<T, D>> {
     struct MyHandler<F> {
         handle: Rc<F>,
     }
 
-    impl<T: 'static, D: dom::Document, F: Fn(dom::ClickEvent, T) -> T + 'static> Handler<T, D>
-        for MyHandler<F>
+    impl<S, T: 'static, D: dom::Document, F: Fn((S, dom::ClickEvent), T) -> T + 'static>
+        Handler<S, T, D> for MyHandler<F>
     {
-        fn attach(&self, document: &D, element: &D::Element, dispatch: &Dispatch<T>) {
+        fn attach(
+            &self,
+            document: &D,
+            element: &D::Element,
+            state: &S,
+            dispatch: &Dispatch<T>,
+        ) -> Box<HandlerUpdate<S>> {
             let handle = self.handle.clone();
             let dispatch = dispatch.clone();
+            let state = Rc::new(RefCell::new(state.clone()));
             document.on_click(element, move |event| {
                 let handle = handle.clone();
-                dispatch(Box::new(move |state| handle(event.clone(), state)))
+                dispatch(Box::new(move |top| {
+                    handle((state.borrow().clone(), event.clone()), top)
+                }))
             });
+
+            struct MyUpdate<S> {
+                state: Rc<Cell<S>>,
+            }
+
+            impl<S> HandlerUpdate<S> for MyUpdate<S> {
+                fn update(&mut self, state: &S) {
+                    *self.state.borrow_mut() = state;
+                }
+            }
+
+            MyUpdate { state }
         }
     }
 
@@ -682,7 +718,7 @@ impl<
                         .add(document, parent, next, dispatch, &(k, v.clone())),
                 )
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect();
 
         struct Tracker<DIF: Diff<K, SS>, T, D: dom::Document, N, K, SS, F> {
             document: D,

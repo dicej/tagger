@@ -29,22 +29,67 @@ struct Image {
     tags: OrdSet<String>,
 }
 
-type State = OrdMap<String, Image>;
+struct State {
+    all: OrdMap<String, Image>,
+    visible: OrdMap<String, Selectable>,
+}
+
+impl State {
+    fn from(all: OrdMap<String, Image>) -> Self {
+        State {
+            all,
+            visible: all,
+            selected: OrdSet::new(),
+        }
+    }
+}
+
+fn tag_menu<D: dom::Document + 'static>(menu_type: MenuType) -> Box<Node<State, State, D>> {
+    html!(
+        <table>
+            <tr onclick=|_, s: State| s.toggle_all(),>
+                <td>{|s| if s.get_all() { "✔" } else { " " }}</td>
+                <td>{"All"}</td>
+            </tr>
+            <tr onclick=|_, s: State| s.toggle_untagged(),>
+                <td>{|s| if s.get_untagged() { "✔" } else { " " }}</td>
+                <td>{"Untagged"}</td>
+            </tr>
+            {apply_all(|s| s.get_tags(menu_type),
+                       html!(
+                           <tr onclick=|((tag, ), _), s: State| s.toggle_tag(menu_type, tag),>
+                               <td>{|(tag, )| if s.get_tag(menu_type, tag) { "✔" } else { " " }}</td>
+                               <td>{|(tag, )| tag}</td>
+                           </tr>
+                       ))}
+        </table>
+    )
+}
 
 fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
     html!(
-      <table>{
-        apply_all(|s| s,
-          html!(
-            <tr>
-              <td><img src=|(hash, _)| format!("{}/images/small/{}", SERVER, hash),/></td>
-              <td>{|(hash, _)| hash}</td>
-              <td>{|(_, image): (_, Arc<Image>)| image.datetime.clone()}</td>
-              <td>{|(_, image): (_, Arc<Image>)| image.tags.iter().map(|s| String::from(&s as &str)).collect::<Vec<_>>().join(", ")}</td>
-            </tr>
-          )
-        )
-      }</table>
+        <div>
+            <a href="#", onclick=|_, s: State| s.toggle_filter(),>{"Filter"}</a>
+            {maybe(|s| s.has_selected(),
+                   html!(
+                       {" | "}
+                       <a href="#", onclick=|_, s: State| s.toggle_apply(),>{"Apply"}</a>
+                   ))}
+        </div>
+        {maybe(|s| s.get_filter(), tag_menu(MenuType::Filter))}
+        {maybe(|s| s.get_apply(), tag_menu(MenuType::Apply))}
+        <div>
+            {apply_all(|s| s.visible,
+                       html!(
+                           <div class="image",>
+                               <img src=|(hash, _)| format!("{}/images/small/{}", SERVER, hash),
+                                    class=|(_, sel): (_, Selectable)| sel.class(),
+                                    onclick=|((hash, _), _), s: State| s.select(hash)/>
+                               <br/>
+                               {|(_, sel): (_, Selectable)| join(sel.image.tags)}
+                           </div>
+                       ))}
+        </div>
    )
 }
 
@@ -56,7 +101,7 @@ fn render(state: &str) -> Result<(), Error> {
             .body()
             .ok_or_else(|| format_err!("document has no body"))?
             .into(),
-        &serde_json::from_str::<State>(state)?,
+        &State::from(serde_json::from_str(state)?),
     );
 
     Ok(())
