@@ -35,6 +35,7 @@ use rexiv2::Metadata;
 use rusqlite::{Connection, DatabaseName};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{read_dir, File};
@@ -48,7 +49,7 @@ use std::time::{Duration, Instant};
 use unicase::Ascii;
 
 const SMALL_BOUNDS: (u32, u32) = (320, 240);
-const LARGE_BOUNDS: (u32, u32) = (1920, 1440);
+const LARGE_BOUNDS: (u32, u32) = (1280, 960);
 const JPEG_QUALITY: u8 = 90;
 
 // todo: upgrade to a new Tokio and use `blocking` API for anywhere we
@@ -342,45 +343,43 @@ fn bound(
     }
 }
 
-fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<Vec<u8>, Error> {
-    if path.starts_with("small/") || path.starts_with("large/") {
-        let mut split = path.split('/');
-        if let (Some(size), Some(path)) = (split.next(), split.next()) {
-            let result = {
-                let lock = lock(conn)?;
-                let mut stmt = lock.prepare("SELECT rowid FROM images WHERE hash = ?1 LIMIT 1")?;
-                let row = stmt.query_map(&[&path], |row| row.get::<_, i64>(0))?
-                    .filter_map(Result::ok)
-                    .next();
-                drop(stmt);
+fn thumbnail(
+    conn: &Arc<Mutex<Connection>>,
+    image_dir: &str,
+    size: &str,
+    path: &str,
+) -> Result<Vec<u8>, Error> {
+    let result = {
+        let lock = lock(conn)?;
+        let mut stmt = lock.prepare("SELECT rowid FROM images WHERE hash = ?1 LIMIT 1")?;
+        let row = stmt.query_map(&[&path], |row| row.get::<_, i64>(0))?
+            .filter_map(Result::ok)
+            .next();
+        drop(stmt);
 
-                let result = row.and_then(|row| {
-                    lock.blob_open(DatabaseName::Main, "images", size, row, true)
-                        .ok()
-                }).and_then(|mut blob| {
-                    let mut result = Vec::new();
-                    blob.read_to_end(&mut result).ok().map(|_| result)
-                });
+        let result = row.and_then(|row| {
+            lock.blob_open(DatabaseName::Main, "images", size, row, true)
+                .ok()
+        }).and_then(|mut blob| {
+            let mut result = Vec::new();
+            blob.read_to_end(&mut result).ok().map(|_| result)
+        });
 
-                result
-            };
+        result
+    };
 
-            if let Some(result) = result {
-                Ok(result)
-            } else {
-                let native_size = load_from_memory_with_format(
-                    &full_size_image(conn, image_dir, path)?,
-                    ImageFormat::JPEG,
-                )?;
+    if let Some(result) = result {
+        Ok(result)
+    } else {
+        let native_size = load_from_memory_with_format(
+            &full_size_image(conn, image_dir, path)?,
+            ImageFormat::JPEG,
+        )?;
 
-                let (width, height) = bound(
-                    native_size.dimensions(),
-                    if size == "small" {
-                        SMALL_BOUNDS
-                    } else {
-                        LARGE_BOUNDS
-                    },
-                );
+        [("small", SMALL_BOUNDS), ("large", LARGE_BOUNDS)]
+            .iter()
+            .map(|&(size, bounds)| {
+                let (width, height) = bound(native_size.dimensions(), bounds);
 
                 let mut encoded = Vec::new();
                 native_size
@@ -395,8 +394,18 @@ fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<V
                     .map(drop)
                     .map_err(Error::from)?;
 
-                Ok(encoded)
-            }
+                Ok((size, encoded))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()
+            .map(|mut map| map.remove(size).unwrap())
+    }
+}
+
+fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<Vec<u8>, Error> {
+    if path.starts_with("small/") || path.starts_with("large/") {
+        let mut split = path.split('/');
+        if let (Some(size), Some(path)) = (split.next(), split.next()) {
+            thumbnail(conn, image_dir, size, path)
         } else {
             Err(format_err!("malformed image path: {}", path))
         }

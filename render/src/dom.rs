@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 #[derive(Clone)]
 pub enum Node<D: Document> {
     Element(D::Element),
@@ -16,6 +18,16 @@ impl<D: Document> ToNode<D> for Node<D> {
 
 #[derive(Clone)]
 pub struct ClickEvent;
+
+#[derive(Clone)]
+pub struct DoubleClickEvent;
+
+#[derive(Clone)]
+pub enum Handler {
+    Click(Rc<Fn(ClickEvent)>),
+    DoubleClick(Rc<Fn(DoubleClickEvent)>),
+    None,
+}
 
 pub trait Document: Clone {
     type Element: ToNode<Self> + Clone;
@@ -46,21 +58,15 @@ pub trait Document: Clone {
 
     fn remove_child(&self, element: &Self::Element, child: &ToNode<Self>);
 
-    fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F);
+    fn add_event_listener(&self, element: &Self::Element, handler: Handler);
 }
 
 pub mod server {
-    use super::{ClickEvent, Node, ToNode};
+    use super::{Handler, Node, ToNode};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap};
     use std::fmt;
     use std::rc::Rc;
-
-    #[derive(Clone)]
-    pub enum Handler {
-        Click(Rc<Fn(ClickEvent)>),
-        None,
-    }
 
     pub struct Element {
         pub name: String,
@@ -221,18 +227,15 @@ pub mod server {
             element.borrow_mut().children.retain(|c| !same(c, &child));
         }
 
-        fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
-            element
-                .borrow_mut()
-                .handlers
-                .push(Handler::Click(Rc::new(handle)));
+        fn add_event_listener(&self, element: &Self::Element, handler: Handler) {
+            element.borrow_mut().handlers.push(handler);
         }
     }
 }
 
 #[cfg(feature = "stdweb")]
 pub mod client {
-    use super::{ClickEvent, Node, ToNode};
+    use super::{ClickEvent, DoubleClickEvent, Handler, Node, ToNode};
     use stdweb::web::{self, IElement, IEventTarget, INode};
 
     #[derive(Clone)]
@@ -309,11 +312,18 @@ pub mod client {
             drop(element.remove_child(as_node(&child.to_node())))
         }
 
-        fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
-            element.add_event_listener(move |_: web::event::ClickEvent| {
-                console!(error, "got click!");
-                handle(ClickEvent)
-            });
+        fn add_event_listener(&self, element: &Self::Element, handler: Handler) {
+            match handler {
+                Handler::Click(handle) => {
+                    element.add_event_listener(move |_: web::event::ClickEvent| handle(ClickEvent));
+                }
+                Handler::DoubleClick(handle) => {
+                    element.add_event_listener(move |_: web::event::DoubleClickEvent| {
+                        handle(DoubleClickEvent)
+                    });
+                }
+                Handler::None => (),
+            }
         }
     }
 }

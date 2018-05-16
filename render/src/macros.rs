@@ -11,6 +11,10 @@ macro_rules! html_impl {
         $stack.0.handlers.push($crate::dispatch::on_click($handler));
         html_impl! { $stack ($($tail)*) }
     };
+    ($stack:ident (ondoubleclick = $handler:expr, $($tail:tt)*)) => {
+        $stack.0.handlers.push($crate::dispatch::on_double_click($handler));
+        html_impl! { $stack ($($tail)*) }
+    };
     ($stack:ident ($name:ident = $value:expr, $($tail:tt)*)) => {
         $stack.0.children.push($crate::dispatch::attribute(stringify!($name), $value));
         html_impl! { $stack ($($tail)*) }

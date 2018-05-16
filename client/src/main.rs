@@ -88,12 +88,48 @@ impl MenuValue {
     }
 }
 
+#[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
+enum SelectionState {
+    Selected,
+    Unselected,
+}
+
+impl SelectionState {
+    fn class(&self) -> &'static str {
+        match self {
+            &SelectionState::Selected => "selected",
+            &SelectionState::Unselected => "unselected",
+        }
+    }
+}
+
+#[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
+enum Size {
+    Small,
+    Large,
+}
+
+impl Size {
+    fn to_string(&self) -> &'static str {
+        match self {
+            &Size::Small => "small",
+            &Size::Large => "large",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct Selection {
+    state: SelectionState,
+    size: Size,
+    tags: OrdSet<String>,
+}
+
 #[derive(Clone, PartialEq)]
 struct State {
     images: OrdMap<String, Image>,
-    images_visible: OrdSet<String>,
-    images_selected: OrdSet<String>,
-    links_visible: OrdSet<MenuType>,
+    selections: OrdMap<(String, String), Selection>,
+    links: OrdSet<MenuType>,
     menus: OrdMap<MenuType, OrdMap<MenuKey, MenuValue>>,
     menus_visible: OrdSet<MenuType>,
 }
@@ -102,9 +138,20 @@ impl State {
     fn from(images: OrdMap<String, Image>) -> Self {
         State {
             images: images.clone(),
-            images_visible: images.keys().collect(),
-            images_selected: OrdSet::new(),
-            links_visible: ordset![MenuType::Filter],
+            selections: images
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        (v.datetime.clone(), (*k).clone()),
+                        Selection {
+                            state: SelectionState::Unselected,
+                            size: Size::Small,
+                            tags: v.tags.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            links: OrdSet::new(),
             menus: OrdMap::new(),
             menus_visible: OrdSet::new(),
         }
@@ -125,17 +172,27 @@ impl State {
         self
     }
 
-    fn toggle_selected(self, hash: Arc<String>) -> Self {
+    fn toggle_selected(self, key: Arc<(String, String)>) -> Self {
         let mut s = self;
-        if s.images_selected.contains(&hash as &str) {
-            s.images_selected.remove_mut(&hash as &str)
+        let mut selection = s.selections.get(&key).unwrap();
+        if selection.state == SelectionState::Selected {
+            Arc::make_mut(&mut selection).state = SelectionState::Unselected;
         } else {
-            s.images_selected.insert_mut(hash.clone())
+            Arc::make_mut(&mut selection).state = SelectionState::Selected;
         }
-        console!(
-            error,
-            format!("toggle_selected {}: {:?}!", hash, s.images_selected)
-        );
+        s.selections.insert_mut(key.clone(), selection);
+        s
+    }
+
+    fn toggle_size(self, key: Arc<(String, String)>) -> Self {
+        let mut s = self;
+        let mut selection = s.selections.get(&key).unwrap();
+        if selection.size == Size::Small {
+            Arc::make_mut(&mut selection).size = Size::Large;
+        } else {
+            Arc::make_mut(&mut selection).size = Size::Small;
+        }
+        s.selections.insert_mut(key.clone(), selection);
         s
     }
 }
@@ -151,7 +208,7 @@ fn join<T: IntoIterator<Item = Arc<String>>>(values: T, sep: &str) -> String {
 fn links<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
     html!(
         <div>
-            {apply_all(|s: State| s.links_visible,
+            {apply_all(|s: State| s.links,
                        html!(
                            <a href="#", onclick=|e: EventPair<SubState<Arc<MenuType>, _, _>, _>, s: State| {
                                s.toggle_menu(*e.state.key)
@@ -165,14 +222,19 @@ fn links<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
 
 fn menus<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
     html!(
-         <div>
+        <div>
              {apply_all(|s| s.menus_visible,
                         html!(
                             <table>
                                 {apply_all(|s: SubState<_, _, State>| (*s.parent.menus.get(&s.key).unwrap()).clone(),
                                            html!(
-                                               <tr onclick=|e: EventPair<SubState<Arc<MenuKey>, Arc<MenuValue>, SubState<Arc<MenuType>, _, _>>, _>, s: State| {
-                                                   s.toggle_menu_item(*e.state.parent.key, (*e.state.key).clone(), *e.state.value)
+                                               <tr onclick=|e: EventPair<SubState<Arc<MenuKey>,
+                                                                                  Arc<MenuValue>,
+                                                                                  SubState<Arc<MenuType>, _, _>>,
+                                                                         _>, s: State| {
+                                                   s.toggle_menu_item(*e.state.parent.key,
+                                                                      (*e.state.key).clone(),
+                                                                      *e.state.value)
                                                },>
                                                    <td>{|s: SubState<_, Arc<MenuValue>, _>| s.value.to_string()}</td>
                                                    <td>{|s: SubState<Arc<MenuKey>, _, _>| s.key.to_string()}</td>
@@ -180,25 +242,30 @@ fn menus<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
                                            ))}
                             </table>
                         ))}
-         </div>
+        </div>
     )
 }
 
 fn images<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
     html!(
          <div>
-             {apply_all(|s| s.images_visible,
+             {apply_all(|s: State| s.selections,
                         html!(
                             <div class="image",>
-                                <img src=|s: SubState<Arc<String>, _, _>| format!("{}/images/small/{}", SERVER, s.key),
-                                     class=|s: SubState<_, _, State>| if s.parent.images_selected.contains(&s.key as &str) {
-                                         "selected"
-                                     } else {
-                                         "unselected"
+                                <img src=|s: SubState<Arc<(String, String)>, Arc<Selection>, _>| {
+                                         format!("{}/images/{}/{}", SERVER, s.value.size.to_string(), s.key.1)
                                      },
-                                     onclick=|e: EventPair<SubState<Arc<String>, _, _>, _>, s: State| s.toggle_selected(e.state.key),/>
+                                     class=|s: SubState<_, Arc<Selection>, _>| {
+                                         s.value.state.class()
+                                     },
+                                     onclick=|e: EventPair<SubState<Arc<(String, String)>, _, _>, _>, s: State| {
+                                         s.toggle_selected(e.state.key)
+                                     },
+                                     ondoubleclick=|e: EventPair<SubState<Arc<(String, String)>, _, _>, _>, s: State| {
+                                         s.toggle_size(e.state.key)
+                                     },/>
                                 <br/>
-                                {|s: SubState<_, _, State>| join(&s.parent.images.get(&s.key as &str).unwrap().tags, ", ")}
+                                {|s: SubState<_, Arc<Selection>, _>| join(&s.value.tags, ", ")}
                             </div>
                         ))}
          </div>

@@ -214,6 +214,46 @@ pub struct EventPair<S, E> {
     pub event: E,
 }
 
+struct EventHandler<F> {
+    make_handler: Box<F>,
+}
+
+impl<
+        S: Clone + 'static,
+        T: 'static,
+        D: dom::Document,
+        F: Fn(Rc<RefCell<S>>, Dispatch<T>) -> dom::Handler + 'static,
+    > Handler<S, T, D> for EventHandler<F>
+{
+    fn attach(
+        &self,
+        document: &D,
+        element: &D::Element,
+        state: &S,
+        dispatch: &Dispatch<T>,
+    ) -> Box<HandlerUpdate<S>> {
+        let state = Rc::new(RefCell::new(state.clone()));
+        document.add_event_listener(
+            element,
+            (self.make_handler)(state.clone(), dispatch.clone()),
+        );
+
+        struct MyUpdate<S> {
+            state: Rc<RefCell<S>>,
+        }
+
+        impl<S: Clone> HandlerUpdate<S> for MyUpdate<S> {
+            fn update(&mut self, state: &S) {
+                *self.state.borrow_mut() = (*state).clone();
+            }
+        }
+
+        Box::new(MyUpdate { state })
+    }
+}
+
+// todo: reduce code duplication below
+
 pub fn on_click<
     S: Clone + 'static,
     T: 'static,
@@ -222,60 +262,55 @@ pub fn on_click<
 >(
     handle: F,
 ) -> Box<Handler<S, T, D>> {
-    struct MyHandler<F> {
-        handle: Rc<F>,
-    }
-
-    impl<
-            S: Clone + 'static,
-            T: 'static,
-            D: dom::Document,
-            F: Fn(EventPair<S, dom::ClickEvent>, T) -> T + 'static,
-        > Handler<S, T, D> for MyHandler<F>
-    {
-        fn attach(
-            &self,
-            document: &D,
-            element: &D::Element,
-            state: &S,
-            dispatch: &Dispatch<T>,
-        ) -> Box<HandlerUpdate<S>> {
-            let handle = self.handle.clone();
-            let dispatch = dispatch.clone();
-            let state = Rc::new(RefCell::new(state.clone()));
-            document.on_click(element, {
+    let handle = Rc::new(handle);
+    Box::new(EventHandler {
+        make_handler: Box::new(move |state: Rc<RefCell<S>>, dispatch: Dispatch<T>| {
+            let handle = handle.clone();
+            dom::Handler::Click(Rc::new(move |event| {
+                let handle = handle.clone();
                 let state = state.clone();
-                move |event| {
-                    let handle = handle.clone();
-                    let state = state.clone();
-                    dispatch(Box::new(move |top| {
-                        handle(
-                            EventPair {
-                                state: (*state.borrow()).clone(),
-                                event: event.clone(),
-                            },
-                            top,
-                        )
-                    }))
-                }
-            });
+                dispatch(Box::new(move |top| {
+                    let event = event.clone();
+                    handle(
+                        EventPair {
+                            state: (*state.borrow()).clone(),
+                            event,
+                        },
+                        top,
+                    )
+                }))
+            }))
+        }),
+    })
+}
 
-            struct MyUpdate<S> {
-                state: Rc<RefCell<S>>,
-            }
-
-            impl<S: Clone> HandlerUpdate<S> for MyUpdate<S> {
-                fn update(&mut self, state: &S) {
-                    *self.state.borrow_mut() = (*state).clone();
-                }
-            }
-
-            Box::new(MyUpdate { state })
-        }
-    }
-
-    Box::new(MyHandler {
-        handle: Rc::new(handle),
+pub fn on_double_click<
+    S: Clone + 'static,
+    T: 'static,
+    D: dom::Document,
+    F: Fn(EventPair<S, dom::DoubleClickEvent>, T) -> T + 'static,
+>(
+    handle: F,
+) -> Box<Handler<S, T, D>> {
+    let handle = Rc::new(handle);
+    Box::new(EventHandler {
+        make_handler: Box::new(move |state: Rc<RefCell<S>>, dispatch: Dispatch<T>| {
+            let handle = handle.clone();
+            dom::Handler::DoubleClick(Rc::new(move |event| {
+                let handle = handle.clone();
+                let state = state.clone();
+                dispatch(Box::new(move |top| {
+                    let event = event.clone();
+                    handle(
+                        EventPair {
+                            state: (*state.borrow()).clone(),
+                            event,
+                        },
+                        top,
+                    )
+                }))
+            }))
+        }),
     })
 }
 
