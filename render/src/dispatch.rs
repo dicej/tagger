@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;

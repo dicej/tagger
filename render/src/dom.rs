@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 #[derive(Clone)]
 pub enum Node<D: Document> {
     Element(D::Element),
@@ -312,7 +310,10 @@ pub mod client {
         }
 
         fn on_click<F: Fn(ClickEvent) + 'static>(&self, element: &Self::Element, handle: F) {
-            element.add_event_listener(move |_: web::event::ClickEvent| handle(ClickEvent));
+            element.add_event_listener(move |_: web::event::ClickEvent| {
+                console!(error, "got click!");
+                handle(ClickEvent)
+            });
         }
     }
 }

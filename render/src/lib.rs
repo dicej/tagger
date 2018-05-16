@@ -1,10 +1,11 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 
 #[cfg(test)]
 #[macro_use]
 extern crate maplit;
 
 #[cfg(feature = "stdweb")]
+#[macro_use]
 extern crate stdweb;
 
 #[cfg(feature = "im")]
