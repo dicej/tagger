@@ -113,7 +113,7 @@ pub trait Render<S> {
 
 pub struct Element<S, T, D: dom::Document> {
     pub name: String,
-    pub handlers: Vec<Box<Handler<T, D>>>,
+    pub handlers: Vec<Box<Handler<S, T, D>>>,
     pub children: Vec<Box<Node<S, T, D>>>,
 }
 
@@ -140,10 +140,10 @@ impl<S: 'static, T, D: dom::Document + 'static> Node<S, T, D> for Element<S, T, 
         let children = self.children
             .iter()
             .filter_map(|n| n.add(document, &element, None, dispatch, state).update)
-            .collect();
+            .collect::<Vec<_>>();
         let handlers = self.handlers
             .iter()
-            .map(|handler| handler.attach(document, &element, dispatch, state))
+            .map(|handler| handler.attach(document, &element, state, dispatch))
             .collect();
         document.insert(parent, &element, next);
 
@@ -184,7 +184,7 @@ impl<S: 'static, T, D: dom::Document + 'static> Node<S, T, D> for Element<S, T, 
                 Some(Box::new(MyUpdate {
                     element: element.clone(),
                     children,
-                    handlers: self.handlers.clone(),
+                    handlers,
                 }))
             },
             remove: Some(Box::new(MyRemove {
@@ -206,19 +206,34 @@ pub trait Handler<S, T, D: dom::Document> {
         &self,
         document: &D,
         element: &D::Element,
+        state: &S,
         dispatch: &Dispatch<T>,
     ) -> Box<HandlerUpdate<S>>;
 }
 
-pub fn on_click<S, T: 'static, D: dom::Document, F: Fn((S, dom::ClickEvent), T) -> T + 'static>(
+pub struct EventPair<S, E> {
+    pub state: S,
+    pub event: E,
+}
+
+pub fn on_click<
+    S: Clone + 'static,
+    T: 'static,
+    D: dom::Document,
+    F: Fn(EventPair<S, dom::ClickEvent>, T) -> T + 'static,
+>(
     handle: F,
-) -> Box<Handler<T, D>> {
+) -> Box<Handler<S, T, D>> {
     struct MyHandler<F> {
         handle: Rc<F>,
     }
 
-    impl<S, T: 'static, D: dom::Document, F: Fn((S, dom::ClickEvent), T) -> T + 'static>
-        Handler<S, T, D> for MyHandler<F>
+    impl<
+            S: Clone + 'static,
+            T: 'static,
+            D: dom::Document,
+            F: Fn(EventPair<S, dom::ClickEvent>, T) -> T + 'static,
+        > Handler<S, T, D> for MyHandler<F>
     {
         fn attach(
             &self,
@@ -230,24 +245,34 @@ pub fn on_click<S, T: 'static, D: dom::Document, F: Fn((S, dom::ClickEvent), T) 
             let handle = self.handle.clone();
             let dispatch = dispatch.clone();
             let state = Rc::new(RefCell::new(state.clone()));
-            document.on_click(element, move |event| {
-                let handle = handle.clone();
-                dispatch(Box::new(move |top| {
-                    handle((state.borrow().clone(), event.clone()), top)
-                }))
+            document.on_click(element, {
+                let state = state.clone();
+                move |event| {
+                    let handle = handle.clone();
+                    let state = state.clone();
+                    dispatch(Box::new(move |top| {
+                        handle(
+                            EventPair {
+                                state: (*state.borrow()).clone(),
+                                event: event.clone(),
+                            },
+                            top,
+                        )
+                    }))
+                }
             });
 
             struct MyUpdate<S> {
-                state: Rc<Cell<S>>,
+                state: Rc<RefCell<S>>,
             }
 
-            impl<S> HandlerUpdate<S> for MyUpdate<S> {
+            impl<S: Clone> HandlerUpdate<S> for MyUpdate<S> {
                 fn update(&mut self, state: &S) {
-                    *self.state.borrow_mut() = state;
+                    *self.state.borrow_mut() = (*state).clone();
                 }
             }
 
-            MyUpdate { state }
+            Box::new(MyUpdate { state })
         }
     }
 
@@ -640,6 +665,13 @@ pub trait Diff<K, V> {
     fn diff(&self, new: &Self) -> Self::DiffIterator;
 }
 
+#[derive(Clone)]
+pub struct SubState<K, V, P> {
+    pub key: K,
+    pub value: V,
+    pub parent: P,
+}
+
 pub fn apply_all<
     S: Clone,
     K: Ord + 'static,
@@ -648,7 +680,7 @@ pub fn apply_all<
     T,
     D: dom::Document + 'static,
     F: Fn(S) -> DIF + 'static,
-    N: Node<(K, SS), T, D> + 'static,
+    N: Node<SubState<K, SS, S>, T, D> + 'static,
 >(
     function: F,
     node: N,
@@ -671,14 +703,14 @@ pub struct ApplyAll<S, K, SS, DIF: Diff<K, SS>, F: Fn(S) -> DIF, N> {
 }
 
 impl<
-        S: Clone,
+        S: Clone + 'static,
         K: Ord + Clone + 'static,
         SS: Clone + 'static,
         DIF: Diff<K, SS> + 'static,
         T: 'static,
         D: dom::Document + 'static,
         F: Fn(S) -> DIF + 'static,
-        N: Node<(K, SS), T, D> + 'static,
+        N: Node<SubState<K, SS, S>, T, D> + 'static,
     > ToNode<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
 {
     type Node = Self;
@@ -689,14 +721,14 @@ impl<
 }
 
 impl<
-        S: Clone,
+        S: Clone + 'static,
         K: Ord + Clone + 'static,
         SS: Clone + 'static,
         DIF: Diff<K, SS> + 'static,
         T: 'static,
         D: dom::Document + 'static,
         F: Fn(S) -> DIF + 'static,
-        N: Node<(K, SS), T, D> + 'static,
+        N: Node<SubState<K, SS, S>, T, D> + 'static,
     > Node<S, T, D> for ApplyAll<S, K, SS, DIF, F, N>
 {
     fn add(
@@ -713,20 +745,28 @@ impl<
             .map(|(k, v)| {
                 (
                     k.clone(),
-                    self.node
-                        .as_ref()
-                        .add(document, parent, next, dispatch, &(k, v.clone())),
+                    self.node.as_ref().add(
+                        document,
+                        parent,
+                        next,
+                        dispatch,
+                        &SubState {
+                            key: k,
+                            value: v.clone(),
+                            parent: state.clone(),
+                        },
+                    ),
                 )
             })
             .collect();
 
-        struct Tracker<DIF: Diff<K, SS>, T, D: dom::Document, N, K, SS, F> {
+        struct Tracker<DIF: Diff<K, SS>, T, D: dom::Document, N, K, SS, F, S> {
             document: D,
             parent: D::Element,
             dispatch: Dispatch<T>,
             node: Rc<N>,
             substate: DIF,
-            map: BTreeMap<K, Added<(K, SS), D>>,
+            map: BTreeMap<K, Added<SubState<K, SS, S>, D>>,
             function: Rc<F>,
         }
 
@@ -734,12 +774,12 @@ impl<
                 DIF: Diff<K, SS>,
                 T,
                 D: dom::Document,
-                N: Node<(K, SS), T, D>,
+                N: Node<SubState<K, SS, S>, T, D>,
                 K: Ord + Clone,
                 SS: Clone,
                 F: Fn(S) -> DIF,
                 S: Clone,
-            > Update<S, D> for Rc<RefCell<Tracker<DIF, T, D, N, K, SS, F>>>
+            > Update<S, D> for Rc<RefCell<Tracker<DIF, T, D, N, K, SS, F, S>>>
         {
             fn update(&mut self, state: &S) -> Option<dom::Node<D>> {
                 let mut t = self.borrow_mut();
@@ -756,7 +796,11 @@ impl<
                                 .as_ref()
                                 .map(|n| n as &dom::ToNode<D>),
                             &t.dispatch,
-                            &(key.clone(), new_value.clone()),
+                            &SubState {
+                                key: key.clone(),
+                                value: new_value.clone(),
+                                parent: state.clone(),
+                            },
                         );
                         t.map.insert(key, added);
                     }
@@ -766,7 +810,13 @@ impl<
                             added.first = added
                                 .update
                                 .as_mut()
-                                .map(|u| u.update(&(key, new_value)))
+                                .map(|u| {
+                                    u.update(&SubState {
+                                        key,
+                                        value: new_value,
+                                        parent: state.clone(),
+                                    })
+                                })
                                 .and_then(identity);
                         }
                     }
@@ -784,8 +834,8 @@ impl<
             }
         }
 
-        impl<DIF: Diff<K, SS>, T, D: dom::Document, N, K: Ord, SS, F> Remove
-            for Rc<RefCell<Tracker<DIF, T, D, N, K, SS, F>>>
+        impl<DIF: Diff<K, SS>, T, D: dom::Document, N, K: Ord, SS, F, S> Remove
+            for Rc<RefCell<Tracker<DIF, T, D, N, K, SS, F, S>>>
         {
             fn remove(&mut self) {
                 let mut map = BTreeMap::new();

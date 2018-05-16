@@ -1,4 +1,4 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 
 #[macro_use]
 extern crate failure;
@@ -8,13 +8,14 @@ extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
 extern crate im;
 #[macro_use]
 extern crate render;
 
 use failure::Error;
 use im::{OrdMap, OrdSet};
-use render::dispatch::{apply_all, Dispatcher, Node};
+use render::dispatch::{apply_all, Dispatcher, EventPair, Node, SubState};
 use render::dom;
 use render::dom::client::Document;
 use std::sync::Arc;
@@ -29,64 +30,162 @@ struct Image {
     tags: OrdSet<String>,
 }
 
-struct State {
-    all: OrdMap<String, Image>,
-    visible: OrdMap<String, Selectable>,
+#[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
+enum MenuType {
+    Filter,
+    Apply,
 }
 
-impl State {
-    fn from(all: OrdMap<String, Image>) -> Self {
-        State {
-            all,
-            visible: all,
-            selected: OrdSet::new(),
+impl MenuType {
+    fn to_string(&self) -> &'static str {
+        match self {
+            &MenuType::Filter => "Filter",
+            &MenuType::Apply => "Apply",
         }
     }
 }
 
-fn tag_menu<D: dom::Document + 'static>(menu_type: MenuType) -> Box<Node<State, State, D>> {
-    html!(
-        <table>
-            <tr onclick=|_, s: State| s.toggle_all(),>
-                <td>{|s| if s.get_all() { "✔" } else { " " }}</td>
-                <td>{"All"}</td>
-            </tr>
-            <tr onclick=|_, s: State| s.toggle_untagged(),>
-                <td>{|s| if s.get_untagged() { "✔" } else { " " }}</td>
-                <td>{"Untagged"}</td>
-            </tr>
-            {apply_all(|s| s.get_tags(menu_type),
-                       html!(
-                           <tr onclick=|((tag, ), _), s: State| s.toggle_tag(menu_type, tag),>
-                               <td>{|(tag, )| if s.get_tag(menu_type, tag) { "✔" } else { " " }}</td>
-                               <td>{|(tag, )| tag}</td>
-                           </tr>
-                       ))}
-        </table>
-    )
+#[derive(PartialEq, PartialOrd, Eq, Ord, Clone)]
+enum MenuKey {
+    All,
+    Untagged,
+    Tag(Arc<String>),
 }
 
-fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
+impl MenuKey {
+    fn to_string(&self) -> String {
+        match self {
+            &MenuKey::All => "All".into(),
+            &MenuKey::Untagged => "Untagged".into(),
+            &MenuKey::Tag(ref tag) => (**tag).clone(),
+        }
+    }
+}
+
+#[derive(PartialEq, PartialOrd, Eq, Ord, Clone, Copy)]
+enum MenuValue {
+    Checked,
+    Unchecked,
+    Neither,
+}
+
+impl MenuValue {
+    fn to_string(&self) -> &'static str {
+        match self {
+            &MenuValue::Checked => "✔",
+            &MenuValue::Unchecked => " ",
+            &MenuValue::Neither => "-",
+        }
+    }
+}
+
+impl MenuValue {
+    fn toggle(self) -> Self {
+        match self {
+            MenuValue::Unchecked => MenuValue::Checked,
+            _ => MenuValue::Unchecked,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct State {
+    images: OrdMap<String, Image>,
+    images_visible: OrdSet<String>,
+    images_selected: OrdSet<String>,
+    links_visible: OrdSet<MenuType>,
+    menus: OrdMap<MenuType, OrdMap<MenuKey, MenuValue>>,
+    menus_visible: OrdSet<MenuType>,
+}
+
+impl State {
+    fn from(images: OrdMap<String, Image>) -> Self {
+        State {
+            images: images.clone(),
+            images_visible: images.keys().collect(),
+            images_selected: OrdSet::new(),
+            links_visible: ordset![MenuType::Filter],
+            menus: OrdMap::new(),
+            menus_visible: OrdSet::new(),
+        }
+    }
+
+    fn toggle_menu(self, menu: MenuType) -> Self {
+        let mut s = self;
+        if s.menus_visible.contains(&menu) {
+            s.menus_visible.remove_mut(&menu);
+        } else {
+            s.menus_visible.insert_mut(menu);
+        }
+        s
+    }
+
+    fn toggle_menu_item(self, _menu: MenuType, _key: MenuKey, _value: MenuValue) -> Self {
+        // todo
+        self
+    }
+
+    fn toggle_selected(self, hash: Arc<String>) -> Self {
+        let mut s = self;
+        if s.images_selected.contains(&hash as &str) {
+            s.images_selected.remove_mut(&hash as &str)
+        } else {
+            s.images_selected.insert_mut(hash)
+        }
+        s
+    }
+}
+
+fn join<T: IntoIterator<Item = Arc<String>>>(values: T, sep: &str) -> String {
+    values
+        .into_iter()
+        .map(|s| String::from(&s as &str))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+fn body<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
     html!(
         <div>
-            <a href="#", onclick=|_, s: State| s.toggle_filter(),>{"Filter"}</a>
-            {maybe(|s| s.has_selected(),
-                   html!(
-                       {" | "}
-                       <a href="#", onclick=|_, s: State| s.toggle_apply(),>{"Apply"}</a>
-                   ))}
+            {apply_all(|s: State| s.links_visible,
+                       html!(
+                           <a href="#", onclick=|e: EventPair<SubState<Arc<MenuType>, _, _>, _>, s: State| {
+                               s.toggle_menu(*e.state.key)
+                           },>
+                               {|s: SubState<Arc<MenuType>, _, _>| s.key.to_string()}
+                           </a>
+                           {" "}
+                       ))}
         </div>
-        {maybe(|s| s.get_filter(), tag_menu(MenuType::Filter))}
-        {maybe(|s| s.get_apply(), tag_menu(MenuType::Apply))}
         <div>
-            {apply_all(|s| s.visible,
+            {apply_all(|s| s.menus_visible,
+                       html!(
+                           <table>
+                               {apply_all(|s: SubState<_, _, State>| (*s.parent.menus.get(&s.key).unwrap()).clone(),
+                                          html!(
+                                              <tr onclick=|e: EventPair<SubState<Arc<MenuKey>, Arc<MenuValue>, SubState<Arc<MenuType>, _, _>>, _>, s: State| {
+                                                  s.toggle_menu_item(*e.state.parent.key, (*e.state.key).clone(), *e.state.value)
+                                              },>
+                                                  <td>{|s: SubState<_, Arc<MenuValue>, _>| s.value.to_string()}</td>
+                                                  <td>{|s: SubState<Arc<MenuKey>, _, _>| s.key.to_string()}</td>
+                                              </tr>
+                                          ))}
+                           </table>
+                       ))}
+        </div>
+        <div>
+            {apply_all(|s| s.images_visible,
                        html!(
                            <div class="image",>
-                               <img src=|(hash, _)| format!("{}/images/small/{}", SERVER, hash),
-                                    class=|(_, sel): (_, Selectable)| sel.class(),
-                                    onclick=|((hash, _), _), s: State| s.select(hash)/>
+                               <img src=|s: SubState<Arc<String>, _, _>| format!("{}/images/small/{}", SERVER, s.key),
+                                    class=|s: SubState<_, _, State>| if s.parent.images_selected.contains(&s.key as &str) {
+                                        "selected"
+                                    } else {
+                                        "unselected"
+                                    },
+                                    onclick=|e: EventPair<SubState<Arc<String>, _, _>, _>, s: State| s.toggle_selected(e.state.key),/>
                                <br/>
-                               {|(_, sel): (_, Selectable)| join(sel.image.tags)}
+                               {|s: SubState<_, _, State>| join(&s.parent.images.get(&s.key as &str).unwrap().tags, ", ")}
                            </div>
                        ))}
         </div>
@@ -95,7 +194,7 @@ fn node<D: dom::Document + 'static>() -> Box<Node<State, State, D>> {
 
 fn render(state: &str) -> Result<(), Error> {
     Dispatcher::from(
-        &node(),
+        &body(),
         &Document::from(document()),
         &document()
             .body()
