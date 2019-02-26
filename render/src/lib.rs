@@ -1,242 +1,177 @@
-//#![deny(warnings)]
+type Dom = DomTree<DOM>;
 
-#[cfg(test)]
-#[macro_use]
-extern crate maplit;
+struct Element {
+    name: &'static str,
+    attributes: OrdMap<usize, (&'static str, String)>,
+    events: Vec<Event>,
+    children: OrdMap<usize, VNode>
+}
 
-#[cfg(feature = "stdweb")]
-#[macro_use]
-extern crate stdweb;
+enum VNode {
+    Element(Element),
+    Text(String)
+}
 
-#[cfg(feature = "im")]
-extern crate im;
+trait Handler<T> {
+    fn handle(t: T) -> VNode
+}
 
-#[macro_use]
-pub mod macros;
-pub mod dispatch;
-pub mod dom;
+struct Listener<T> {
+    sublisteners: HashMap<Identity<Render>, Box<SubListener<T>>>,
+    handlers: HashMap<Path, Handler>
+}
 
-#[cfg(feature = "im")]
-pub mod im_diff;
+struct Root<T> {
+    node: VNode,
+    listeners: HashMap<Identity<Render>, Listener<T>>
+}
 
-#[cfg(test)]
-mod tests {
-    use dispatch;
-    use dom::{self, server, Document};
-    use std::collections::btree_map;
-    use std::collections::BTreeMap;
-    use std::fmt::Write;
-    use std::vec;
+struct PathFinder {
+    random: StdRng,
+}
 
-    fn render<S: Clone + 'static>(
-        node: &dispatch::Node<S, S, server::Document>,
-        state: &S,
-    ) -> String {
-        render_with_updates(node, state, &Vec::new())
-            .into_iter()
-            .next()
-            .unwrap()
+impl PathFinder {
+    fn make_key(&mut self) -> String {
+        iter::repeat(())
+            .map(|_| self.random.sample(Alphanumeric))
+            .take(8)
+            .collect()
     }
+}
 
-    fn render_children(e: &<server::Document as Document>::Element) -> String {
-        let mut s = String::new();
-        for child in &e.borrow().children {
-            write!(s, "{}", child).unwrap();
+struct MapState<I, T> {
+    inner: Weak<I>,
+    sinks: HashSet<Identity<Fn(T)>>
+}
+
+struct Map<I, T, F> {
+    previous: Option<T>,
+    map: F,
+    state: Rc<RefCell<MapState<I, T>>>
+}
+
+impl <I, T, F: Clone> for Map<I, T, F> {
+    fn clone(&self) -> Self {
+        Map {
+            previous: None,
+            map: self.map.clone(),
+            state: self.state.clone(),
         }
-        s
     }
+}
 
-    fn render_with_updates<S: Clone + 'static>(
-        node: &dispatch::Node<S, S, server::Document>,
-        state: &S,
-        updates: &[&Fn(S) -> S],
-    ) -> Vec<String> {
-        let document = server::Document::new();
-        let root = document.create_element("root");
-        let dispatcher = dispatch::Dispatcher::from(node, &document, &root, state);
-        let mut v = vec![render_children(&root)];
-        for u in updates {
-            dispatcher.dispatch(u);
-            v.push(render_children(&root));
+impl <I, T, F> Map<I, T, F> {
+    fn map<V, G: Fn(U) -> V + Clone + 'static>(&self, map: G) -> Map<I, Self, G> {
+        Map {
+            map,
+            state: Rc::new(RefCell::new(MapState {
+                inner: self.clone().downgrade(),
+                contexts: HashMap::new()
+            }))
         }
-        v
     }
 
-    fn render_with_inputs<S: Clone + 'static>(
-        node: &dispatch::Node<S, S, server::Document>,
-        state: &S,
-        inputs: &[(&str, &Fn(server::Handler))],
-    ) -> Vec<String> {
-        let document = server::Document::new();
-        let root = document.create_element("root");
-        dispatch::Dispatcher::from(node, &document, &root, state);
-        let mut v = vec![render_children(&root)];
-        for i in inputs {
-            if let Some(e) = document.get_element_by_id(i.0) {
-                let handlers = e.borrow().handlers.clone();
-                for h in handlers {
-                    i.1(h);
+    fn add_use<G: FnOnce() -> Dom, H: FnOnce(VNode) -> UseBody<T>>(&self, root: G, use_body: H) -> String {
+        let old_context = self.path_finder.borrow_mut().push_context();
+        let root = root();
+        let new_context = self.path_finder.borrow_mut().pop_context(old_context.clone());
+        let key = new_context.borrow().key.clone();
+        let use_ = Rc::new(Use {
+            context: new_context,
+            body: use_body(resolve(root, &mut new_context.borrow_mut().paths))
+        });
+        let map = self.clone();
+        
+        old_context.borrow_mut().on_add.push(Box::new(move || {
+            let map = Rc::new(RefCell::new(map.clone()));
+
+            let use_sink = Rc::new({
+                let use_ = use_.clone();
+                move |state| use_.accept(state)
+            });
+            
+            map.borrow().add_sink(use_sink.clone());
+            
+            let inner_sink = Rc::new({
+                let map = map.clone();
+                move |state| map.borrow_mut().accept(state)
+            });
+
+            // todo: reduce the number of these to one per MapState
+            map.borrow().state.borrow().inner.upgrade().unwrap().add_sink(inner_sink.clone());
+            
+            Box::new(move || {
+                map.borrow().remove_sink(use_sink);
+                map.borrow().state.borrow().inner.upgrade().unwrap().remove_sink(inner_sink)
+            })
+        }));
+
+        key
+   }
+
+    fn accept(&mut self, state: T) {
+        let mapped = self.map(state);
+        if Some(mapped) != self.previous {
+            self.previous = Some(mapped.clone());
+            for sink in &self.state.borrow().sinks {
+                sink(mapped.clone())
+            }
+        }
+    }
+}
+
+impl <'a, P, T, U: Eq, F: Fn(T) -> U> Map<'a, P, F> {
+    fn case<G: FnOnce() -> Dom>(&self, value: U, root: G) -> String {
+        self.map(|state| if state == value {
+            Some(value.clone())
+        } else {
+            None
+        }).each(|_| root())
+    }
+}
+
+impl <'a, P, T, V, W, U: Diff<V, W>, F: Fn(T) -> U + Clone + 'static> Map<'a, P, F> {
+    fn each<G: FnOnce(&Render<W>) -> Dom>(&self, root: G) -> String {
+        let visitor = Rc::new(Visitor::new());
+        
+        self.add_use({
+            let visitor = visitor.clone();
+            move || root(&visitor)
+        }, move |root| Use::Each(Each{
+            visitor,
+            root
+        }))
+    }
+}
+
+struct Value;
+
+struct Each<T> {
+    visitor: Rc<Visitor<T>>,
+    dom: Dom
+}
+
+impl <T> Use<T> {
+    fn accept(&self, value: T) {
+        match self.body {
+            UseBody::Each(each) => {
+                for event in self.previous.diff(value) {
+                    match event {
+                        Add((key, value)) =>
+                        // add new subdocument and notify visitor sinks (which should be registered when adding subdocument)
+                            ;
+                        Remove((key, _)) =>
+                        // remove subdocument (which should unregister any associated sinks)
+                            ;
+                        Update {
+                            old: (key, old_value),
+                            new: (_, new_value)
+                        } =>
+                        // notify visitor sinks for specified key
+                            ;
+                    }
                 }
             }
-            v.push(render_children(&root));
         }
-        v
-    }
-
-    #[test]
-    fn simple() {
-        assert_eq!("<foo/>", &render(&html!(<foo/>), &()));
-    }
-
-    #[test]
-    fn string_attribute() {
-        assert_eq!(
-            "<foo bar=\"baz\"/>",
-            &render(&html!(<foo bar="baz",/>), &())
-        );
-    }
-
-    #[test]
-    fn function_attribute() {
-        assert_eq!(
-            "<foo bar=\"baz\"/>",
-            &render(&html!(<foo bar=|s| s,/>), &"baz".to_string())
-        );
-    }
-
-    #[test]
-    fn string_node() {
-        assert_eq!("<foo>baz</foo>", &render(&html!(<foo>{"baz"}</foo>), &()));
-    }
-
-    #[test]
-    fn function_node() {
-        assert_eq!(
-            "<foo>baz</foo>",
-            &render(&html!(<foo>{|s| s}</foo>), &"baz".to_string())
-        );
-    }
-
-    #[test]
-    fn nested() {
-        assert_eq!(
-            "<foo><bar um=\"bim\"/>baz</foo>",
-            &render(
-                &html!(<foo><bar um=|(_, s)| s,/>{|(s, _)| s}</foo>),
-                &("baz".to_string(), "bim".to_string())
-            )
-        );
-    }
-
-    #[test]
-    fn apply() {
-        assert_eq!(
-            "<foo><bar um=\"bim\"/></foo>",
-            &render(
-                &html!(<foo>{dispatch::apply(|(_, s)| s, html!(<bar um=|s| s,/>))}</foo>),
-                &("baz".to_string(), "bim".to_string())
-            )
-        );
-    }
-
-    impl dispatch::Diff<u32, char> for BTreeMap<u32, char> {
-        type Iterator = btree_map::IntoIter<u32, char>;
-        type DiffIterator = vec::IntoIter<dispatch::DiffEvent<u32, char>>;
-
-        fn iter(&self) -> Self::Iterator {
-            self.clone().into_iter()
-        }
-
-        fn diff(&self, new: &Self) -> Self::DiffIterator {
-            self.into_iter()
-                .filter_map(|(k, v)| {
-                    if let Some(c) = new.get(k) {
-                        if c == v {
-                            None
-                        } else {
-                            println!("new is {:?}", (*k, *c));
-                            Some(dispatch::DiffEvent::Update {
-                                key: *k,
-                                old_value: *v,
-                                new_value: *c,
-                            })
-                        }
-                    } else {
-                        Some(dispatch::DiffEvent::Remove {
-                            key: *k,
-                            old_value: *v,
-                        })
-                    }
-                })
-                .chain(new.into_iter().filter_map(|(k, v)| {
-                    if self.get(k).is_some() {
-                        None
-                    } else {
-                        Some(dispatch::DiffEvent::Add {
-                            key: *k,
-                            new_value: *v,
-                        })
-                    }
-                }))
-                .collect::<Vec<_>>()
-                .into_iter()
-        }
-    }
-
-    #[test]
-    fn apply_all() {
-        assert_eq!(
-            "<foo>abcd</foo>",
-            &render(
-                &html!(<foo>{dispatch::apply_all(|s| s, html!({|(_,v)| v}))}</foo>),
-                &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd']
-            )
-        );
-    }
-
-    #[test]
-    fn apply_all_with_updates() {
-        assert_eq!(
-            &vec!["<foo>abcd</foo>", "<foo>zbCde</foo>"],
-            &render_with_updates(
-                &html!(<foo>{dispatch::apply_all(|s| s, html!({|(_,v)| v}))}</foo>),
-                &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],
-                &[&|mut s| {
-                    s.insert(0, 'z');
-                    s.remove(&1);
-                    s.insert(3, 'C');
-                    s.insert(5, 'e');
-                    s
-                }],
-            )
-        );
-    }
-
-    #[test]
-    fn apply_all_with_inputs() {
-        let click = |handler| {
-            if let server::Handler::Click(handle) = handler {
-                handle(dom::ClickEvent)
-            }
-        };
-
-        assert_eq!(
-            &vec![
-                "<foo id=\"42\"><bar id=\"43\"/>abcd</foo>",
-                "<foo id=\"42\"><bar id=\"43\"/>aBcd</foo>",
-                "<foo id=\"42\"><bar id=\"43\"/>aBcD</foo>",
-            ],
-            &render_with_inputs(
-                &html!(<foo id="42", onclick=|_, mut s: BTreeMap<_, _>| {
-                    s.insert(2, 'B');
-                    s
-                },><bar id="43", onclick=|_, mut s: BTreeMap<_, _>| {
-                    s.insert(4, 'D');
-		                s
-		            },/>{dispatch::apply_all(|s| s, html!({|(_,v)| v}))}</foo>),
-                &btreemap![1 => 'a', 2 => 'b', 3 => 'c', 4 => 'd'],
-                &[("42", &click), ("43", &click)],
-            )
-        );
     }
 }

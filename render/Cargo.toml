@@ -2,8 +2,6 @@
 name = "render"
 version = "0.1.0"
 authors = ["Joel Dice <joel.dice@gmail.com>"]
+edition = "2018"
 
 [dependencies]
-maplit = "*"
-stdweb = { version = "*", optional = true }
-im = { git = "https://github.com/bodil/im-rs", optional = true }
