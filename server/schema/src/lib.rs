@@ -1,6 +1,6 @@
 #![deny(warnings)]
 
-static DDL_STATEMENTS: &[&str] = &[
+pub static DDL_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS paths (
        path      TEXT NOT NULL PRIMARY KEY,
        hash      TEXT NOT NULL

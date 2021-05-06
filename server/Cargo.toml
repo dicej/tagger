@@ -6,19 +6,31 @@ authors = ["Joel Dice <joel.dice@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 anyhow = "1"
-serde_json = "1"
-warp = "0.3"
-pretty_env_logger = "0.4"
-log = "0.4"
-mime = "0.3"
-chrono = "0.4"
-rexiv2 = "0.9"
-regex = "1"
-sha2 = "0.9"
+chrono = { version = "0.4", features = [ "serde" ] }
 futures = "0.3"
-structopt = "0.3"
-unicase = "2.6"
+http = "0.2"
+hyper = "0.14"
 image = "0.23"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+lazy_static = "1"
+mime = "0.3"
+pretty_env_logger = "0.4"
+regex = "1"
+rexiv2 = "0.9"
+schema = { path = "./schema" }
+serde = "1"
+serde_derive = "1"
+serde_json = "1"
+sha2 = "0.9"
+sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
+structopt = "0.3"
+thiserror = "1"
+tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time", "sync" ] }
+tracing = { version = "0.1", features = [ "log" ] }
+warp = { version = "0.3", features = [ "tls" ] }
+
+[build-dependencies]
+anyhow = "1"
+schema = { path = "./schema" }
+sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
+tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs" ] }
