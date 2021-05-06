@@ -269,10 +269,13 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
         if query.tag.is_empty() {
             String::new()
         } else {
-            iter::repeat(" AND t.tag = ?")
-                .take(query.tag.len())
-                .collect::<Vec<_>>()
-                .concat()
+            format!(
+                " AND ({})",
+                iter::repeat("t.tag = ?")
+                    .take(query.tag.len())
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            )
         },
         if query.limit.is_some() { " LIMIT ?" } else { "" }
     );
