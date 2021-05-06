@@ -1,0 +1,9 @@
+sqlx
+add auth
+add pagination
+make it compile
+write tests
+  use image crate to write fake images to temp dir and index that
+  don't launch thread to reindex - do it explicitly when needed
+  test all endpoints and both patch types
+work on front end

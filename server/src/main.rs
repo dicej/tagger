@@ -1,116 +1,49 @@
 #![deny(warnings)]
 
-extern crate chrono;
-extern crate clap;
-extern crate env_logger;
-#[macro_use]
-extern crate failure;
-extern crate futures;
-extern crate hyper;
-#[macro_use]
-extern crate log;
-extern crate mime;
-extern crate regex;
-extern crate rexiv2;
-extern crate rusqlite;
-#[macro_use]
-extern crate serde_json;
-extern crate image;
-extern crate sha2;
-extern crate unicase;
-
+use anyhow::{anyhow, Result};
 use chrono::Local;
-use clap::{App, Arg};
-use env_logger::LogBuilder;
-use failure::Error;
-use futures::future::{ok, result};
-use futures::{Future, Stream};
-use hyper::header::{AccessControlAllowHeaders, AccessControlAllowMethods,
-                    AccessControlAllowOrigin, ContentLength, ContentType};
-use hyper::server::{Http, Service};
-use hyper::{Method, Request, Response, StatusCode};
-use image::{load_from_memory_with_format, FilterType, GenericImage, ImageFormat, ImageOutputFormat};
+use image::{FilterType, GenericImage, ImageFormat, ImageOutputFormat};
 use regex::Regex;
 use rexiv2::Metadata;
 use rusqlite::{Connection, DatabaseName};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::env;
-use std::ffi::OsStr;
-use std::fs::{read_dir, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::exit;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::{sleep, spawn};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    env,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process,
+    rc::Rc,
+    sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
+};
+use structopt::StructOpt;
 use unicase::Ascii;
+use warp_util::HttpError;
+
+mod warp_util;
 
 const SMALL_BOUNDS: (u32, u32) = (320, 240);
 const LARGE_BOUNDS: (u32, u32) = (1280, 960);
 const JPEG_QUALITY: u8 = 90;
+const SYNC_INTERVAL_SECONDS: u64 = 10;
 
-// todo: upgrade to a new Tokio and use `blocking` API for anywhere we
-// might block (e.g. filesystem, mutex, DB, image processing)
+fn open(state_file: &str) -> Result<SqliteConnection> {
+    let conn = SqliteConnection::connect(&format!("sqlite://", state_file))?;
 
-fn init_logger() -> Result<(), Error> {
-    let mut builder = LogBuilder::new();
-    builder.format(|record| {
-        format!(
-            "{} {} - {}",
-            Local::now().format("%F %T"),
-            record.level(),
-            record.args()
-        )
-    });
-
-    if let Ok(s) = env::var("RUST_LOG") {
-        builder.parse(&s);
+    for statement in schema::DDL_STATEMENTS {
+        sqlx::query(statement).execute(&mut conn).await?;
     }
-
-    builder.init().map_err(Error::from)
-}
-
-fn open(state_file: &str) -> Result<Connection, Error> {
-    let conn = Connection::open(state_file)?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS paths (
-           path      TEXT NOT NULL PRIMARY KEY,
-           hash      TEXT NOT NULL
-         )",
-        &[],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS images (
-           hash      TEXT NOT NULL PRIMARY KEY,
-           datetime  TEXT NOT NULL,
-           small BLOB,
-           large BLOB
-         )",
-        &[],
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS tags (
-           hash      TEXT NOT NULL,
-           tag       TEXT NOT NULL,
-
-           PRIMARY KEY (hash, tag),
-           FOREIGN KEY (hash) REFERENCES images(hash) ON DELETE CASCADE
-         )",
-        &[],
-    )?;
 
     Ok(conn)
 }
 
-fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>, Error> {
+async fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
-    File::open(path)?.read_to_end(&mut buffer)?;
+
+    File::open(path).await?.read_to_end(&mut buffer).await?;
+
     Ok(buffer)
 }
 
@@ -127,17 +60,16 @@ fn hash(data: &[u8]) -> String {
         .concat()
 }
 
-fn lock(conn: &Arc<Mutex<Connection>>) -> Result<MutexGuard<Connection>, Error> {
-    conn.lock().map_err(|_| format_err!("poisoned lock"))
-}
-
-fn find_new<P: AsRef<Path>>(
-    conn: &Arc<Mutex<Connection>>,
+async fn find_new<P: AsRef<Path>>(
+    conn: &AsyncMutex<SqliteConnection>,
     root: &str,
     result: &mut Vec<(String, String)>,
     dir: P,
-    pattern: &Regex,
-) -> Result<(), Error> {
+) -> Result<()> {
+    lazy_static! {
+        static ref DATE_TIME_PATTERN: Regex = Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
+    };
+
     let dir_buf = dir.as_ref().to_path_buf();
     for entry in read_dir(dir)? {
         let entry = entry?;
@@ -148,23 +80,21 @@ fn find_new<P: AsRef<Path>>(
                 if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
                     let mut path = dir_buf.clone();
                     path.push(name);
-                    let stripped = path.strip_prefix(root)?
-                        .to_str()
-                        .ok_or_else(|| format_err!("bad utf8"))?;
-                    let lock = lock(conn)?;
-                    let mut stmt = lock.prepare("SELECT 1 FROM paths WHERE path = ?1")?;
-                    if let None = stmt.query_map(&[&stripped], |_| ())?.next() {
+                    let stripped = path.strip_prefix(root)?.to_str().ok_or_else(|| anyhow!("bad utf8"))?;
+                    if sqlx::query!("SELECT 1 FROM paths WHERE path = ?1", path)
+                        .fetch_optional(&mut conn.lock().await)
+                        .await?
+                        .is_none()
+                    {
                         if let Some(datetime) = Metadata::new_from_path(&path)
                             .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
                             .ok()
                             .and_then(|s| {
-                                pattern.captures(&s).map(|c| {
-                                    format!(
-                                        "{}-{}-{} {}:{}:{}",
-                                        &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
-                                    )
-                                })
-                            }) {
+                                DATE_TIME_PATTERN
+                                    .captures(&s)
+                                    .map(|c| format!("{}-{}-{} {}:{}:{}", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]))
+                            })
+                        {
                             result.push((stripped.to_string(), datetime))
                         } else {
                             warn!("unable to get metadata for {}", lowercase);
@@ -174,71 +104,78 @@ fn find_new<P: AsRef<Path>>(
                 }
             }
         } else if path.is_dir() {
-            find_new(conn, root, result, path, pattern)?;
+            find_new(conn, root, result, path).await?;
         }
     }
 
     Ok(())
 }
 
-fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Result<(), Error> {
+async fn sync(conn: &AsyncMutex<Connection>, image_dir: &str) -> Result<()> {
     let then = Instant::now();
 
-    let obsolete = {
-        let lock = lock(conn)?;
-        let mut stmt = lock.prepare("SELECT path FROM paths")?;
-        let obsolete = stmt.query_map(&[], |row| row.get::<i32, String>(0))?
-            .filter_map(Result::ok)
-            .filter(|path| ![image_dir, path].iter().collect::<PathBuf>().is_file())
-            .collect::<Vec<_>>();
-        drop(stmt);
-        obsolete
-    };
+    let obsolete = sqlx::query!("SELECT path FROM paths")
+        .fetch(&mut conn.lock().await)
+        .await?
+        .filter(|path| ![image_dir, path].iter().collect::<PathBuf>().is_file())
+        .collect::<Vec<_>>();
 
     let new = {
         let mut result = Vec::new();
-        find_new(conn, image_dir, &mut result, image_dir, pattern)?;
+        find_new(conn, image_dir, &mut result, image_dir, pattern).await?;
         result
     };
 
     for &(ref path, ref datetime) in new.iter() {
         let hash = hash(&content([image_dir, &path].iter().collect::<PathBuf>())?);
+
         info!("insert {} (hash {})", path, hash);
-        let mut lock = lock(conn)?;
-        let transaction = lock.transaction()?;
-        transaction.execute(
-            "INSERT INTO paths (path, hash) VALUES (?1, ?2)",
-            &[path, &hash],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
-            &[&hash, datetime],
-        )?;
-        transaction.commit()?;
+
+        conn.lock()
+            .await
+            .transaction(|conn| async {
+                sqlx::query!("INSERT INTO paths (path, hash) VALUES (?1, ?2)", path, hash)
+                    .execute(conn)
+                    .await?;
+                sqlx::query!(
+                    "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
+                    hash,
+                    datetime
+                )
+                .execute(conn)
+                .await
+            })
+            .await
     }
 
     for path in obsolete.iter() {
         info!("delete {}", path);
-        let mut lock = lock(conn)?;
-        let transaction = lock.transaction()?;
-        let mut stmt = transaction.prepare("SELECT hash FROM paths WHERE path = ?1")?;
-        if let Some(hash) = stmt.query_map(&[path], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .next()
-        {
-            transaction.execute("DELETE FROM paths WHERE path = ?1", &[path])?;
-            let mut stmt = transaction.prepare("SELECT 1 FROM paths WHERE hash = ?1")?;
-            if let None = stmt.query_map(&[path], |_| ())?.next() {
-                transaction.execute("DELETE FROM images WHERE hash = ?1", &[&hash])?;
+
+        conn.lock().await.transaction(|conn| async {
+            if let Some(hash) = sqlx::query!("SELECT hash FROM paths WHERE path = ?1", path)
+                .fetch_optional(conn)
+                .await
+            {
+                sqlx::query!("DELETE FROM paths WHERE path = ?1", path)
+                    .execute(conn)
+                    .await?;
+                if sqlx::query!("SELECT 1 FROM paths WHERE hash = ?1", hash)
+                    .fetch_optional(conn)
+                    .await?
+                    .is_none()
+                {
+                    sqlx::query!("DELETE FROM images WHERE hash = ?1", hash)
+                        .execute(conn)
+                        .await?;
+                }
             }
-            drop(stmt);
-        }
-        drop(stmt);
+            Ok(())
+        });
     }
 
     info!(
-        "sync took {} seconds (added {}; deleted {})",
-        then.elapsed().as_secs(),
+        "sync took {:?} (added {}; deleted {})",
+        then.elapsed(),
         new.len(),
         obsolete.len()
     );
@@ -246,96 +183,107 @@ fn sync(conn: &Arc<Mutex<Connection>>, image_dir: &str, pattern: &Regex) -> Resu
     Ok(())
 }
 
-fn state(conn: &Arc<Mutex<Connection>>) -> Result<Value, Error> {
-    let mut map = Map::new();
-    let lock = lock(conn)?;
-    let mut stmt = lock.prepare(
-        "SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash",
-    )?;
-    for (hash, datetime, tag) in stmt.query_map(&[], |row| {
-        (
-            row.get::<_, String>(0),
-            row.get::<_, String>(1),
-            row.get::<_, Option<String>>(2),
-        )
-    })?
-        .filter_map(Result::ok)
-    {
-        let found = if let Some(&mut Value::Object(ref mut map)) = map.get_mut(&hash) {
-            if let Some(&mut Value::Array(ref mut tags)) = map.get_mut("tags") {
-                tags.extend(tag.iter().cloned().map(Value::String));
-                true
-            } else {
-                unimplemented!()
-            }
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct StateQuery {
+    start: Option<DateTime<Utc>>,
+    limit: Option<i32>,
+    tag: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct ImageState {
+    datetime: DateTime<Utc>,
+    tags: Vec<String>,
+}
+
+async fn state(conn: &mut Connection, query: &StateQuery) -> Result<Map<String, ImageState>> {
+    let mut query = sqlx::query(&format!(
+        "SELECT i.hash, i.datetime, t.tag FROM images AS i LEFT JOIN tags AS t ON i.hash = t.hash WHERE 1{}{}{}",
+        if query.start.is_some() {
+            " AND i.datetime > ?"
         } else {
-            false
-        };
+            ""
+        },
+        if query.tag.is_empty() {
+            ""
+        } else {
+            &iter::repeat(" AND t.tag = ?")
+                .take(query.tag.len())
+                .collect::<Vec<_>>()
+                .concat()
+        },
+        if query.limit.is_some() { " LIMIT ?" } else { "" }
+    ));
 
-        if !found {
-            map.insert(
-                hash,
-                json!({
-                    "datetime": datetime,
-                    "tags": tag.iter().collect::<Vec<_>>(),
-                }),
-            );
+    if let Some(start) = &query.start {
+        query = query.bind(start);
+    }
+
+    for tag in &query.tag {
+        query = query.bind(tag);
+    }
+
+    if let Some(limit) = &query.limit {
+        query = query.bind(limit);
+    }
+
+    let mut map = HashMap::new();
+
+    for row in query.fetch(conn).await? {
+        map.entry(row.get(0))
+            .or_insert_with(|| ImageState {
+                datetime: row.get(1),
+                tags: Vec::new(),
+            })
+            .tags
+            .push(row.get(2));
+    }
+
+    Ok(map)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Action {
+    Add,
+    Remove,
+}
+
+#[derive(Deserialize)]
+struct Patch {
+    hash: String,
+    tag: String,
+    action: Action,
+}
+
+async fn apply(conn: &mut Connection, patch: Patch) -> Result<()> {
+    Ok(match patch.action {
+        Action::Add => {
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, ?2)", hash, tag)
+                .execute(conn)
+                .await?
         }
-    }
-    Ok(Value::Object(map))
+        Some("remove") => {
+            sqlx::query!("DELETE FROM tags WHERE hash = ?1 AND tag = ?2", hash, tag)
+                .execute(conn)
+                .await?
+        }
+    })
 }
 
-fn apply(conn: &Arc<Mutex<Connection>>, patch: Value) -> Result<(), Error> {
-    let hash = patch["hash"]
-        .as_str()
-        .ok_or_else(|| format_err!("hash not found in {}", patch))?;
-
-    let tag = patch["tag"]
-        .as_str()
-        .ok_or_else(|| format_err!("tag not found in {}", patch))?;
-
-    match patch["action"].as_str() {
-        Some("add") => lock(conn)?
-            .execute(
-                "INSERT INTO tags (hash, tag) VALUES (?1, ?2)",
-                &[&hash, &tag],
-            )
-            .map(drop)
-            .map_err(Error::from),
-        Some("remove") => lock(conn)?
-            .execute(
-                "DELETE FROM tags WHERE hash = ?1 AND tag = ?2",
-                &[&hash, &tag],
-            )
-            .map(drop)
-            .map_err(Error::from),
-        _ => Err(format_err!("missing or unexpected action in {}", patch)),
-    }
-}
-
-fn full_size_image(
-    conn: &Arc<Mutex<Connection>>,
-    image_dir: &str,
-    path: &str,
-) -> Result<Vec<u8>, Error> {
-    let lock = lock(conn)?;
-    let mut stmt = lock.prepare("SELECT path FROM paths WHERE hash = ?1 LIMIT 1")?;
-    let result = if let Some(path) = stmt.query_map(&[&path], |row| row.get::<_, String>(0))?
-        .filter_map(Result::ok)
-        .next()
+async fn full_size_image(conn: &mut Connection, image_dir: &str, path: &str) -> Result<Vec<u8>> {
+    if let Some(path) = sql::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
+        .fetch_optional(conn)
+        .await?
     {
         content([image_dir, &path].iter().collect::<PathBuf>())
     } else {
-        Err(format_err!("image not found: {}", path))
-    };
-    drop(stmt);
-    result
+        Err(anyhow!("image not found: {}", path))
+    }
 }
 
-fn bound(
-    (native_width, native_height): (u32, u32),
-    (bound_width, bound_height): (u32, u32),
-) -> (u32, u32) {
+fn bound((native_width, native_height): (u32, u32), (bound_width, bound_height): (u32, u32)) -> (u32, u32) {
     if native_width * bound_height > bound_width * native_height {
         (bound_width, (native_height * bound_width) / native_width)
     } else {
@@ -343,89 +291,89 @@ fn bound(
     }
 }
 
-fn thumbnail(
-    conn: &Arc<Mutex<Connection>>,
+enum ThumbnailSize {
+    Small,
+    Large,
+}
+
+impl FromStr for ThumbnailSize {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "small" => Ok(ThumbnailSize::Small),
+            "large" => Ok(ThumbnailSize::Large),
+            _ => Err(anyhow!("unrecongnized thumbnail size \"{}\"", prefix)),
+        }
+    }
+}
+
+async fn thumbnail(
+    conn: &AsyncMutex<Connection>,
     image_dir: &str,
-    size: &str,
+    size: ThumbnailSize,
     path: &str,
-) -> Result<Vec<u8>, Error> {
-    let result = {
-        let lock = lock(conn)?;
-        let mut stmt = lock.prepare("SELECT rowid FROM images WHERE hash = ?1 LIMIT 1")?;
-        let row = stmt.query_map(&[&path], |row| row.get::<_, i64>(0))?
-            .filter_map(Result::ok)
-            .next();
-        drop(stmt);
-
-        let result = row.and_then(|row| {
-            lock.blob_open(DatabaseName::Main, "images", size, row, true)
-                .ok()
-        }).and_then(|mut blob| {
-            let mut result = Vec::new();
-            blob.read_to_end(&mut result).ok().map(|_| result)
-        });
-
-        result
+) -> Result<Vec<u8>> {
+    let result = match size {
+        ThumbnailSize::Small => {
+            sqlx::query!("SELECT small FROM images WHERE hash = ?1 LIMIT 1", path)
+                .fetch_optional(&mut conn.lock().await)
+                .await?
+        }
+        ThumbnailSize::Large => {
+            sqlx::query!("SELECT large FROM images WHERE hash = ?1 LIMIT 1", path)
+                .fetch_optional(&mut conn.lock().await)
+                .await?
+        }
     };
 
     if let Some(result) = result {
         Ok(result)
     } else {
-        let native_size = load_from_memory_with_format(
-            &full_size_image(conn, image_dir, path)?,
-            ImageFormat::JPEG,
-        )?;
+        let image = full_size_image(&mut conn.lock().unwrap(), image_dir, path).await?;
 
-        [("small", SMALL_BOUNDS), ("large", LARGE_BOUNDS)]
-            .iter()
-            .map(|&(size, bounds)| {
-                let (width, height) = bound(native_size.dimensions(), bounds);
+        let native_size = load_from_memory_with_format(&image, ImageFormat::JPEG)?;
 
-                let mut encoded = Vec::new();
-                native_size
-                    .resize(width, height, FilterType::Lanczos3)
-                    .write_to(&mut encoded, ImageOutputFormat::JPEG(JPEG_QUALITY))?;
+        let resize = |bounds| {
+            let (width, height) = bound(native_size.dimensions(), bounds);
 
-                lock(conn)?
-                    .execute(
-                        &format!("UPDATE images SET {} = ?1 WHERE hash = ?2", size),
-                        &[&encoded, &path],
-                    )
-                    .map(drop)
-                    .map_err(Error::from)?;
+            let mut encoded = Vec::new();
 
-                Ok((size, encoded))
-            })
-            .collect::<Result<HashMap<_, _>, Error>>()
-            .map(|mut map| map.remove(size).unwrap())
+            native_size
+                .resize(width, height, FilterType::Lanczos3)
+                .write_to(&mut encoded, ImageOutputFormat::JPEG(JPEG_QUALITY))?;
+
+            Ok(encoded)
+        };
+
+        let small = resize(SMALL_BOUNDS);
+        sqlx::query!("UPDATE images SET small = ?1 WHERE hash = ?2", small, path)
+            .execute(&mut conn.lock().await)
+            .await?;
+
+        let large = resize(LARGE_BOUNDS);
+        sqlx::query!("UPDATE images SET large = ?1 WHERE hash = ?2", large, path)
+            .execute(&mut conn.lock().await)
+            .await?;
+
+        Ok(match size {
+            ThumbnailSize::Small => small,
+            ThumbnailSize::Large => large,
+        })
     }
 }
 
-fn image(conn: &Arc<Mutex<Connection>>, image_dir: &str, path: &str) -> Result<Vec<u8>, Error> {
+async fn image(conn: &AsyncMutex<Connection>, image_dir: &str, path: &str) -> Result<Vec<u8>> {
     if path.starts_with("small/") || path.starts_with("large/") {
         let mut split = path.split('/');
         if let (Some(size), Some(path)) = (split.next(), split.next()) {
-            thumbnail(conn, image_dir, size, path)
+            thumbnail(conn, image_dir, size.parse()?, path).await
         } else {
-            Err(format_err!("malformed image path: {}", path))
+            Err(anyhow!("malformed image path: {}", path))
         }
     } else {
-        full_size_image(conn, image_dir, path)
+        full_size_image(&mut conn.lock().await, image_dir, path).await
     }
-}
-
-fn public(public_dir: &str, path: &str) -> Result<(Vec<u8>, ContentType), Error> {
-    content([public_dir, path].iter().collect::<PathBuf>()).map(|bytes| {
-        (
-            bytes,
-            match Path::new(path).extension().and_then(OsStr::to_str) {
-                Some("html") => ContentType::html(),
-                Some("js") => ContentType(mime::TEXT_JAVASCRIPT),
-                Some("css") => ContentType(mime::TEXT_CSS),
-                _ => ContentType::octet_stream(),
-            },
-        )
-    })
 }
 
 fn response() -> Response {
@@ -443,167 +391,156 @@ fn response() -> Response {
         ]))
 }
 
-fn handle(
-    conn: &Arc<Mutex<Connection>>,
-    image_dir: &str,
-    public_dir: &str,
-    req: Request,
-) -> Box<Future<Item = Response, Error = Error>> {
-    type F = Box<Future<Item = Response, Error = Error>>;
+fn routes(
+    conn: Arc<AsyncMutex<Connection>>,
+    options: &Options,
+) -> impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone {
+    warp::get()
+        .and(
+            warp::path("state")
+                .and(warp::query::<StateQuery>())
+                .and_then({
+                    let conn = conn.clone();
 
-    match (req.method(), req.path().to_string().as_ref()) {
-        (&Method::Post, "/patch") => {
-            let conn = conn.clone();
-            Box::new(
-                req.body()
-                    .concat2()
-                    .from_err()
-                    .and_then(move |body| {
-                        result(
-                            serde_json::from_slice(&body)
-                                .map_err(Error::from)
-                                .and_then(|patch| apply(&conn, patch)),
-                        )
-                    })
-                    .map(|_| {
-                        let body = "OK";
-                        response()
-                            .with_header(ContentLength(body.len() as u64))
-                            .with_header(ContentType::plaintext())
-                            .with_body(body)
-                    }),
-            ) as F
-        }
+                    move |query: StateQuery| {
+                        let conn = conn.clone();
 
-        (&Method::Post, _) => {
-            Box::new(ok(response().with_status(StatusCode::MethodNotAllowed))) as F
-        }
+                        async move {
+                            let state = serde_json::to_vec(&state(&mut conn.lock().await, &query).await?)?;
 
-        (&Method::Get, "/state") => Box::new(result(state(conn).map(|state| {
-            let state = state.to_string().as_bytes().to_vec();
-            response()
-                .with_header(ContentLength(state.len() as u64))
-                .with_header(ContentType::json())
-                .with_body(state)
-        }))) as F,
+                            Ok(response()
+                                .with_header(ContentLength(state.len() as u64))
+                                .with_header(ContentType::json())
+                                .with_body(state)?)
+                        }
+                        .map_err(|e| {
+                            warn!(?auth, "error retrieving state: {:?}", e);
 
-        (&Method::Get, path) => if path.starts_with("/images/") {
-            Box::new(result(image(conn, image_dir, &path[8..]).map(|image| {
-                response()
-                    .with_header(ContentLength(image.len() as u64))
-                    .with_header(ContentType::jpeg())
-                    .with_body(image)
-            }))) as F
+                            Rejection::from(HttpError::from(e))
+                        })
+                    }
+                })
+                .or(warp::path!("images" / String).and_then({
+                    let conn = conn.clone();
+
+                    move |hash| {
+                        let conn = conn.clone();
+
+                        async move {
+                            let image = image(&conn, image_dir, hash).await?;
+
+                            Ok(response()
+                                .with_header(ContentLength(image.len() as u64))
+                                .with_header(ContentType::jpeg())
+                                .with_body(image)?)
+                        }
+                        .map_err(|e| {
+                            warn!(?auth, "error retrieving image {}: {:?}", hash, e);
+
+                            Rejection::from(HttpError::from(e))
+                        })
+                    }
+                }))
+                .or(warp::fs::dir(&options.public_dir)),
+        )
+        .or(warp::post()
+            .and(warp::path("patch"))
+            .and(warp::body::json())
+            .and_then(move |patch: Patch| {
+                let conn = conn.clone();
+
+                async move {
+                    apply(&mut conn.lock().await, patch).await?;
+
+                    Ok(())
+                }
+                .map_err(|e| {
+                    warn!(?auth, "error applying patch {}: {:?}", hash, e);
+
+                    Rejection::from(HttpError::from(e))
+                })
+            }))
+        .recover(warp_util::handle_rejection)
+        .with(warp::log("tagger"))
+}
+
+fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
+    panic::catch_unwind(fun).map_err(|e| {
+        if let Some(s) = e.downcast_ref::<&str>() {
+            anyhow!("{}", s)
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            anyhow!("{}", s)
         } else {
-            Box::new(result(public(public_dir, &path[1..]).map(
-                |(file, content_type)| {
-                    response()
-                        .with_header(ContentLength(file.len() as u64))
-                        .with_header(content_type)
-                        .with_body(file)
-                },
-            ))) as F
-        },
-
-        _ => Box::new(ok(response().with_status(StatusCode::MethodNotAllowed))) as F,
-    }
-}
-
-fn serve(
-    conn: &Arc<Mutex<Connection>>,
-    address: &str,
-    image_dir: &str,
-    public_dir: &str,
-) -> Result<(), Error> {
-    struct Server {
-        conn: Arc<Mutex<Connection>>,
-        image_dir: Rc<String>,
-        public_dir: Rc<String>,
-    }
-
-    impl Service for Server {
-        type Request = Request;
-        type Response = Response;
-        type Error = hyper::Error;
-        type Future = Box<Future<Item = Response, Error = hyper::Error>>;
-
-        fn call(&self, req: Request) -> Self::Future {
-            Box::new(
-                handle(&self.conn, &self.image_dir, &self.public_dir, req).or_else(|e| {
-                    error!("request error: {:?}", e);
-                    let body = format!("{:?}", e);
-                    Box::new(ok(response()
-                        .with_status(StatusCode::InternalServerError)
-                        .with_header(ContentLength(body.len() as u64))
-                        .with_header(ContentType::plaintext())
-                        .with_body(body)))
-                }),
-            )
+            anyhow!("caught panic")
         }
-    }
-
-    let conn = conn.clone();
-    let image_dir = Rc::new(image_dir.to_string());
-    let public_dir = Rc::new(public_dir.to_string());
-    let mut server = Http::new().bind(&address.parse()?, move || {
-        Ok(Server {
-            conn: conn.clone(),
-            image_dir: image_dir.clone(),
-            public_dir: public_dir.clone(),
-        })
-    })?;
-    server.no_proto();
-    server.run().map_err(Error::from)
+    })
 }
 
-fn run(address: &str, image_dir: &str, state_file: &str, public_dir: &str) -> Result<(), Error> {
-    init_logger()?;
+async fn serve(conn: Arc<Mutex<Connection>>, options: &Options) -> Result<()> {
+    let (address, future) = if let Some((cert, key)) = &tls_cert_and_key {
+        let server = server.tls().cert_path(cert).key_path(key);
 
-    let conn = Arc::new(Mutex::new(open(state_file)?));
+        // As of this writing, warp::TlsServer does not have a try_bind_ephemeral method, so we must catch panics
+        // explicitly.
+        let (address, future) = catch_unwind(AssertUnwindSafe(move || server.bind_ephemeral(address)))?;
 
-    let pattern = Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})")?;
+        (address, future.boxed())
+    } else {
+        let (address, future) = server.try_bind_ephemeral(address)?;
 
-    sync(&conn, image_dir, &pattern)?;
+        (address, future.boxed())
+    };
 
-    {
-        let image_dir = image_dir.to_string();
+    info!("listening on {}", address);
+
+    future.await;
+
+    Ok(())
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
+struct Options {
+    #[structopt(long, help = "address to which to bind")]
+    address: Ipv4Addr,
+
+    #[structopt(long, help = "directory containing image files")]
+    image_directory: Arc<str>,
+
+    #[structopt(long, help = "SQLite database of image metadata to create or reuse")]
+    state_file: PathBuf,
+
+    #[structopt(long, help = "directory containing static resources")]
+    public_directory: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    pretty_env_logger::init_timed();
+
+    let options = Options::from_args();
+
+    let conn = task::block_in_place(|| {
+        let conn = Arc::new(Mutex::new(open(&options.state_file)?));
+
+        sync(&conn, &options.image_directory);
+
+        conn
+    });
+
+    thread::spawn({
+        let image_dir = options.image_directory.clone();
         let conn = conn.clone();
-        let pattern = pattern.clone();
 
-        spawn(move || loop {
-            sleep(Duration::from_secs(10));
+        move || {
+            thread::sleep(Duration::from_secs(SYNC_INTERVAL_SECONDS));
 
-            if let Err(e) = sync(&conn, &image_dir, &pattern) {
+            if let Err(e) = sync(&conn, &image_dir) {
                 error!("sync error: {:?}", e);
                 exit(-1)
             }
-        });
-    }
+        }
+    });
 
-    serve(&conn, address, image_dir, public_dir)
-}
-
-fn arg(name: &str) -> Arg {
-    Arg::with_name(name).takes_value(true).required(true)
-}
-
-fn main() {
-    let matches = App::new(env!("CARGO_PKG_DESCRIPTION"))
-        .version(env!("CARGO_PKG_VERSION"))
-        .author(env!("CARGO_PKG_AUTHORS"))
-        .arg(arg("address").help("address to which to bind"))
-        .arg(arg("image directory").help("directoring containing image files"))
-        .arg(arg("state file").help("SQLite database of image metadata to create or reuse"))
-        .arg(arg("public directory").help("directory containing static resources"))
-        .get_matches();
-
-    if let Err(e) = run(
-        matches.value_of("address").unwrap(),
-        matches.value_of("image directory").unwrap(),
-        matches.value_of("state file").unwrap(),
-        matches.value_of("public directory").unwrap(),
-    ) {
-        error!("exit on error: {:?}", e);
-        exit(-1)
-    }
+    serve(&conn, &options).await
 }

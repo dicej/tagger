@@ -1,4 +1,4 @@
-use typed-html macro
+use typed-html macro (or parens-and-curly-brackets syntax?)
 struct Render<S>, where S: Clone + Eq + Default
   fn case takes Fn(S)->usize and Vec<html>; returns html
   fn if_else takes Fn(S)->bool, when_true: html, and when_false: html; returns html (implemented in terms of case)
