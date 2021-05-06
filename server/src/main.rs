@@ -81,12 +81,15 @@ async fn find_new<P: AsRef<Path>>(
                     let mut path = dir_buf.clone();
                     path.push(name);
                     let stripped = path.strip_prefix(root)?.to_str().ok_or_else(|| anyhow!("bad utf8"))?;
-                    if sqlx::query!("SELECT 1 FROM paths WHERE path = ?1", path)
+
+                    let found = sqlx::query!("SELECT 1 FROM paths WHERE path = ?1", path)
                         .fetch_optional(&mut conn.lock().await)
                         .await?
-                        .is_none()
-                    {
+                        .is_some();
+
+                    if !found {
                         if let Some(datetime) = Metadata::new_from_path(&path)
+                            .await
                             .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
                             .ok()
                             .and_then(|s| {
@@ -100,7 +103,6 @@ async fn find_new<P: AsRef<Path>>(
                             warn!("unable to get metadata for {}", lowercase);
                         }
                     }
-                    drop(stmt);
                 }
             }
         } else if path.is_dir() {
@@ -137,6 +139,7 @@ async fn sync(conn: &AsyncMutex<Connection>, image_dir: &str) -> Result<()> {
                 sqlx::query!("INSERT INTO paths (path, hash) VALUES (?1, ?2)", path, hash)
                     .execute(conn)
                     .await?;
+
                 sqlx::query!(
                     "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
                     hash,
@@ -145,32 +148,37 @@ async fn sync(conn: &AsyncMutex<Connection>, image_dir: &str) -> Result<()> {
                 .execute(conn)
                 .await
             })
-            .await
+            .await?
     }
 
     for path in obsolete.iter() {
         info!("delete {}", path);
 
-        conn.lock().await.transaction(|conn| async {
-            if let Some(hash) = sqlx::query!("SELECT hash FROM paths WHERE path = ?1", path)
-                .fetch_optional(conn)
-                .await
-            {
-                sqlx::query!("DELETE FROM paths WHERE path = ?1", path)
-                    .execute(conn)
-                    .await?;
-                if sqlx::query!("SELECT 1 FROM paths WHERE hash = ?1", hash)
+        conn.lock()
+            .await
+            .transaction(|conn| async {
+                if let Some(hash) = sqlx::query!("SELECT hash FROM paths WHERE path = ?1", path)
                     .fetch_optional(conn)
-                    .await?
-                    .is_none()
+                    .await
                 {
-                    sqlx::query!("DELETE FROM images WHERE hash = ?1", hash)
+                    sqlx::query!("DELETE FROM paths WHERE path = ?1", path)
                         .execute(conn)
                         .await?;
+
+                    if sqlx::query!("SELECT 1 FROM paths WHERE hash = ?1", hash)
+                        .fetch_optional(conn)
+                        .await?
+                        .is_none()
+                    {
+                        sqlx::query!("DELETE FROM images WHERE hash = ?1", hash)
+                            .execute(conn)
+                            .await?;
+                    }
                 }
-            }
-            Ok(())
-        });
+
+                Ok(())
+            })
+            .await?;
     }
 
     info!(
@@ -184,7 +192,6 @@ async fn sync(conn: &AsyncMutex<Connection>, image_dir: &str) -> Result<()> {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
 struct StateQuery {
     start: Option<DateTime<Utc>>,
     limit: Option<i32>,
@@ -264,7 +271,7 @@ async fn apply(conn: &mut Connection, patch: Patch) -> Result<()> {
                 .execute(conn)
                 .await?
         }
-        Some("remove") => {
+        Action::Remove => {
             sqlx::query!("DELETE FROM tags WHERE hash = ?1 AND tag = ?2", hash, tag)
                 .execute(conn)
                 .await?
@@ -277,7 +284,7 @@ async fn full_size_image(conn: &mut Connection, image_dir: &str, path: &str) -> 
         .fetch_optional(conn)
         .await?
     {
-        content([image_dir, &path].iter().collect::<PathBuf>())
+        content([image_dir, &path].iter().collect::<PathBuf>()).await
     } else {
         Err(anyhow!("image not found: {}", path))
     }
@@ -291,21 +298,11 @@ fn bound((native_width, native_height): (u32, u32), (bound_width, bound_height):
     }
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
 enum ThumbnailSize {
     Small,
     Large,
-}
-
-impl FromStr for ThumbnailSize {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "small" => Ok(ThumbnailSize::Small),
-            "large" => Ok(ThumbnailSize::Large),
-            _ => Err(anyhow!("unrecongnized thumbnail size \"{}\"", prefix)),
-        }
-    }
 }
 
 async fn thumbnail(
@@ -363,14 +360,14 @@ async fn thumbnail(
     }
 }
 
-async fn image(conn: &AsyncMutex<Connection>, image_dir: &str, path: &str) -> Result<Vec<u8>> {
-    if path.starts_with("small/") || path.starts_with("large/") {
-        let mut split = path.split('/');
-        if let (Some(size), Some(path)) = (split.next(), split.next()) {
-            thumbnail(conn, image_dir, size.parse()?, path).await
-        } else {
-            Err(anyhow!("malformed image path: {}", path))
-        }
+#[derive(Deserialize, Debug)]
+struct ImageQuery {
+    size: Option<ThumbnailSize>,
+}
+
+async fn image(conn: &AsyncMutex<Connection>, image_dir: &str, path: &str, query: &ImageQuery) -> Result<Vec<u8>> {
+    if let Some(size) = &query.size {
+        thumbnail(conn, image_dir, size, path).await
     } else {
         full_size_image(&mut conn.lock().await, image_dir, path).await
     }
@@ -402,7 +399,7 @@ fn routes(
                 .and_then({
                     let conn = conn.clone();
 
-                    move |query: StateQuery| {
+                    move |query| {
                         let conn = conn.clone();
 
                         async move {
@@ -420,14 +417,14 @@ fn routes(
                         })
                     }
                 })
-                .or(warp::path!("images" / String).and_then({
+                .or(warp::path("image" / String).and(warp::query::<ImageQuery>()).and_then({
                     let conn = conn.clone();
 
-                    move |hash| {
+                    move |hash, query| {
                         let conn = conn.clone();
 
                         async move {
-                            let image = image(&conn, image_dir, hash).await?;
+                            let image = image(&conn, image_dir, hash, &query).await?;
 
                             Ok(response()
                                 .with_header(ContentLength(image.len() as u64))
