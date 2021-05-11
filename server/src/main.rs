@@ -3,19 +3,23 @@
 use anyhow::{anyhow, Error, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::{
-    future::{BoxFuture, FutureExt, TryFutureExt},
+    future::{self, BoxFuture, FutureExt, TryFutureExt},
     stream::TryStreamExt,
 };
 use http::{
     header,
     response::{self, Response},
+    status::StatusCode,
 };
 use hyper::Body;
 use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
+use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use lazy_static::lazy_static;
+use rand::Rng;
 use regex::Regex;
 use rexiv2::Metadata;
 use serde_derive::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, Row, SqliteConnection};
 use std::{
@@ -23,12 +27,14 @@ use std::{
     convert::Infallible,
     iter,
     net::SocketAddrV4,
+    num::NonZeroU32,
     ops::DerefMut,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     process,
+    str::FromStr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
 use tokio::{
@@ -44,9 +50,16 @@ use warp_util::HttpError;
 mod warp_util;
 
 const SMALL_BOUNDS: (u32, u32) = (320, 240);
+
 const LARGE_BOUNDS: (u32, u32) = (1280, 960);
+
 const JPEG_QUALITY: u8 = 90;
+
 const SYNC_INTERVAL_SECONDS: u64 = 10;
+
+const INVALID_CREDENTIAL_DELAY_SECS: u64 = 5;
+
+const TOKEN_EXPIRATION_SECS: u64 = 24 * 60 * 60;
 
 async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
@@ -95,7 +108,7 @@ fn find_new<'a>(
 
     let dir_buf = dir.as_ref().to_path_buf();
 
-    async {
+    async move {
         let mut dir = fs::read_dir(dir).await?;
 
         while let Some(entry) = dir.next_entry().await? {
@@ -327,7 +340,7 @@ struct Patch {
     action: Action,
 }
 
-async fn apply(conn: &mut SqliteConnection, patch: Patch) -> Result<()> {
+async fn apply(conn: &mut SqliteConnection, patch: &Patch) -> Result<()> {
     match patch.action {
         Action::Add => {
             sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, ?2)", patch.hash, patch.tag)
@@ -441,6 +454,156 @@ async fn image(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GrantType {
+    Password,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenRequest {
+    #[serde(rename = "grant_type")]
+    _grant_type: GrantType,
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenType {
+    Jwt,
+}
+
+#[derive(Serialize)]
+struct TokenSuccess {
+    access_token: String,
+    token_type: TokenType,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TokenErrorType {
+    UnauthorizedClient,
+}
+
+#[derive(Serialize)]
+struct TokenError {
+    error: TokenErrorType,
+    error_description: Option<String>,
+}
+
+fn hash_password(salt: &[u8], secret: &[u8]) -> String {
+    let iterations = NonZeroU32::new(100_000).unwrap();
+    const SIZE: usize = ring::digest::SHA256_OUTPUT_LEN;
+    let mut hash: [u8; SIZE] = [0u8; SIZE];
+    ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256, iterations, salt, secret, &mut hash);
+    base64::encode(&hash)
+}
+
+async fn authenticate(
+    conn: &AsyncMutex<SqliteConnection>,
+    request: &TokenRequest,
+    key: &[u8],
+    mutex: &AsyncMutex<()>,
+) -> Result<Response<Body>> {
+    let _lock = mutex.lock().await;
+
+    let hash = hash_password(request.username.as_bytes(), request.password.as_bytes());
+
+    let found = sqlx::query("SELECT 1 FROM users WHERE name = ?1 AND password_hash = ?2")
+        .bind(&request.username)
+        .bind(&hash)
+        .fetch_optional(conn.lock().await.deref_mut())
+        .await?
+        .is_some();
+
+    Ok(if found {
+        let expiration = (SystemTime::now() + Duration::from_secs(TOKEN_EXPIRATION_SECS))
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+
+        let success = serde_json::to_vec(&TokenSuccess {
+            access_token: jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &json!({
+                    "exp": expiration,
+                    "sub": &request.username
+                }),
+                &EncodingKey::from_secret(key),
+            )?,
+            token_type: TokenType::Jwt,
+        })?;
+
+        response()
+            .header(header::CONTENT_LENGTH, success.len())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(success))?
+    } else {
+        warn!("received invalid credentials; delaying response");
+
+        time::sleep(Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS)).await;
+
+        let error = serde_json::to_vec(&TokenError {
+            error: TokenErrorType::UnauthorizedClient,
+            error_description: None,
+        })?;
+
+        response()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_LENGTH, error.len())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(error))?
+    })
+}
+
+#[derive(Deserialize, Debug)]
+struct Authorization {
+    sub: String,
+}
+
+struct Bearer {
+    pub body: String,
+}
+
+impl FromStr for Bearer {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let prefix = "Bearer ";
+        if s.starts_with(prefix) {
+            Ok(Self {
+                body: s.chars().skip(prefix.len()).collect(),
+            })
+        } else {
+            Err(anyhow!("expected prefix \"{}\"", prefix))
+        }
+    }
+}
+
+fn authorize(header: Option<Bearer>, key: &[u8]) -> Result<Arc<Authorization>, Rejection> {
+    let token = header.map(|h| h.body).ok_or_else(|| {
+        HttpError::from_slice(
+            StatusCode::UNAUTHORIZED,
+            "auth token query parameter or header required",
+        )
+    })?;
+
+    Ok(Arc::new(
+        jsonwebtoken::decode::<Authorization>(
+            &token,
+            &DecodingKey::from_secret(key),
+            &Validation::new(Algorithm::HS256),
+        )
+        .map_err(|e| {
+            warn!("received invalid token: {}: {:?}", token, e);
+
+            HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
+        })?
+        .claims,
+    ))
+}
+
 fn response() -> response::Builder {
     Response::builder()
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "any")
@@ -452,80 +615,120 @@ fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     options: &Arc<Options>,
 ) -> impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone {
-    warp::get()
-        .and(
-            warp::path("state")
-                .and(warp::query::<StateQuery>())
-                .and_then({
-                    let conn = conn.clone();
+    let mut auth_key = [0u8; 32];
+    rand::thread_rng().fill(&mut auth_key);
 
-                    move |query| {
-                        let conn = conn.clone();
+    let auth_mutex = Arc::new(AsyncMutex::new(()));
 
-                        async move {
-                            let state = serde_json::to_vec(&state(conn.lock().await.deref_mut(), &query).await?)?;
+    let auth = warp::header::optional::<Bearer>("authorization")
+        .and_then(move |header| future::ready(authorize(header, &auth_key)));
 
-                            Ok(response()
-                                .header(header::CONTENT_LENGTH, state.len())
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(Body::from(state))?)
-                        }
-                        .map_err(|e| {
-                            warn!(?auth, "error retrieving state: {:?}", e);
-
-                            Rejection::from(HttpError::from(e))
-                        })
-                    }
-                })
-                .or(warp::path!("image" / String)
-                    .and(warp::query::<ImageQuery>())
-                    .and_then({
-                        let conn = conn.clone();
-                        let options = options.clone();
-
-                        move |hash: String, query| {
-                            let conn = conn.clone();
-                            let options = options.clone();
-
-                            async move {
-                                let image = image(&conn, &options.image_directory, &hash, &query).await?;
-
-                                Ok(response()
-                                    .header(header::CONTENT_LENGTH, image.len())
-                                    .header(header::CONTENT_TYPE, "application/json")
-                                    .body(Body::from(image))?)
-                            }
-                            .map_err(|e| {
-                                warn!(?auth, "error retrieving image {}: {:?}", hash, e);
-
-                                Rejection::from(HttpError::from(e))
-                            })
-                        }
-                    }))
-                .or(warp::fs::dir(&options.public_directory)),
-        )
-        .or(warp::post().and(warp::path("patch")).and(warp::body::json()).and_then({
+    warp::post()
+        .and(warp::path("token"))
+        .and(warp::body::form::<TokenRequest>())
+        .and_then({
             let conn = conn.clone();
-            move |patch: Patch| {
+
+            move |body| {
                 let conn = conn.clone();
+                let auth_mutex = auth_mutex.clone();
 
-                async move {
-                    apply(conn.lock().await.deref_mut(), patch).await?;
-
-                    Ok(String::new())
-                }
-                .map_err(|e| {
-                    warn!(
-                        ?auth,
-                        "error applying patch {}: {:?}",
-                        serde_json::to_string(&patch).unwrap_or_else(|_| "(unable to serialize patch)".to_string()),
-                        e
-                    );
+                async move { authenticate(&conn, &body, &auth_key, &auth_mutex).await }.map_err(|e| {
+                    warn!("error authorizing: {:?}", e);
 
                     Rejection::from(HttpError::from(e))
                 })
             }
-        }))
+        })
+        .or(warp::get()
+            .and(
+                warp::path("state")
+                    .and(auth)
+                    .and(warp::query::<StateQuery>())
+                    .and_then({
+                        let conn = conn.clone();
+
+                        move |auth, query| {
+                            let conn = conn.clone();
+
+                            async move {
+                                let state = serde_json::to_vec(&state(conn.lock().await.deref_mut(), &query).await?)?;
+
+                                Ok(response()
+                                    .header(header::CONTENT_LENGTH, state.len())
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(state))?)
+                            }
+                            .map_err(move |e| {
+                                warn!(?auth, "error retrieving state: {:?}", e);
+
+                                Rejection::from(HttpError::from(e))
+                            })
+                        }
+                    })
+                    .or(auth
+                        .and(warp::path!("image" / String))
+                        .and(warp::query::<ImageQuery>())
+                        .and_then({
+                            let conn = conn.clone();
+                            let options = options.clone();
+
+                            move |auth, hash: String, query| {
+                                let hash = Arc::<str>::from(hash);
+
+                                {
+                                    let hash = hash.clone();
+                                    let conn = conn.clone();
+                                    let options = options.clone();
+
+                                    async move {
+                                        let image = image(&conn, &options.image_directory, &hash, &query).await?;
+
+                                        Ok(response()
+                                            .header(header::CONTENT_LENGTH, image.len())
+                                            .header(header::CONTENT_TYPE, "application/json")
+                                            .body(Body::from(image))?)
+                                    }
+                                }
+                                .map_err(move |e| {
+                                    warn!(?auth, "error retrieving image {}: {:?}", hash, e);
+
+                                    Rejection::from(HttpError::from(e))
+                                })
+                            }
+                        }))
+                    .or(warp::fs::dir(options.public_directory.clone())),
+            )
+            .or(
+                warp::post().and(warp::path("patch").and(auth).and(warp::body::json()).and_then({
+                    let conn = conn.clone();
+                    move |auth, patch: Patch| {
+                        let patch = Arc::new(patch);
+
+                        {
+                            let patch = patch.clone();
+                            let conn = conn.clone();
+
+                            async move {
+                                apply(conn.lock().await.deref_mut(), &patch).await?;
+
+                                Ok(String::new())
+                            }
+                        }
+                        .map_err(move |e| {
+                            warn!(
+                                ?auth,
+                                "error applying patch {}: {:?}",
+                                serde_json::to_string(patch.as_ref())
+                                    .unwrap_or_else(|_| "(unable to serialize patch)".to_string()),
+                                e
+                            );
+
+                            Rejection::from(HttpError::from(e))
+                        })
+                    }
+                })),
+            ))
         .recover(warp_util::handle_rejection)
         .with(warp::log("tagger"))
 }
@@ -596,14 +799,14 @@ async fn main() -> Result<()> {
 
     let conn = Arc::new(AsyncMutex::new(open(&options.state_file).await?));
 
-    sync(&conn, &options.image_directory);
+    sync(&conn, &options.image_directory).await?;
 
     task::spawn({
         let options = options.clone();
         let conn = conn.clone();
 
         async move {
-            time::sleep(Duration::from_secs(SYNC_INTERVAL_SECONDS));
+            time::sleep(Duration::from_secs(SYNC_INTERVAL_SECONDS)).await;
 
             if let Err(e) = sync(&conn, &options.image_directory).await {
                 error!("sync error: {:?}", e);

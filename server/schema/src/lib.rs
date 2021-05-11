@@ -2,20 +2,26 @@
 
 pub static DDL_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS paths (
-       path      TEXT NOT NULL PRIMARY KEY,
-       hash      TEXT NOT NULL
+       path          TEXT NOT NULL PRIMARY KEY,
+       hash          TEXT NOT NULL
      )",
     "CREATE TABLE IF NOT EXISTS images (
-       hash      TEXT NOT NULL PRIMARY KEY,
-       datetime  TEXT NOT NULL,
-       small     BLOB,
-       large     BLOB
+       hash          TEXT NOT NULL PRIMARY KEY,
+       datetime      TEXT NOT NULL,
+       small         BLOB,
+       large         BLOB
      )",
     "CREATE TABLE IF NOT EXISTS tags (
-       hash      TEXT NOT NULL,
-       tag       TEXT NOT NULL,
+       hash          TEXT NOT NULL,
+       tag           TEXT NOT NULL,
 
        PRIMARY KEY (hash, tag),
        FOREIGN KEY (hash) REFERENCES images(hash) ON DELETE CASCADE
+     )",
+    "CREATE TABLE IF NOT EXISTS users (
+       name          TEXT NOT NULL,
+       password_hash TEXT NOT NULL,
+
+       PRIMARY KEY (name, password_hash)
      )",
 ];

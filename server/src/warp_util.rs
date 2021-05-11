@@ -22,13 +22,6 @@ pub struct HttpError {
 }
 
 impl HttpError {
-    pub fn from_string(status: StatusCode, message: String) -> Self {
-        Self {
-            status,
-            message: Cow::Owned(message),
-        }
-    }
-
     pub fn from_slice(status: StatusCode, message: &'static str) -> Self {
         Self {
             status,
