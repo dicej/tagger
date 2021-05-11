@@ -261,7 +261,7 @@ struct StateQuery {
     tag: Vec<String>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct ImageState {
     datetime: DateTime<Utc>,
     tags: Vec<String>,
@@ -469,25 +469,25 @@ struct TokenRequest {
     password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TokenType {
     Jwt,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct TokenSuccess {
     access_token: String,
     token_type: TokenType,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TokenErrorType {
     UnauthorizedClient,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct TokenError {
     error: TokenErrorType,
     error_description: Option<String>,
@@ -506,6 +506,7 @@ async fn authenticate(
     request: &TokenRequest,
     key: &[u8],
     mutex: &AsyncMutex<()>,
+    invalid_credential_delay: Duration,
 ) -> Result<Response<Body>> {
     let _lock = mutex.lock().await;
 
@@ -542,7 +543,7 @@ async fn authenticate(
     } else {
         warn!("received invalid credentials; delaying response");
 
-        time::sleep(Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS)).await;
+        time::sleep(invalid_credential_delay).await;
 
         let error = serde_json::to_vec(&TokenError {
             error: TokenErrorType::UnauthorizedClient,
@@ -614,6 +615,7 @@ fn response() -> response::Builder {
 fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     options: &Arc<Options>,
+    invalid_credential_delay: Duration,
 ) -> impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone {
     let mut auth_key = [0u8; 32];
     rand::thread_rng().fill(&mut auth_key);
@@ -633,11 +635,12 @@ fn routes(
                 let conn = conn.clone();
                 let auth_mutex = auth_mutex.clone();
 
-                async move { authenticate(&conn, &body, &auth_key, &auth_mutex).await }.map_err(|e| {
-                    warn!("error authorizing: {:?}", e);
+                async move { authenticate(&conn, &body, &auth_key, &auth_mutex, invalid_credential_delay).await }
+                    .map_err(|e| {
+                        warn!("error authorizing: {:?}", e);
 
-                    Rejection::from(HttpError::from(e))
-                })
+                        Rejection::from(HttpError::from(e))
+                    })
             }
         })
         .or(warp::get()
@@ -700,7 +703,7 @@ fn routes(
                     .or(warp::fs::dir(options.public_directory.clone())),
             )
             .or(
-                warp::post().and(warp::path("patch").and(auth).and(warp::body::json()).and_then({
+                warp::patch().and(warp::path("patch").and(auth).and(warp::body::json()).and_then({
                     let conn = conn.clone();
                     move |auth, patch: Patch| {
                         let patch = Arc::new(patch);
@@ -746,7 +749,7 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
 }
 
 async fn serve(conn: &Arc<AsyncMutex<SqliteConnection>>, options: &Arc<Options>) -> Result<()> {
-    let routes = routes(conn, options);
+    let routes = routes(conn, options, Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS));
 
     let (address, future) = if let (Some(cert), Some(key)) = (&options.cert_file, &options.key_file) {
         let server = warp::serve(routes).tls().cert_path(cert).key_path(key);
@@ -816,4 +819,114 @@ async fn main() -> Result<()> {
     });
 
     serve(&conn, &options).await
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn it_works() -> Result<()> {
+        let mut conn = "sqlite::memory:".parse::<SqliteConnectOptions>()?.connect().await?;
+
+        for statement in schema::DDL_STATEMENTS {
+            sqlx::query(statement).execute(&mut conn).await?;
+        }
+
+        let user = "Jabberwocky";
+        let password = "Bandersnatch";
+
+        {
+            let hash = hash_password(user.as_bytes(), password.as_bytes());
+
+            sqlx::query!("INSERT INTO users (name, password_hash) VALUES (?1, ?2)", user, hash,)
+                .execute(&mut conn)
+                .await?;
+        }
+
+        let conn = Arc::new(AsyncMutex::new(conn));
+
+        let tmp_dir = TempDir::new()?;
+
+        let routes = routes(
+            &conn,
+            &Arc::new(Options {
+                address: "0.0.0.0:0".parse()?,
+                image_directory: tmp_dir
+                    .path()
+                    .to_str()
+                    .ok_or_else(|| anyhow!("invalid UTF-8"))?
+                    .to_owned(),
+                state_file: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
+                public_directory: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
+                cert_file: None,
+                key_file: None,
+            }),
+            Duration::from_secs(0),
+        );
+
+        let response = warp::test::request()
+            .method("POST")
+            .path("/token")
+            .body("grant_type=password&username=invalid+user&password=invalid+password")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        serde_json::from_slice::<TokenError>(response.body())?;
+
+        let response = warp::test::request()
+            .method("POST")
+            .path("/token")
+            .body(&format!(
+                "grant_type=password&username={}&password=invalid+password",
+                user
+            ))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        serde_json::from_slice::<TokenError>(response.body())?;
+
+        let response = warp::test::request()
+            .method("POST")
+            .path("/token")
+            .body(&format!("grant_type=password&username={}&password={}", user, password))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let token = serde_json::from_slice::<TokenSuccess>(response.body())?.access_token;
+
+        let response = warp::test::request().method("GET").path("/state").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state")
+            .header("authorization", "Bearer invalid")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?.is_empty());
+
+        // todo: add images to directory, run scan, and test more scenarios
+
+        Ok(())
+    }
 }
