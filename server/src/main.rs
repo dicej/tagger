@@ -69,6 +69,8 @@ const INVALID_CREDENTIAL_DELAY_SECS: u64 = 5;
 
 const TOKEN_EXPIRATION_SECS: u64 = 24 * 60 * 60;
 
+const DEFAULT_LIMIT: u32 = 1000;
+
 async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
         .parse::<SqliteConnectOptions>()?
@@ -137,11 +139,14 @@ fn find_new<'a>(
 
                         if !found {
                             if let Some(datetime) = Metadata::new_from_buffer(&content(&path).await?)
-                                .and_then(|m| m.get_tag_string("Exif.Image.DateTime"))
+                                .and_then(|m| {
+                                    m.get_tag_string("Exif.Image.DateTimeOriginal")
+                                        .or_else(|_| m.get_tag_string("Exif.Image.DateTime"))
+                                })
                                 .ok()
                                 .and_then(|s| {
                                     DATE_TIME_PATTERN.captures(&s).map(|c| {
-                                        format!("{}-{}-{} {}:{}:{}", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6])
+                                        format!("{}-{}-{}T{}:{}:{}", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6])
                                     })
                                 })
                             {
@@ -287,7 +292,7 @@ impl<'de> serde::Deserialize<'de> for TagExpression {
 #[derive(Deserialize, Debug)]
 struct StateQuery {
     start: Option<DateTime<Utc>>,
-    limit: Option<i32>,
+    limit: Option<u32>,
     tags: Option<TagExpression>,
 }
 
@@ -298,14 +303,17 @@ struct ImageState {
 }
 
 async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMap<String, ImageState>> {
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+
     let select = format!(
         "SELECT i.hash, i.datetime, t.tag
          FROM images AS i
          LEFT JOIN tags AS t ON i.hash = t.hash
-         WHERE 1{}{}{}
-         ORDER BY i.datetime",
+         WHERE 1{}{}
+         ORDER BY i.datetime
+         LIMIT ?",
         if query.start.is_some() {
-            " AND i.datetime > ?"
+            " AND i.datetime >= ?"
         } else {
             ""
         },
@@ -313,8 +321,7 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
             format!(" AND {}", tags.to_sql_string())
         } else {
             String::new()
-        },
-        if query.limit.is_some() { " LIMIT ?" } else { "" }
+        }
     );
 
     let mut select = sqlx::query(&select);
@@ -327,9 +334,7 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
         select = tags.fold_tags(select, |select, tag| select.bind(tag));
     }
 
-    if let Some(limit) = &query.limit {
-        select = select.bind(limit + 1);
-    }
+    select = select.bind(limit + 1);
 
     let mut map = HashMap::new();
 
@@ -338,13 +343,14 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
     while let Some(row) = rows.try_next().await? {
         let datetime = DateTime::<Utc>::from_utc(row.get::<&str, _>(1).parse::<NaiveDateTime>()?, Utc);
 
-        map.entry(row.get(0))
-            .or_insert_with(|| ImageState {
-                datetime,
-                tags: Vec::new(),
-            })
-            .tags
-            .push(row.get(2));
+        let entry = map.entry(row.get(0)).or_insert_with(|| ImageState {
+            datetime,
+            tags: Vec::new(),
+        });
+
+        if let Some(tag) = row.get::<Option<String>, _>(2) {
+            entry.tags.push(tag);
+        }
     }
 
     Ok(map)
@@ -848,6 +854,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use image::ImageBuffer;
+    use rand::{rngs::StdRng, SeedableRng};
     use tempfile::TempDir;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
@@ -859,6 +867,7 @@ mod test {
         assert_eq!(TagExpression::Tag("foo".into()), parse_te("foo")?);
         assert_eq!(TagExpression::Tag("foo".into()), parse_te("(foo)")?);
         assert_eq!(TagExpression::Tag("foo".into()), parse_te(r#""foo""#)?);
+        assert_eq!(TagExpression::Tag("(foo)".into()), parse_te(r#""(foo)""#)?);
         assert_eq!(TagExpression::Tag("foo bar".into()), parse_te(r#""foo bar""#)?);
         assert_eq!(TagExpression::Tag("foo  bar".into()), parse_te(r#""foo  bar""#)?);
         assert_eq!(
@@ -943,16 +952,13 @@ mod test {
         let conn = Arc::new(AsyncMutex::new(conn));
 
         let tmp_dir = TempDir::new()?;
+        let image_directory = tmp_dir.path().to_str().ok_or_else(|| anyhow!("invalid UTF-8"))?;
 
         let routes = routes(
             &conn,
             &Arc::new(Options {
                 address: "0.0.0.0:0".parse()?,
-                image_directory: tmp_dir
-                    .path()
-                    .to_str()
-                    .ok_or_else(|| anyhow!("invalid UTF-8"))?
-                    .to_owned(),
+                image_directory: image_directory.to_owned(),
                 state_file: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 public_directory: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 cert_file: None,
@@ -1020,7 +1026,55 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?.is_empty());
 
-        // todo: add images to directory, run scan, and test more scenarios
+        let image_count = 10;
+        let image_width = 320;
+        let image_height = 240;
+        let mut random = StdRng::seed_from_u64(42);
+
+        for number in 1..=image_count {
+            let mut path = tmp_dir.path().to_owned();
+            path.push(format!("{}.jpg", number));
+
+            task::block_in_place(|| {
+                ImageBuffer::from_pixel(
+                    image_width,
+                    image_height,
+                    image::Rgb([random.gen::<u8>(), random.gen(), random.gen()]),
+                )
+                .save(&path)?;
+
+                let metadata = Metadata::new_from_path(&path)?;
+                metadata.set_tag_string(
+                    "Exif.Image.DateTimeOriginal",
+                    &format!("2021:05:{:02} 00:00:00", number),
+                )?;
+                metadata.save_to_file(&path)?;
+
+                Ok::<_, Error>(())
+            })?;
+        }
+
+        sync(&conn, image_directory).await?;
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (1..=image_count)
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .collect::<Result<_>>()?
+        );
+
+        // todo: test more scenarios and features
 
         Ok(())
     }

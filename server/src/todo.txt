@@ -2,5 +2,7 @@ write tests
   use image crate to write fake images to temp dir and index it
   don't launch task to reindex - do it explicitly when needed
   test all endpoints and both patch types
+  test pagination
+  test complicated tag expressions
 work on front end
 video support

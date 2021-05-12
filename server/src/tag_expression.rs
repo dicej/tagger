@@ -7,11 +7,29 @@ pub enum TagExpression {
 
 impl TagExpression {
     pub fn to_sql_string(&self) -> String {
-        match self {
-            TagExpression::Or(a, b) => format!("({} OR {})", a.to_sql_string(), b.to_sql_string()),
-            TagExpression::And(a, b) => format!("({} AND {})", a.to_sql_string(), b.to_sql_string()),
-            TagExpression::Tag(s) => s.to_owned(),
+        fn append(buffer: &mut String, expression: &TagExpression) {
+            match expression {
+                TagExpression::Or(a, b) => {
+                    buffer.push('(');
+                    append(buffer, a);
+                    buffer.push_str(" OR ");
+                    append(buffer, b);
+                    buffer.push(')');
+                }
+                TagExpression::And(a, b) => {
+                    buffer.push('(');
+                    append(buffer, a);
+                    buffer.push_str(" AND ");
+                    append(buffer, b);
+                    buffer.push(')');
+                }
+                TagExpression::Tag(_) => buffer.push('?'),
+            }
         }
+
+        let mut buffer = String::new();
+        append(&mut buffer, self);
+        buffer
     }
 
     pub fn fold_tags<'a, T>(&'a self, value: T, fold: impl Fn(T, &'a str) -> T + Copy) -> T {
