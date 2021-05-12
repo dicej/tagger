@@ -1,0 +1,23 @@
+use crate::tag_expression::TagExpression;
+
+grammar;
+
+pub TagExpression = {
+    <a:TagExpression> "or" <b:And> => Box::new(TagExpression::Or(a, b)),
+    And
+}
+
+And = {
+    <a:And> "and" <b:Term> => Box::new(TagExpression::And(a, b)),
+    Term
+}
+
+Term: Box<TagExpression> = {
+    Tag => Box::new(TagExpression::Tag(<>.to_owned())),
+    "(" <s:TagExpression> ")" => s
+}
+
+Tag = {
+    r"\w+",
+    r#""[^"]*""# => <>.trim_matches('"')
+}

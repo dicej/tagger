@@ -14,10 +14,12 @@ use http::{
 use hyper::Body;
 use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
 use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use lalrpop_util::lalrpop_mod;
 use lazy_static::lazy_static;
 use rand::Rng;
 use regex::Regex;
 use rexiv2::Metadata;
+use serde::Deserializer;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -25,7 +27,6 @@ use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, Row, Sqlite
 use std::{
     collections::HashMap,
     convert::Infallible,
-    iter,
     net::SocketAddrV4,
     num::NonZeroU32,
     ops::DerefMut,
@@ -37,6 +38,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
+use tag_expression::TagExpression;
 use tokio::{
     fs::{self, File},
     io::AsyncReadExt,
@@ -47,7 +49,13 @@ use tracing::{error, info, warn};
 use warp::{Filter, Rejection, Reply};
 use warp_util::HttpError;
 
+mod tag_expression;
 mod warp_util;
+
+lalrpop_mod!(
+    #[allow(clippy::all)]
+    tag_expression_grammar
+);
 
 const SMALL_BOUNDS: (u32, u32) = (320, 240);
 
@@ -254,11 +262,33 @@ async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()
     Ok(())
 }
 
+impl FromStr for TagExpression {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        tag_expression_grammar::TagExpressionParser::new()
+            .parse(s)
+            .map(|tags| *tags)
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TagExpression {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct StateQuery {
     start: Option<DateTime<Utc>>,
     limit: Option<i32>,
-    tag: Vec<String>,
+    tags: Option<TagExpression>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -273,22 +303,16 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
          FROM images AS i
          LEFT JOIN tags AS t ON i.hash = t.hash
          WHERE 1{}{}{}
-         SORT BY i.datetime",
+         ORDER BY i.datetime",
         if query.start.is_some() {
             " AND i.datetime > ?"
         } else {
             ""
         },
-        if query.tag.is_empty() {
-            String::new()
+        if let Some(tags) = &query.tags {
+            format!(" AND {}", tags.to_sql_string())
         } else {
-            format!(
-                " AND ({})",
-                iter::repeat("t.tag = ?")
-                    .take(query.tag.len())
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-            )
+            String::new()
         },
         if query.limit.is_some() { " LIMIT ?" } else { "" }
     );
@@ -299,12 +323,12 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
         select = select.bind(start.naive_utc().to_string());
     }
 
-    for tag in &query.tag {
-        select = select.bind(tag);
+    if let Some(tags) = &query.tags {
+        select = tags.fold_tags(select, |select, tag| select.bind(tag));
     }
 
     if let Some(limit) = &query.limit {
-        select = select.bind(limit);
+        select = select.bind(limit + 1);
     }
 
     let mut map = HashMap::new();
@@ -826,8 +850,78 @@ mod test {
     use super::*;
     use tempfile::TempDir;
 
+    fn parse_te(s: &str) -> Result<TagExpression> {
+        TagExpression::from_str(s).map_err(|e| anyhow!("{:?}", e))
+    }
+
+    #[test]
+    fn tags() -> Result<()> {
+        assert_eq!(TagExpression::Tag("foo".into()), parse_te("foo")?);
+        assert_eq!(TagExpression::Tag("foo".into()), parse_te("(foo)")?);
+        assert_eq!(TagExpression::Tag("foo bar".into()), parse_te(r#""foo bar""#)?);
+        assert_eq!(TagExpression::Tag("foo  bar".into()), parse_te(r#""foo  bar""#)?);
+        assert_eq!(
+            TagExpression::And(
+                Box::new(TagExpression::Tag("foo".into())),
+                Box::new(TagExpression::Tag("bar".into()))
+            ),
+            parse_te("foo and bar")?
+        );
+        assert_eq!(
+            TagExpression::Or(
+                Box::new(TagExpression::Tag("foo".into())),
+                Box::new(TagExpression::Tag("bar".into()))
+            ),
+            parse_te("foo or bar")?
+        );
+        assert_eq!(
+            TagExpression::Or(
+                Box::new(TagExpression::Tag("foo".into())),
+                Box::new(TagExpression::And(
+                    Box::new(TagExpression::Tag("bar".into())),
+                    Box::new(TagExpression::Tag("baz".into()))
+                ))
+            ),
+            parse_te("foo or (bar and baz)")?
+        );
+        assert_eq!(
+            TagExpression::Or(
+                Box::new(TagExpression::Tag("foo".into())),
+                Box::new(TagExpression::And(
+                    Box::new(TagExpression::Tag("bar".into())),
+                    Box::new(TagExpression::Tag("baz".into()))
+                ))
+            ),
+            parse_te("foo or bar and baz")?
+        );
+        assert_eq!(
+            TagExpression::And(
+                Box::new(TagExpression::Or(
+                    Box::new(TagExpression::Tag("foo".into())),
+                    Box::new(TagExpression::Tag("bar".into()))
+                )),
+                Box::new(TagExpression::Tag("baz".into()))
+            ),
+            parse_te("(foo or bar) and baz")?
+        );
+        assert_eq!(
+            TagExpression::And(
+                Box::new(TagExpression::Or(
+                    Box::new(TagExpression::Tag("foo".into())),
+                    Box::new(TagExpression::Tag("bar".into()))
+                )),
+                Box::new(TagExpression::Tag("baz".into()))
+            ),
+            parse_te("((foo or bar) and baz)")?
+        );
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_works() -> Result<()> {
+        pretty_env_logger::init_timed();
+
         let mut conn = "sqlite::memory:".parse::<SqliteConnectOptions>()?.connect().await?;
 
         for statement in schema::DDL_STATEMENTS {
