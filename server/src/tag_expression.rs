@@ -23,7 +23,7 @@ impl TagExpression {
                     append(buffer, b);
                     buffer.push(')');
                 }
-                TagExpression::Tag(_) => buffer.push('?'),
+                TagExpression::Tag(_) => buffer.push_str("t.tag = ?"),
             }
         }
 

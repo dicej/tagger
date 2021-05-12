@@ -309,7 +309,7 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
         "SELECT i.hash, i.datetime, t.tag
          FROM images AS i
          LEFT JOIN tags AS t ON i.hash = t.hash
-         WHERE 1{}{}
+         WHERE 1{}
          ORDER BY i.datetime
          LIMIT ?",
         if query.start.is_some() {
@@ -733,7 +733,7 @@ fn routes(
                     .or(warp::fs::dir(options.public_directory.clone())),
             )
             .or(
-                warp::patch().and(warp::path("patch").and(auth).and(warp::body::json()).and_then({
+                warp::patch().and(warp::path("tags").and(auth).and(warp::body::json()).and_then({
                     let conn = conn.clone();
                     move |auth, patch: Patch| {
                         let patch = Arc::new(patch);
@@ -856,6 +856,7 @@ mod test {
     use super::*;
     use image::ImageBuffer;
     use rand::{rngs::StdRng, SeedableRng};
+    use std::iter;
     use tempfile::TempDir;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
@@ -1063,6 +1064,8 @@ mod test {
             .reply(&routes)
             .await;
 
+        let state_response = &response;
+
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
@@ -1082,6 +1085,7 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
         // Note that the server should give us three results back even though we said "limit=2" -- the third one
         // tells us there are more available and what to specify as the "start" if we want to retrieve them.
         assert_eq!(
@@ -1091,6 +1095,178 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=3)
                 .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .collect::<Result<_>>()?
+        );
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?start=2021-05-03T00:00:00Z&limit=2")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (3..=5)
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .collect::<Result<_>>()?
+        );
+
+        let patch = Patch {
+            hash: serde_json::from_slice::<HashMap<String, ImageState>>(state_response.body())?
+                .into_iter()
+                .find(|(_, state)| state.datetime == "2021-05-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+                .unwrap()
+                .0,
+            tag: "foo".into(),
+            action: Action::Add,
+        };
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (1..=image_count)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    if number == 3 { vec!["foo".into()] } else { Vec::new() }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=foo")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(3)
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, vec!["foo".into()])))
+                .collect::<Result<_>>()?
+        );
+
+        let patch = Patch {
+            hash: serde_json::from_slice::<HashMap<String, ImageState>>(state_response.body())?
+                .into_iter()
+                .find(|(_, state)| state.datetime == "2021-05-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+                .unwrap()
+                .0,
+            tag: "foo".into(),
+            action: Action::Add,
+        };
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let patch = Patch {
+            hash: serde_json::from_slice::<HashMap<String, ImageState>>(state_response.body())?
+                .into_iter()
+                .find(|(_, state)| state.datetime == "2021-05-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+                .unwrap()
+                .0,
+            tag: "bar".into(),
+            action: Action::Add,
+        };
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=foo")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (2..=3)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    if number == 3 {
+                        vec!["foo".into(), "bar".into()]
+                    } else {
+                        vec!["foo".into()]
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=foo and bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(3)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    vec!["foo".into(), "bar".into()]
+                )))
                 .collect::<Result<_>>()?
         );
 

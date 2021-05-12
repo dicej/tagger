@@ -1,8 +1,10 @@
+fix state query
+  duplicates for images with multiple tags
+  get all tags for each image when filtering by tag
 write tests
-  use image crate to write fake images to temp dir and index it
-  don't launch task to reindex - do it explicitly when needed
+  ensure all endpoints require auth except /token
   test all endpoints and both patch types
-  test pagination
   test complicated tag expressions
+  test full size, large, and small image downloads
 work on front end
 video support
