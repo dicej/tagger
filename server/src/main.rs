@@ -1074,6 +1074,26 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?limit=2")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // Note that the server should give us three results back even though we said "limit=2" -- the third one
+        // tells us there are more available and what to specify as the "start" if we want to retrieve them.
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (1..=3)
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .collect::<Result<_>>()?
+        );
+
         // todo: test more scenarios and features
 
         Ok(())
