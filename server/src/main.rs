@@ -858,6 +858,7 @@ mod test {
     fn tags() -> Result<()> {
         assert_eq!(TagExpression::Tag("foo".into()), parse_te("foo")?);
         assert_eq!(TagExpression::Tag("foo".into()), parse_te("(foo)")?);
+        assert_eq!(TagExpression::Tag("foo".into()), parse_te(r#""foo""#)?);
         assert_eq!(TagExpression::Tag("foo bar".into()), parse_te(r#""foo bar""#)?);
         assert_eq!(TagExpression::Tag("foo  bar".into()), parse_te(r#""foo  bar""#)?);
         assert_eq!(
