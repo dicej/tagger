@@ -1,7 +1,7 @@
 #![deny(warnings)]
 
 use anyhow::{anyhow, Error, Result};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use futures::{
     future::{self, BoxFuture, FutureExt, TryFutureExt},
     stream::TryStreamExt,
@@ -12,7 +12,7 @@ use http::{
     status::StatusCode,
 };
 use hyper::Body;
-use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
+use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat, Rgb};
 use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use lalrpop_util::lalrpop_mod;
 use lazy_static::lazy_static;
@@ -27,6 +27,7 @@ use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, Row, Sqlite
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    iter,
     net::SocketAddrV4,
     num::NonZeroU32,
     ops::DerefMut,
@@ -131,8 +132,7 @@ fn find_new<'a>(
                         path.push(name);
                         let stripped = path.strip_prefix(root)?.to_str().ok_or_else(|| anyhow!("bad utf8"))?;
 
-                        let found = sqlx::query("SELECT 1 FROM paths WHERE path = ?1")
-                            .bind(stripped)
+                        let found = sqlx::query!("SELECT 1 as foo FROM paths WHERE path = ?1", stripped)
                             .fetch_optional(conn.lock().await.deref_mut())
                             .await?
                             .is_some();
@@ -146,7 +146,7 @@ fn find_new<'a>(
                                 .ok()
                                 .and_then(|s| {
                                     DATE_TIME_PATTERN.captures(&s).map(|c| {
-                                        format!("{}-{}-{}T{}:{}:{}", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6])
+                                        format!("{}-{}-{}T{}:{}:{}Z", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6])
                                     })
                                 })
                             {
@@ -238,8 +238,7 @@ async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()
                             .execute(&mut *conn)
                             .await?;
 
-                        if sqlx::query("SELECT 1 FROM paths WHERE hash = ?1")
-                            .bind(&row.hash)
+                        if sqlx::query!("SELECT 1 as foo FROM paths WHERE hash = ?1", row.hash)
                             .fetch_optional(&mut *conn)
                             .await?
                             .is_none()
@@ -305,33 +304,54 @@ struct ImageState {
 async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMap<String, ImageState>> {
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
 
+    fn append(buffer: &mut String, expression: &TagExpression) {
+        match expression {
+            TagExpression::Tag(_) => buffer.push_str("EXISTS (SELECT * FROM tags WHERE hash = i.hash AND tag = ?)"),
+            TagExpression::And(a, b) => {
+                buffer.push('(');
+                append(buffer, a);
+                buffer.push_str(" AND ");
+                append(buffer, b);
+                buffer.push(')');
+            }
+            TagExpression::Or(a, b) => {
+                buffer.push('(');
+                append(buffer, a);
+                buffer.push_str(" OR ");
+                append(buffer, b);
+                buffer.push(')');
+            }
+        }
+    }
+
     let select = format!(
-        "SELECT i.hash, i.datetime, t.tag
-         FROM images AS i
-         LEFT JOIN tags AS t ON i.hash = t.hash
-         WHERE 1{}{}
-         ORDER BY i.datetime
+        "SELECT hash, datetime, (SELECT group_concat(tag) FROM tags WHERE hash = i.hash)
+         FROM images i
+         WHERE {}{}
+         ORDER BY datetime
          LIMIT ?",
+        if let Some(tags) = &query.tags {
+            let mut buffer = String::new();
+            append(&mut buffer, tags);
+            buffer
+        } else {
+            "1".into()
+        },
         if query.start.is_some() {
-            " AND i.datetime >= ?"
+            " AND datetime >= ?"
         } else {
             ""
-        },
-        if let Some(tags) = &query.tags {
-            format!(" AND {}", tags.to_sql_string())
-        } else {
-            String::new()
         }
     );
 
     let mut select = sqlx::query(&select);
 
-    if let Some(start) = &query.start {
-        select = select.bind(start.naive_utc().to_string());
-    }
-
     if let Some(tags) = &query.tags {
         select = tags.fold_tags(select, |select, tag| select.bind(tag));
+    }
+
+    if let Some(start) = &query.start {
+        select = select.bind(start.to_string());
     }
 
     select = select.bind(limit + 1);
@@ -341,16 +361,18 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
     let mut rows = select.fetch(conn);
 
     while let Some(row) = rows.try_next().await? {
-        let datetime = DateTime::<Utc>::from_utc(row.get::<&str, _>(1).parse::<NaiveDateTime>()?, Utc);
-
-        let entry = map.entry(row.get(0)).or_insert_with(|| ImageState {
-            datetime,
-            tags: HashSet::new(),
-        });
-
-        if let Some(tag) = row.get::<Option<String>, _>(2) {
-            entry.tags.insert(tag);
-        }
+        map.insert(
+            row.get(0),
+            ImageState {
+                datetime: row.get::<&str, _>(1).parse()?,
+                tags: row
+                    .get::<&str, _>(2)
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<HashSet<_>>(),
+            },
+        );
     }
 
     Ok(map)
@@ -542,12 +564,14 @@ async fn authenticate(
 
     let hash = hash_password(request.username.as_bytes(), request.password.as_bytes());
 
-    let found = sqlx::query("SELECT 1 FROM users WHERE name = ?1 AND password_hash = ?2")
-        .bind(&request.username)
-        .bind(&hash)
-        .fetch_optional(conn.lock().await.deref_mut())
-        .await?
-        .is_some();
+    let found = sqlx::query!(
+        "SELECT 1 as foo FROM users WHERE name = ?1 AND password_hash = ?2",
+        request.username,
+        hash
+    )
+    .fetch_optional(conn.lock().await.deref_mut())
+    .await?
+    .is_some();
 
     Ok(if found {
         let expiration = (SystemTime::now() + Duration::from_secs(TOKEN_EXPIRATION_SECS))
@@ -719,7 +743,7 @@ fn routes(
 
                                         Ok(response()
                                             .header(header::CONTENT_LENGTH, image.len())
-                                            .header(header::CONTENT_TYPE, "application/json")
+                                            .header(header::CONTENT_TYPE, "image/jpeg")
                                             .body(Body::from(image))?)
                                     }
                                 }
@@ -745,7 +769,7 @@ fn routes(
                             async move {
                                 apply(conn.lock().await.deref_mut(), &patch).await?;
 
-                                Ok(String::new())
+                                Ok(response().body(Body::empty()))
                             }
                         }
                         .map_err(move |e| {
@@ -857,7 +881,6 @@ mod test {
     use image::ImageBuffer;
     use maplit::hashset;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::iter;
     use tempfile::TempDir;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
@@ -868,10 +891,6 @@ mod test {
     fn tags() -> Result<()> {
         assert_eq!(TagExpression::Tag("foo".into()), parse_te("foo")?);
         assert_eq!(TagExpression::Tag("foo".into()), parse_te("(foo)")?);
-        assert_eq!(TagExpression::Tag("foo".into()), parse_te(r#""foo""#)?);
-        assert_eq!(TagExpression::Tag("(foo)".into()), parse_te(r#""(foo)""#)?);
-        assert_eq!(TagExpression::Tag("foo bar".into()), parse_te(r#""foo bar""#)?);
-        assert_eq!(TagExpression::Tag("foo  bar".into()), parse_te(r#""foo  bar""#)?);
         assert_eq!(
             TagExpression::And(
                 Box::new(TagExpression::Tag("foo".into())),
@@ -1050,7 +1069,7 @@ mod test {
         let image_height = 240;
         let mut random = StdRng::seed_from_u64(42);
         let colors = (1..=image_count)
-            .map(|number| (number, image::Rgb([random.gen::<u8>(), random.gen(), random.gen()])))
+            .map(|number| (number, Rgb([random.gen::<u8>(), random.gen(), random.gen()])))
             .collect::<HashMap<_, _>>();
 
         for (&number, &color) in &colors {
@@ -1335,7 +1354,7 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo and bar")
+            .path("/state?tags=foo%20and%20bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1358,7 +1377,7 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo or bar")
+            .path("/state?tags=foo%20or%20bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1432,7 +1451,7 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=bar and (foo or baz)")
+            .path("/state?tags=bar%20and%20%28foo%20or%20baz%29")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1459,7 +1478,7 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=bar and (foo or baz)&limit=0")
+            .path("/state?tags=bar%20and%20%28foo%20or%20baz%29&limit=0")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1478,11 +1497,11 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/state?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=0" should yield just the fourth image.
+        // GET "/state?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=1" should yield just the fourth image.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=0")
+            .path("/state?tags=foo%20or%20bar&start=2021-05-04T00:00:00Z&limit=0")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1537,11 +1556,7 @@ mod test {
             iter::once(4)
                 .map(|number| Ok((
                     format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    if number == 3 {
-                        hashset!["foo".into(), "bar".into()]
-                    } else {
-                        hashset!["bar".into()]
-                    }
+                    hashset!["bar".into(), "baz".into()]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1579,9 +1594,17 @@ mod test {
             Small,
             Large,
             Original,
-        };
+        }
 
-        for (&number, color) in &colors {
+        fn close_enough(a: Rgb<u8>, b: Rgb<u8>) -> bool {
+            const EPSILON: i32 = 5;
+
+            a.0.iter()
+                .zip(b.0.iter())
+                .all(|(&a, &b)| ((a as i32) - (b as i32)).abs() < EPSILON)
+        }
+
+        for (&number, &color) in &colors {
             for size in &[Size::Small, Size::Large, Size::Original] {
                 let response = warp::test::request()
                     .method("GET")
@@ -1602,7 +1625,7 @@ mod test {
 
                 assert_eq!(response.status(), StatusCode::OK);
 
-                let image = image::load_from_memory(response.body())?.to_rgb8();
+                let image = image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)?.to_rgb8();
 
                 assert_eq!(
                     (image.width(), image.height()),
@@ -1613,10 +1636,11 @@ mod test {
                     }
                 );
 
-                for y in 0..image.height() {
-                    for x in 0..image.width() {
-                        assert_eq!(image.get_pixel(x, y), color);
-                    }
+                for _ in 0..10 {
+                    assert!(close_enough(
+                        *image.get_pixel(random.gen_range(0..image.width()), random.gen_range(0..image.height())),
+                        color
+                    ));
                 }
             }
         }

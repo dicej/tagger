@@ -18,6 +18,5 @@ Term: Box<TagExpression> = {
 }
 
 Tag = {
-    r"\w+",
-    r#""[^"]*""# => <>.trim_matches('"')
+    r"\w+"
 }

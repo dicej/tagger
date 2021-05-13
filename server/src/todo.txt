@@ -1,6 +1,6 @@
-fix state query
-  duplicates for images with multiple tags
-  get all tags for each image when filtering by tag
 work on front end
+per-user tag permissions and roles
+  restrict access to /state, /tags, and /image based on permissions
+  possibly including a "public" tag which requires no authentication
 video support
 support query subscriptions on the server?
