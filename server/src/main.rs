@@ -25,7 +25,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, Row, SqliteConnection};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     net::SocketAddrV4,
     num::NonZeroU32,
@@ -299,7 +299,7 @@ struct StateQuery {
 #[derive(Serialize, Deserialize, Debug)]
 struct ImageState {
     datetime: DateTime<Utc>,
-    tags: Vec<String>,
+    tags: HashSet<String>,
 }
 
 async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMap<String, ImageState>> {
@@ -309,7 +309,7 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
         "SELECT i.hash, i.datetime, t.tag
          FROM images AS i
          LEFT JOIN tags AS t ON i.hash = t.hash
-         WHERE 1{}
+         WHERE 1{}{}
          ORDER BY i.datetime
          LIMIT ?",
         if query.start.is_some() {
@@ -345,11 +345,11 @@ async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMa
 
         let entry = map.entry(row.get(0)).or_insert_with(|| ImageState {
             datetime,
-            tags: Vec::new(),
+            tags: HashSet::new(),
         });
 
         if let Some(tag) = row.get::<Option<String>, _>(2) {
-            entry.tags.push(tag);
+            entry.tags.insert(tag);
         }
     }
 
@@ -855,6 +855,7 @@ async fn main() -> Result<()> {
 mod test {
     use super::*;
     use image::ImageBuffer;
+    use maplit::hashset;
     use rand::{rngs::StdRng, SeedableRng};
     use std::iter;
     use tempfile::TempDir;
@@ -968,6 +969,8 @@ mod test {
             Duration::from_secs(0),
         );
 
+        // Invalid user and password should yield `UNAUTHORIZED` from /token.
+
         let response = warp::test::request()
             .method("POST")
             .path("/token")
@@ -978,6 +981,8 @@ mod test {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         serde_json::from_slice::<TokenError>(response.body())?;
+
+        // Valid user and invalid password should yield `UNAUTHORIZED` from /token.
 
         let response = warp::test::request()
             .method("POST")
@@ -993,6 +998,8 @@ mod test {
 
         serde_json::from_slice::<TokenError>(response.body())?;
 
+        // Valid user and password should yield `OK` from /token.
+
         let response = warp::test::request()
             .method("POST")
             .path("/token")
@@ -1004,9 +1011,13 @@ mod test {
 
         let token = serde_json::from_slice::<TokenSuccess>(response.body())?.access_token;
 
+        // Missing authorization header should yield `UNAUTHORIZED` from /state.
+
         let response = warp::test::request().method("GET").path("/state").reply(&routes).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Invalid token should yield `UNAUTHORIZED` from /state.
 
         let response = warp::test::request()
             .method("GET")
@@ -1017,6 +1028,8 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        // Valid token should yield `OK` from /state.
+
         let response = warp::test::request()
             .method("GET")
             .path("/state")
@@ -1025,24 +1038,27 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        // The response from /state should be empty at this point since we haven't added any images yet.
+
         assert!(serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?.is_empty());
 
-        let image_count = 10;
+        // Let's add some images to `tmp_dir` and call `sync` to add them to the database.
+
+        let image_count = 10_usize;
         let image_width = 320;
         let image_height = 240;
         let mut random = StdRng::seed_from_u64(42);
+        let colors = (1..=image_count)
+            .map(|number| (number, image::Rgb([random.gen::<u8>(), random.gen(), random.gen()])))
+            .collect::<HashMap<_, _>>();
 
-        for number in 1..=image_count {
+        for (&number, &color) in &colors {
             let mut path = tmp_dir.path().to_owned();
             path.push(format!("{}.jpg", number));
 
             task::block_in_place(|| {
-                ImageBuffer::from_pixel(
-                    image_width,
-                    image_height,
-                    image::Rgb([random.gen::<u8>(), random.gen(), random.gen()]),
-                )
-                .save(&path)?;
+                ImageBuffer::from_pixel(image_width, image_height, color).save(&path)?;
 
                 let metadata = Metadata::new_from_path(&path)?;
                 metadata.set_tag_string(
@@ -1064,18 +1080,26 @@ mod test {
             .reply(&routes)
             .await;
 
-        let state_response = &response;
-
         assert_eq!(response.status(), StatusCode::OK);
+
+        // A GET /state with no query parameters should give us all the images.
+
         assert_eq!(
             serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=image_count)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
                 .collect::<Result<_>>()?
         );
+
+        let hashes = serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            .into_iter()
+            .map(|(hash, state)| (state.datetime, hash))
+            .collect::<HashMap<_, _>>();
+
+        // A GET /state with a "limit" parameter should give us the earliest images.
 
         let response = warp::test::request()
             .method("GET")
@@ -1088,15 +1112,18 @@ mod test {
 
         // Note that the server should give us three results back even though we said "limit=2" -- the third one
         // tells us there are more available and what to specify as the "start" if we want to retrieve them.
+
         assert_eq!(
             serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=3)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
                 .collect::<Result<_>>()?
         );
+
+        // A GET /state with "start" and "limit" parameters should give us images from the specified interval.
 
         let response = warp::test::request()
             .method("GET")
@@ -1112,19 +1139,19 @@ mod test {
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             (3..=5)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, Vec::new())))
+                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
                 .collect::<Result<_>>()?
         );
 
+        // Let's add the "foo" tag to the third image.
+
         let patch = Patch {
-            hash: serde_json::from_slice::<HashMap<String, ImageState>>(state_response.body())?
-                .into_iter()
-                .find(|(_, state)| state.datetime == "2021-05-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
-                .unwrap()
-                .0,
+            hash: hashes.get(&"2021-05-03T00:00:00Z".parse()?).unwrap().clone(),
             tag: "foo".into(),
             action: Action::Add,
         };
+
+        // A PATCH /tags with no authorization header should yield `UNAUTHORIZED`
 
         let response = warp::test::request()
             .method("PATCH")
@@ -1135,6 +1162,20 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        // A PATCH /tags with an invalid authorization header should yield `UNAUTHORIZED`
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", "Bearer invalid")
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A PATCH /tags with a valid authorization header should yield `OK`
+
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
@@ -1144,6 +1185,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Now GET /state should report the tag we added via the above patch.
 
         let response = warp::test::request()
             .method("GET")
@@ -1161,10 +1204,16 @@ mod test {
             (1..=image_count)
                 .map(|number| Ok((
                     format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    if number == 3 { vec!["foo".into()] } else { Vec::new() }
+                    if number == 3 {
+                        hashset!["foo".into()]
+                    } else {
+                        HashSet::new()
+                    }
                 )))
                 .collect::<Result<_>>()?
         );
+
+        // GET /state with a "tags" parameter should yield only the image(s) matching that expression.
 
         let response = warp::test::request()
             .method("GET")
@@ -1180,16 +1229,17 @@ mod test {
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, vec!["foo".into()])))
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    hashset!["foo".into()]
+                )))
                 .collect::<Result<_>>()?
         );
 
+        // Let's add the "foo" tag to the second image.
+
         let patch = Patch {
-            hash: serde_json::from_slice::<HashMap<String, ImageState>>(state_response.body())?
-                .into_iter()
-                .find(|(_, state)| state.datetime == "2021-05-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
-                .unwrap()
-                .0,
+            hash: hashes.get(&"2021-05-02T00:00:00Z".parse()?).unwrap().clone(),
             tag: "foo".into(),
             action: Action::Add,
         };
@@ -1204,25 +1254,30 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let patch = Patch {
-            hash: serde_json::from_slice::<HashMap<String, ImageState>>(state_response.body())?
-                .into_iter()
-                .find(|(_, state)| state.datetime == "2021-05-03T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
-                .unwrap()
-                .0,
-            tag: "bar".into(),
-            action: Action::Add,
-        };
+        // Let's add the "bar" tag to the third and fourth images.
 
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(&patch)
-            .reply(&routes)
-            .await;
+        for number in 3..=4 {
+            let patch = Patch {
+                hash: hashes
+                    .get(&format!("2021-05-{:02}T00:00:00Z", number).parse()?)
+                    .unwrap()
+                    .clone(),
+                tag: "bar".into(),
+                action: Action::Add,
+            };
 
-        assert_eq!(response.status(), StatusCode::OK);
+            let response = warp::test::request()
+                .method("PATCH")
+                .path("/tags")
+                .header("authorization", format!("Bearer {}", token))
+                .json(&patch)
+                .reply(&routes)
+                .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // GET /state?tags=foo should yield all images with that tag.
 
         let response = warp::test::request()
             .method("GET")
@@ -1241,13 +1296,42 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-05-{:02}T00:00:00Z", number).parse()?,
                     if number == 3 {
-                        vec!["foo".into(), "bar".into()]
+                        hashset!["foo".into(), "bar".into()]
                     } else {
-                        vec!["foo".into()]
+                        hashset!["foo".into()]
                     }
                 )))
                 .collect::<Result<_>>()?
         );
+
+        // GET /state?tags=bar should yield all images with that tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (3..=4)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    if number == 3 {
+                        hashset!["foo".into(), "bar".into()]
+                    } else {
+                        hashset!["bar".into()]
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // GET "/state?tags=foo and bar" should yield only the image that has both tags.
 
         let response = warp::test::request()
             .method("GET")
@@ -1265,12 +1349,277 @@ mod test {
             iter::once(3)
                 .map(|number| Ok((
                     format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    vec!["foo".into(), "bar".into()]
+                    hashset!["foo".into(), "bar".into()]
                 )))
                 .collect::<Result<_>>()?
         );
 
-        // todo: test more scenarios and features
+        // GET "/state?tags=foo or bar" should yield the images with either tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=foo or bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (2..=4)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    match number {
+                        4 => hashset!["bar".into()],
+                        3 => hashset!["foo".into(), "bar".into()],
+                        2 => hashset!["foo".into()],
+                        _ => unreachable!(),
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // A GET /state with a "limit" parameter should still give us the same earliest images we asked for
+        // earlier, including the tags we've added.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?limit=2")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (1..=3)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    match number {
+                        3 => hashset!["foo".into(), "bar".into()],
+                        2 => hashset!["foo".into()],
+                        _ => HashSet::new(),
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // Let's add the "baz" tag to the fourth image.
+
+        let patch = Patch {
+            hash: hashes.get(&"2021-05-04T00:00:00Z".parse()?).unwrap().clone(),
+            tag: "baz".into(),
+            action: Action::Add,
+        };
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // GET "/state?tags=bar and (foo or baz)" should yield the images which match that expression.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=bar and (foo or baz)")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (3..=4)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    match number {
+                        4 => hashset!["bar".into(), "baz".into()],
+                        3 => hashset!["foo".into(), "bar".into()],
+                        _ => unreachable!(),
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // GET "/state?tags=bar and (foo or baz)&limit=0" should yield just the third image.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=bar and (foo or baz)&limit=0")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(3)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    hashset!["foo".into(), "bar".into()]
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // GET "/state?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=0" should yield just the fourth image.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=0")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(4)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    hashset!["bar".into(), "baz".into()]
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // Let's remove the "bar" tag from the third image.
+
+        let patch = Patch {
+            hash: hashes.get(&"2021-05-03T00:00:00Z".parse()?).unwrap().clone(),
+            tag: "bar".into(),
+            action: Action::Remove,
+        };
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // GET /state?tags=bar should yield just the fourth image now.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/state?tags=bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(4)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    if number == 3 {
+                        hashset!["foo".into(), "bar".into()]
+                    } else {
+                        hashset!["bar".into()]
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // A GET /image/<hash> with no authorization header should yield `UNAUTHORIZED`
+
+        let response = warp::test::request()
+            .method("GET")
+            .path(&format!(
+                "/image/{}",
+                hashes.get(&"2021-05-02T00:00:00Z".parse()?).unwrap()
+            ))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A GET /image/<hash> with an invalid authorization header should yield `UNAUTHORIZED`
+
+        let response = warp::test::request()
+            .method("GET")
+            .header("authorization", "Bearer invalid")
+            .path(&format!(
+                "/image/{}",
+                hashes.get(&"2021-05-02T00:00:00Z".parse()?).unwrap()
+            ))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The images and thumbnails should contain the colors we specified above
+
+        enum Size {
+            Small,
+            Large,
+            Original,
+        };
+
+        for (&number, color) in &colors {
+            for size in &[Size::Small, Size::Large, Size::Original] {
+                let response = warp::test::request()
+                    .method("GET")
+                    .header("authorization", format!("Bearer {}", token))
+                    .path(&format!(
+                        "/image/{}{}",
+                        hashes
+                            .get(&format!("2021-05-{:02}T00:00:00Z", number).parse()?)
+                            .unwrap(),
+                        match size {
+                            Size::Small => "?size=small",
+                            Size::Large => "?size=large",
+                            Size::Original => "",
+                        }
+                    ))
+                    .reply(&routes)
+                    .await;
+
+                assert_eq!(response.status(), StatusCode::OK);
+
+                let image = image::load_from_memory(response.body())?.to_rgb8();
+
+                assert_eq!(
+                    (image.width(), image.height()),
+                    match size {
+                        Size::Small => SMALL_BOUNDS,
+                        Size::Large => LARGE_BOUNDS,
+                        Size::Original => (image_width, image_height),
+                    }
+                );
+
+                for y in 0..image.height() {
+                    for x in 0..image.width() {
+                        assert_eq!(image.get_pixel(x, y), color);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

@@ -36,6 +36,7 @@ lalrpop-util = "0.19"
 
 [dev-dependencies]
 tempfile = "3"
+maplit = "1"
 
 [build-dependencies]
 anyhow = "1"
