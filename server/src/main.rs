@@ -12,7 +12,7 @@ use http::{
     status::StatusCode,
 };
 use hyper::Body;
-use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat, Rgb};
+use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
 use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use lalrpop_util::lalrpop_mod;
 use lazy_static::lazy_static;
@@ -23,11 +23,15 @@ use serde::Deserializer;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection, Row, SqliteConnection};
+use sqlx::{
+    query::Query,
+    sqlite::{SqliteArguments, SqliteConnectOptions},
+    ConnectOptions, Connection, Row, Sqlite, SqliteConnection,
+};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    iter,
+    fmt::Write,
     net::SocketAddrV4,
     num::NonZeroU32,
     ops::DerefMut,
@@ -289,93 +293,136 @@ impl<'de> serde::Deserialize<'de> for TagExpression {
 }
 
 #[derive(Deserialize, Debug)]
-struct StateQuery {
+struct ImagesQuery {
     start: Option<DateTime<Utc>>,
     limit: Option<u32>,
     tags: Option<TagExpression>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct ImageState {
+struct ImageData {
     datetime: DateTime<Utc>,
     tags: HashSet<String>,
 }
 
-async fn state(conn: &mut SqliteConnection, query: &StateQuery) -> Result<HashMap<String, ImageState>> {
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+#[derive(Serialize, Deserialize, Debug)]
+struct ImagesResponse {
+    start: u32,
+    total: u32,
+    images: HashMap<String, ImageData>,
+}
 
-    fn append(buffer: &mut String, expression: &TagExpression) {
-        match expression {
-            TagExpression::Tag(_) => buffer.push_str("EXISTS (SELECT * FROM tags WHERE hash = i.hash AND tag = ?)"),
-            TagExpression::And(a, b) => {
-                buffer.push('(');
-                append(buffer, a);
-                buffer.push_str(" AND ");
-                append(buffer, b);
-                buffer.push(')');
-            }
-            TagExpression::Or(a, b) => {
-                buffer.push('(');
-                append(buffer, a);
-                buffer.push_str(" OR ");
-                append(buffer, b);
-                buffer.push(')');
-            }
+fn append_images_clause(buffer: &mut String, expression: &TagExpression) {
+    match expression {
+        TagExpression::Tag(_) => buffer.push_str("EXISTS (SELECT * FROM tags WHERE hash = i.hash AND tag = ?)"),
+        TagExpression::And(a, b) => {
+            buffer.push('(');
+            append_images_clause(buffer, a);
+            buffer.push_str(" AND ");
+            append_images_clause(buffer, b);
+            buffer.push(')');
+        }
+        TagExpression::Or(a, b) => {
+            buffer.push('(');
+            append_images_clause(buffer, a);
+            buffer.push_str(" OR ");
+            append_images_clause(buffer, b);
+            buffer.push(')');
         }
     }
+}
 
-    let select = format!(
-        "SELECT hash, datetime, (SELECT group_concat(tag) FROM tags WHERE hash = i.hash)
-         FROM images i
-         WHERE {}{}
-         ORDER BY datetime
-         LIMIT ?",
+fn build_images_query<'a>(
+    buffer: &'a mut String,
+    count: bool,
+    query: &ImagesQuery,
+    limit: u32,
+) -> Query<'a, Sqlite, SqliteArguments<'a>> {
+    write!(
+        buffer,
+        "SELECT {} FROM images i WHERE {}{}{}",
+        if count {
+            if query.start.is_some() {
+                "sum(CASE WHEN datetime >= ? THEN 1 ELSE 0 END), count(*)"
+            } else {
+                "0, count(*)"
+            }
+        } else {
+            "hash, datetime, (SELECT group_concat(tag) FROM tags WHERE hash = i.hash)"
+        },
         if let Some(tags) = &query.tags {
             let mut buffer = String::new();
-            append(&mut buffer, tags);
+            append_images_clause(&mut buffer, tags);
             buffer
         } else {
             "1".into()
         },
-        if query.start.is_some() {
-            " AND datetime >= ?"
+        if query.start.is_some() && !count {
+            " AND datetime < ?"
         } else {
             ""
-        }
-    );
+        },
+        if count { "" } else { " ORDER BY datetime DESC LIMIT ?" }
+    )
+    .unwrap();
 
-    let mut select = sqlx::query(&select);
+    let mut select = sqlx::query(buffer);
+
+    if count {
+        if let Some(start) = &query.start {
+            select = select.bind(start.to_string());
+        }
+    }
 
     if let Some(tags) = &query.tags {
-        select = tags.fold_tags(select, |select, tag| select.bind(tag));
+        select = tags.fold_tags(select, |select, tag| select.bind(tag.to_owned()));
     }
 
-    if let Some(start) = &query.start {
-        select = select.bind(start.to_string());
+    if count {
+        select
+    } else {
+        if let Some(start) = &query.start {
+            select = select.bind(start.to_string());
+        }
+        select.bind(limit)
+    }
+}
+
+async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<ImagesResponse> {
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+
+    let mut images = HashMap::new();
+
+    {
+        let mut buffer = String::new();
+        let mut rows = build_images_query(&mut buffer, false, query, limit).fetch(&mut *conn);
+
+        while let Some(row) = rows.try_next().await? {
+            images.insert(
+                row.get(0),
+                ImageData {
+                    datetime: row.get::<&str, _>(1).parse()?,
+                    tags: row
+                        .get::<&str, _>(2)
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect::<HashSet<_>>(),
+                },
+            );
+        }
     }
 
-    select = select.bind(limit + 1);
+    let (start, total) = {
+        let mut buffer = String::new();
+        let row = build_images_query(&mut buffer, true, query, limit)
+            .fetch_one(conn)
+            .await?;
 
-    let mut map = HashMap::new();
+        (row.get::<u32, _>(0), row.get::<u32, _>(1))
+    };
 
-    let mut rows = select.fetch(conn);
-
-    while let Some(row) = rows.try_next().await? {
-        map.insert(
-            row.get(0),
-            ImageState {
-                datetime: row.get::<&str, _>(1).parse()?,
-                tags: row
-                    .get::<&str, _>(2)
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect::<HashSet<_>>(),
-            },
-        );
-    }
-
-    Ok(map)
+    Ok(ImagesResponse { start, total, images })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -699,9 +746,9 @@ fn routes(
         })
         .or(warp::get()
             .and(
-                warp::path("state")
+                warp::path("images")
                     .and(auth)
-                    .and(warp::query::<StateQuery>())
+                    .and(warp::query::<ImagesQuery>())
                     .and_then({
                         let conn = conn.clone();
 
@@ -709,7 +756,7 @@ fn routes(
                             let conn = conn.clone();
 
                             async move {
-                                let state = serde_json::to_vec(&state(conn.lock().await.deref_mut(), &query).await?)?;
+                                let state = serde_json::to_vec(&images(conn.lock().await.deref_mut(), &query).await?)?;
 
                                 Ok(response()
                                     .header(header::CONTENT_LENGTH, state.len())
@@ -878,9 +925,10 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use image::ImageBuffer;
+    use image::{ImageBuffer, Rgb};
     use maplit::hashset;
     use rand::{rngs::StdRng, SeedableRng};
+    use std::iter;
     use tempfile::TempDir;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
@@ -1030,41 +1078,45 @@ mod test {
 
         let token = serde_json::from_slice::<TokenSuccess>(response.body())?.access_token;
 
-        // Missing authorization header should yield `UNAUTHORIZED` from /state.
+        // Missing authorization header should yield `UNAUTHORIZED` from /images.
 
-        let response = warp::test::request().method("GET").path("/state").reply(&routes).await;
+        let response = warp::test::request().method("GET").path("/images").reply(&routes).await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // Invalid token should yield `UNAUTHORIZED` from /state.
+        // Invalid token should yield `UNAUTHORIZED` from /images.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state")
+            .path("/images")
             .header("authorization", "Bearer invalid")
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // Valid token should yield `OK` from /state.
+        // Valid token should yield `OK` from /images.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state")
+            .path("/images")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // The response from /state should be empty at this point since we haven't added any images yet.
+        // The response from /images should be empty at this point since we haven't added any images yet.
 
-        assert!(serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?.is_empty());
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 0);
+        assert!(response.images.is_empty());
 
         // Let's add some images to `tmp_dir` and call `sync` to add them to the database.
 
-        let image_count = 10_usize;
+        let image_count = 10_u32;
         let image_width = 320;
         let image_height = 240;
         let mut random = StdRng::seed_from_u64(42);
@@ -1094,17 +1146,29 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state")
+            .path("/images")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // A GET /state with no query parameters should give us all the images.
+        // A GET /images with no query parameters should give us all the images.
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, image_count);
+
+        let hashes = response
+            .images
+            .iter()
+            .map(|(hash, state)| (state.datetime, hash.clone()))
+            .collect::<HashMap<_, _>>();
 
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1113,51 +1177,54 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        let hashes = serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
-            .into_iter()
-            .map(|(hash, state)| (state.datetime, hash))
-            .collect::<HashMap<_, _>>();
-
-        // A GET /state with a "limit" parameter should give us the earliest images.
+        // A GET /images with a "limit" parameter should give us the most recent images.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?limit=2")
+            .path("/images?limit=2")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Note that the server should give us three results back even though we said "limit=2" -- the third one
-        // tells us there are more available and what to specify as the "start" if we want to retrieve them.
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, image_count);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=3)
+            ((image_count - 1)..=image_count)
                 .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
                 .collect::<Result<_>>()?
         );
 
-        // A GET /state with "start" and "limit" parameters should give us images from the specified interval.
+        // A GET /images with "start" and "limit" parameters should give us images from the specified interval.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?start=2021-05-03T00:00:00Z&limit=2")
+            .path("/images?start=2021-05-04T00:00:00Z&limit=2")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 7);
+        assert_eq!(response.total, image_count);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
-            (3..=5)
+            (2..=3)
                 .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
                 .collect::<Result<_>>()?
         );
@@ -1205,18 +1272,24 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Now GET /state should report the tag we added via the above patch.
+        // Now GET /images should report the tag we added via the above patch.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state")
+            .path("/images")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, image_count);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1232,18 +1305,24 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /state with a "tags" parameter should yield only the image(s) matching that expression.
+        // GET /images with a "tags" parameter should yield only the image(s) matching that expression.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo")
+            .path("/images?tags=foo")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 1);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1296,18 +1375,24 @@ mod test {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        // GET /state?tags=foo should yield all images with that tag.
+        // GET /images?tags=foo should yield all images with that tag.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo")
+            .path("/images?tags=foo")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 2);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1323,18 +1408,24 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /state?tags=bar should yield all images with that tag.
+        // GET /images?tags=bar should yield all images with that tag.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=bar")
+            .path("/images?tags=bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 2);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1350,18 +1441,24 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/state?tags=foo and bar" should yield only the image that has both tags.
+        // GET "/images?tags=foo and bar" should yield only the image that has both tags.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo%20and%20bar")
+            .path("/images?tags=foo%20and%20bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 1);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1373,18 +1470,24 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/state?tags=foo or bar" should yield the images with either tag.
+        // GET "/images?tags=foo or bar" should yield the images with either tag.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=foo%20or%20bar")
+            .path("/images?tags=foo%20or%20bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 3);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1401,26 +1504,33 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // A GET /state with a "limit" parameter should still give us the same earliest images we asked for
-        // earlier, including the tags we've added.
+        // A GET /images with a "limit" parameter should still give us the same most recent images, including the
+        // tags we've added.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?limit=2")
+            .path(&format!("/images?limit={}", image_count - 1))
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, image_count);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=3)
+            (2..=image_count)
                 .map(|number| Ok((
                     format!("2021-05-{:02}T00:00:00Z", number).parse()?,
                     match number {
+                        4 => hashset!["bar".into()],
                         3 => hashset!["foo".into(), "bar".into()],
                         2 => hashset!["foo".into()],
                         _ => HashSet::new(),
@@ -1447,18 +1557,24 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // GET "/state?tags=bar and (foo or baz)" should yield the images which match that expression.
+        // GET "/images?tags=bar and (foo or baz)" should yield the images which match that expression.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=bar%20and%20%28foo%20or%20baz%29")
+            .path("/images?tags=bar%20and%20%28foo%20or%20baz%29")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 2);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1474,41 +1590,24 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/state?tags=bar and (foo or baz)&limit=0" should yield just the third image.
+        // GET "/images?tags=bar and (foo or baz)&limit=1" should yield just the fourth image.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=bar%20and%20%28foo%20or%20baz%29&limit=0")
+            .path("/images?tags=bar%20and%20%28foo%20or%20baz%29&limit=1")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 2);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
-                .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
-                .collect::<HashMap<_, _>>(),
-            iter::once(3)
-                .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    hashset!["foo".into(), "bar".into()]
-                )))
-                .collect::<Result<_>>()?
-        );
-
-        // GET "/state?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=1" should yield just the fourth image.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/state?tags=foo%20or%20bar&start=2021-05-04T00:00:00Z&limit=0")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
@@ -1516,6 +1615,35 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-05-{:02}T00:00:00Z", number).parse()?,
                     hashset!["bar".into(), "baz".into()]
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // GET "/images?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=1" should yield just the third image.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?tags=foo%20or%20bar&start=2021-05-04T00:00:00Z&limit=1")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 1);
+        assert_eq!(response.total, 3);
+        assert_eq!(
+            response
+                .images
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(3)
+                .map(|number| Ok((
+                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    hashset!["foo".into(), "bar".into()]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1538,18 +1666,24 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // GET /state?tags=bar should yield just the fourth image now.
+        // GET /images?tags=bar should yield just the fourth image now.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/state?tags=bar")
+            .path("/images?tags=bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 1);
         assert_eq!(
-            serde_json::from_slice::<HashMap<String, ImageState>>(response.body())?
+            response
+                .images
                 .into_iter()
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),

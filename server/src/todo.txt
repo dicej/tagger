@@ -1,6 +1,11 @@
+add category table with name and parent columns; add optional category column to tags with foreign key to category table
+GET /tags
+  include number of images assigned to each tag
+  accept optional query to filter tags
+per-user tag permissions (read and write)
+  restrict access to /images, /tags, and /image based on permissions
+  include a "visibility:public" tag which makes image available with no authentication
+  built in year and month tags are should not be writeable by anyone, i.e. cannot be assigned or unassigned
 work on front end
-per-user tag permissions and roles
-  restrict access to /state, /tags, and /image based on permissions
-  possibly including a "public" tag which requires no authentication
 video support
 support query subscriptions on the server?
