@@ -13,10 +13,17 @@ And = {
 }
 
 Term: Box<TagExpression> = {
-    Tag => Box::new(TagExpression::Tag(<>.to_owned())),
+    <category:Name> ":" <tag:Name> => Box::new(TagExpression::Tag {
+      category: Some(category.to_owned()),
+      tag: tag.to_owned()
+    }),
+     <tag:Name> => Box::new(TagExpression::Tag {
+       category: None,
+       tag: tag.to_owned()
+    }),
     "(" <s:TagExpression> ")" => s
 }
 
-Tag = {
+Name = {
     r"\w+"
 }

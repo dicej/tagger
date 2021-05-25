@@ -1,7 +1,7 @@
 #![deny(warnings)]
 
 use anyhow::{anyhow, Error, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use futures::{
     future::{self, BoxFuture, FutureExt, TryFutureExt},
     stream::TryStreamExt,
@@ -114,7 +114,7 @@ fn hash(data: &[u8]) -> String {
 fn find_new<'a>(
     conn: &'a AsyncMutex<SqliteConnection>,
     root: &'a str,
-    result: &'a mut Vec<(String, String)>,
+    result: &'a mut Vec<(String, DateTime<Utc>)>,
     dir: impl AsRef<Path> + 'a + Send,
 ) -> BoxFuture<'a, Result<()>> {
     lazy_static! {
@@ -150,11 +150,11 @@ fn find_new<'a>(
                                 .ok()
                                 .and_then(|s| {
                                     DATE_TIME_PATTERN.captures(&s).map(|c| {
-                                        format!("{}-{}-{}T{}:{}:{}Z", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6])
+                                        format!("{}-{}-{}T{}:{}:{}Z", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]).parse()
                                     })
                                 })
                             {
-                                result.push((stripped.to_string(), datetime))
+                                result.push((stripped.to_string(), datetime?))
                             } else {
                                 warn!("unable to get metadata for {}", lowercase);
                             }
@@ -204,7 +204,7 @@ async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()
     for (path, datetime) in new {
         let hash = hash(&content([image_dir, &path].iter().collect::<PathBuf>()).await?);
 
-        info!("insert {} (hash {})", path, hash);
+        info!("insert {} (hash {}; datetime {})", path, hash, datetime);
 
         conn.lock()
             .await
@@ -214,10 +214,30 @@ async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()
                         .execute(&mut *conn)
                         .await?;
 
+                    let year = datetime.year();
+                    let month = datetime.month();
+                    let datetime = datetime.to_string();
+
                     sqlx::query!(
                         "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
                         hash,
                         datetime
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+
+                    sqlx::query!(
+                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'year', ?2)",
+                        hash,
+                        year
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+
+                    sqlx::query!(
+                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'month', ?2)",
+                        hash,
+                        month
                     )
                     .execute(&mut *conn)
                     .await
@@ -314,7 +334,11 @@ struct ImagesResponse {
 
 fn append_images_clause(buffer: &mut String, expression: &TagExpression) {
     match expression {
-        TagExpression::Tag(_) => buffer.push_str("EXISTS (SELECT * FROM tags WHERE hash = i.hash AND tag = ?)"),
+        TagExpression::Tag { category, .. } => buffer.push_str(if category.is_some() {
+            "EXISTS (SELECT * FROM tags WHERE hash = i.hash AND category = ? AND tag = ?)"
+        } else {
+            "EXISTS (SELECT * FROM tags WHERE hash = i.hash AND category IS NULL AND tag = ?)"
+        }),
         TagExpression::And(a, b) => {
             buffer.push('(');
             append_images_clause(buffer, a);
@@ -348,7 +372,8 @@ fn build_images_query<'a>(
                 "0, count(*)"
             }
         } else {
-            "hash, datetime, (SELECT group_concat(tag) FROM tags WHERE hash = i.hash)"
+            "hash, datetime, (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END)
+             FROM tags WHERE hash = i.hash)"
         },
         if let Some(tags) = &query.tags {
             let mut buffer = String::new();
@@ -375,7 +400,12 @@ fn build_images_query<'a>(
     }
 
     if let Some(tags) = &query.tags {
-        select = tags.fold_tags(select, |select, tag| select.bind(tag.to_owned()));
+        select = tags.fold_tags(select, |mut select, category, tag| {
+            if let Some(category) = category {
+                select = select.bind(category.to_owned())
+            }
+            select.bind(tag.to_owned())
+        });
     }
 
     if count {
@@ -425,7 +455,7 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
     Ok(ImagesResponse { start, total, images })
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Copy, Clone)]
 #[serde(rename_all = "lowercase")]
 enum Action {
     Add,
@@ -436,24 +466,56 @@ enum Action {
 struct Patch {
     hash: String,
     tag: String,
+    category: Option<String>,
     action: Action,
 }
 
-async fn apply(conn: &mut SqliteConnection, patch: &Patch) -> Result<()> {
-    match patch.action {
-        Action::Add => {
-            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, ?2)", patch.hash, patch.tag)
-                .execute(conn)
-                .await?;
-        }
-        Action::Remove => {
-            sqlx::query!("DELETE FROM tags WHERE hash = ?1 AND tag = ?2", patch.hash, patch.tag)
-                .execute(conn)
-                .await?;
+async fn apply(conn: &mut SqliteConnection, patch: &Patch) -> Result<Response<Body>> {
+    if let Some(category) = &patch.category {
+        if let Some(row) = sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
+            .fetch_optional(&mut *conn)
+            .await?
+        {
+            if row.immutable != 0 {
+                return Ok(response().status(StatusCode::UNAUTHORIZED).body(Body::empty())?);
+            }
         }
     }
 
-    Ok(())
+    match patch.action {
+        Action::Add => {
+            sqlx::query!(
+                "INSERT INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
+                patch.hash,
+                patch.tag,
+                patch.category
+            )
+            .execute(conn)
+            .await?;
+        }
+        Action::Remove => {
+            if let Some(category) = &patch.category {
+                sqlx::query!(
+                    "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category = ?3",
+                    patch.hash,
+                    patch.tag,
+                    category
+                )
+                .execute(conn)
+                .await?;
+            } else {
+                sqlx::query!(
+                    "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category IS NULL",
+                    patch.hash,
+                    patch.tag
+                )
+                .execute(conn)
+                .await?;
+            }
+        }
+    }
+
+    Ok(response().body(Body::empty())?)
 }
 
 async fn full_size_image(conn: &mut SqliteConnection, image_dir: &str, path: &str) -> Result<Vec<u8>> {
@@ -813,11 +875,7 @@ fn routes(
                             let patch = patch.clone();
                             let conn = conn.clone();
 
-                            async move {
-                                apply(conn.lock().await.deref_mut(), &patch).await?;
-
-                                Ok(response().body(Body::empty()))
-                            }
+                            async move { apply(conn.lock().await.deref_mut(), &patch).await }
                         }
                         .map_err(move |e| {
                             warn!(
@@ -932,65 +990,52 @@ mod test {
     use tempfile::TempDir;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
-        TagExpression::from_str(s).map_err(|e| anyhow!("{:?}", e))
+        s.parse().map_err(|e| anyhow!("{:?}", e))
+    }
+
+    fn cat_tag(category: &str, tag: &str) -> TagExpression {
+        TagExpression::Tag {
+            category: Some(category.into()),
+            tag: tag.into(),
+        }
+    }
+
+    fn tag(tag: &str) -> TagExpression {
+        TagExpression::Tag {
+            category: None,
+            tag: tag.into(),
+        }
+    }
+
+    fn and(a: TagExpression, b: TagExpression) -> TagExpression {
+        TagExpression::And(Box::new(a), Box::new(b))
+    }
+
+    fn or(a: TagExpression, b: TagExpression) -> TagExpression {
+        TagExpression::Or(Box::new(a), Box::new(b))
     }
 
     #[test]
     fn tags() -> Result<()> {
-        assert_eq!(TagExpression::Tag("foo".into()), parse_te("foo")?);
-        assert_eq!(TagExpression::Tag("foo".into()), parse_te("(foo)")?);
+        assert_eq!(tag("foo"), parse_te("foo")?);
+        assert_eq!(tag("foo"), parse_te("(foo)")?);
+        assert_eq!(cat_tag("um", "foo"), parse_te("um:foo")?);
+        assert_eq!(and(tag("foo"), tag("bar")), parse_te("foo and bar")?);
+        assert_eq!(or(tag("foo"), tag("bar")), parse_te("foo or bar")?);
         assert_eq!(
-            TagExpression::And(
-                Box::new(TagExpression::Tag("foo".into())),
-                Box::new(TagExpression::Tag("bar".into()))
-            ),
-            parse_te("foo and bar")?
-        );
-        assert_eq!(
-            TagExpression::Or(
-                Box::new(TagExpression::Tag("foo".into())),
-                Box::new(TagExpression::Tag("bar".into()))
-            ),
-            parse_te("foo or bar")?
-        );
-        assert_eq!(
-            TagExpression::Or(
-                Box::new(TagExpression::Tag("foo".into())),
-                Box::new(TagExpression::And(
-                    Box::new(TagExpression::Tag("bar".into())),
-                    Box::new(TagExpression::Tag("baz".into()))
-                ))
-            ),
+            or(tag("foo"), and(tag("bar"), tag("baz"))),
             parse_te("foo or (bar and baz)")?
         );
         assert_eq!(
-            TagExpression::Or(
-                Box::new(TagExpression::Tag("foo".into())),
-                Box::new(TagExpression::And(
-                    Box::new(TagExpression::Tag("bar".into())),
-                    Box::new(TagExpression::Tag("baz".into()))
-                ))
-            ),
+            or(tag("foo"), and(tag("bar"), tag("baz"))),
             parse_te("foo or bar and baz")?
         );
         assert_eq!(
-            TagExpression::And(
-                Box::new(TagExpression::Or(
-                    Box::new(TagExpression::Tag("foo".into())),
-                    Box::new(TagExpression::Tag("bar".into()))
-                )),
-                Box::new(TagExpression::Tag("baz".into()))
-            ),
-            parse_te("(foo or bar) and baz")?
+            and(or(tag("foo"), cat_tag("wat", "bar")), tag("baz")),
+            parse_te("(foo or wat:bar) and baz")?
         );
         assert_eq!(
-            TagExpression::And(
-                Box::new(TagExpression::Or(
-                    Box::new(TagExpression::Tag("foo".into())),
-                    Box::new(TagExpression::Tag("bar".into()))
-                )),
-                Box::new(TagExpression::Tag("baz".into()))
-            ),
+            and(or(tag("foo"), tag("bar")), tag("baz")),
             parse_te("((foo or bar) and baz)")?
         );
 
@@ -1134,7 +1179,7 @@ mod test {
                 let metadata = Metadata::new_from_path(&path)?;
                 metadata.set_tag_string(
                     "Exif.Image.DateTimeOriginal",
-                    &format!("2021:05:{:02} 00:00:00", number),
+                    &format!("2021:{:02}:01 00:00:00", number),
                 )?;
                 metadata.save_to_file(&path)?;
 
@@ -1173,7 +1218,10 @@ mod test {
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=image_count)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset!["year:2021".into(), format!("month:{}", number)]
+                )))
                 .collect::<Result<_>>()?
         );
 
@@ -1199,7 +1247,10 @@ mod test {
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             ((image_count - 1)..=image_count)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset!["year:2021".into(), format!("month:{}", number)]
+                )))
                 .collect::<Result<_>>()?
         );
 
@@ -1207,7 +1258,7 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?start=2021-05-04T00:00:00Z&limit=2")
+            .path("/images?start=2021-04-01T00:00:00Z&limit=2")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1225,15 +1276,19 @@ mod test {
                 .map(|(_, state)| (state.datetime, state.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=3)
-                .map(|number| Ok((format!("2021-05-{:02}T00:00:00Z", number).parse()?, HashSet::new())))
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset!["year:2021".into(), format!("month:{}", number)]
+                )))
                 .collect::<Result<_>>()?
         );
 
         // Let's add the "foo" tag to the third image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-05-03T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes.get(&"2021-03-01T00:00:00Z".parse()?).unwrap().clone(),
             tag: "foo".into(),
+            category: None,
             action: Action::Add,
         };
 
@@ -1295,11 +1350,11 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=image_count)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
-                        hashset!["foo".into()]
+                        hashset!["year:2021".into(), format!("month:{}", number), "foo".into()]
                     } else {
-                        HashSet::new()
+                        hashset!["year:2021".into(), format!("month:{}", number)]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1328,8 +1383,8 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    hashset!["foo".into()]
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset!["year:2021".into(), format!("month:{}", number), "foo".into()]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1337,8 +1392,9 @@ mod test {
         // Let's add the "foo" tag to the second image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-05-02T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes.get(&"2021-02-01T00:00:00Z".parse()?).unwrap().clone(),
             tag: "foo".into(),
+            category: None,
             action: Action::Add,
         };
 
@@ -1357,10 +1413,11 @@ mod test {
         for number in 3..=4 {
             let patch = Patch {
                 hash: hashes
-                    .get(&format!("2021-05-{:02}T00:00:00Z", number).parse()?)
+                    .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
                     .unwrap()
                     .clone(),
                 tag: "bar".into(),
+                category: None,
                 action: Action::Add,
             };
 
@@ -1398,11 +1455,16 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=3)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
-                        hashset!["foo".into(), "bar".into()]
+                        hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into(),
+                            "bar".into()
+                        ]
                     } else {
-                        hashset!["foo".into()]
+                        hashset!["year:2021".into(), format!("month:{}", number), "foo".into()]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1431,11 +1493,16 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (3..=4)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
-                        hashset!["foo".into(), "bar".into()]
+                        hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into(),
+                            "bar".into()
+                        ]
                     } else {
-                        hashset!["bar".into()]
+                        hashset!["year:2021".into(), format!("month:{}", number), "bar".into()]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1464,8 +1531,13 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    hashset!["foo".into(), "bar".into()]
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset![
+                        "year:2021".into(),
+                        format!("month:{}", number),
+                        "foo".into(),
+                        "bar".into()
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1493,11 +1565,16 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=4)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
-                        4 => hashset!["bar".into()],
-                        3 => hashset!["foo".into(), "bar".into()],
-                        2 => hashset!["foo".into()],
+                        4 => hashset!["year:2021".into(), format!("month:{}", number), "bar".into()],
+                        3 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into(),
+                            "bar".into()
+                        ],
+                        2 => hashset!["year:2021".into(), format!("month:{}", number), "foo".into()],
                         _ => unreachable!(),
                     }
                 )))
@@ -1528,12 +1605,17 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=image_count)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
-                        4 => hashset!["bar".into()],
-                        3 => hashset!["foo".into(), "bar".into()],
-                        2 => hashset!["foo".into()],
-                        _ => HashSet::new(),
+                        4 => hashset!["year:2021".into(), format!("month:{}", number), "bar".into()],
+                        3 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into(),
+                            "bar".into()
+                        ],
+                        2 => hashset!["year:2021".into(), format!("month:{}", number), "foo".into()],
+                        _ => hashset!["year:2021".into(), format!("month:{}", number)],
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1542,8 +1624,9 @@ mod test {
         // Let's add the "baz" tag to the fourth image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-05-04T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap().clone(),
             tag: "baz".into(),
+            category: None,
             action: Action::Add,
         };
 
@@ -1580,10 +1663,20 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (3..=4)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
-                        4 => hashset!["bar".into(), "baz".into()],
-                        3 => hashset!["foo".into(), "bar".into()],
+                        4 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "bar".into(),
+                            "baz".into()
+                        ],
+                        3 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into(),
+                            "bar".into()
+                        ],
                         _ => unreachable!(),
                     }
                 )))
@@ -1613,17 +1706,22 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    hashset!["bar".into(), "baz".into()]
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset![
+                        "year:2021".into(),
+                        format!("month:{}", number),
+                        "bar".into(),
+                        "baz".into()
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=foo or bar&start=2021-05-04T00:00:00Z&limit=1" should yield just the third image.
+        // GET "/images?tags=foo or bar&start=2021-04-01T00:00:00Z&limit=1" should yield just the third image.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=foo%20or%20bar&start=2021-05-04T00:00:00Z&limit=1")
+            .path("/images?tags=foo%20or%20bar&start=2021-04-01T00:00:00Z&limit=1")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1642,8 +1740,13 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    hashset!["foo".into(), "bar".into()]
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset![
+                        "year:2021".into(),
+                        format!("month:{}", number),
+                        "foo".into(),
+                        "bar".into()
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1651,8 +1754,9 @@ mod test {
         // Let's remove the "bar" tag from the third image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-05-03T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes.get(&"2021-03-01T00:00:00Z".parse()?).unwrap().clone(),
             tag: "bar".into(),
+            category: None,
             action: Action::Remove,
         };
 
@@ -1689,11 +1793,104 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
-                    format!("2021-05-{:02}T00:00:00Z", number).parse()?,
-                    hashset!["bar".into(), "baz".into()]
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset![
+                        "year:2021".into(),
+                        format!("month:{}", number),
+                        "bar".into(),
+                        "baz".into()
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
+
+        // GET "/images?tags=year:2021" should yield all images.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?tags=year:2021")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, image_count);
+        assert_eq!(
+            response
+                .images
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            (1..=image_count)
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    match number {
+                        4 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "bar".into(),
+                            "baz".into()
+                        ],
+                        3 | 2 => hashset!["year:2021".into(), format!("month:{}", number), "foo".into()],
+                        _ => hashset!["year:2021".into(), format!("month:{}", number)],
+                    }
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // GET "/images?tags=year:2021 and month:7" should yield only the seventh image.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?tags=year:2021%20and%20month:7")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 1);
+        assert_eq!(
+            response
+                .images
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(7)
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset!["year:2021".into(), format!("month:{}", number)]
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // A PATCH /tags that tries to change the year or month should yield `UNAUTHORIZED`
+
+        for &category in &["year", "month"] {
+            for &action in &[Action::Add, Action::Remove] {
+                let response = warp::test::request()
+                    .method("PATCH")
+                    .path("/tags")
+                    .header("authorization", format!("Bearer {}", token))
+                    .json(&Patch {
+                        hash: hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap().clone(),
+                        tag: "baz".into(),
+                        category: Some(category.into()),
+                        action,
+                    })
+                    .reply(&routes)
+                    .await;
+
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
 
         // A GET /image/<hash> with no authorization header should yield `UNAUTHORIZED`
 
@@ -1701,7 +1898,7 @@ mod test {
             .method("GET")
             .path(&format!(
                 "/image/{}",
-                hashes.get(&"2021-05-02T00:00:00Z".parse()?).unwrap()
+                hashes.get(&"2021-02-01T00:00:00Z".parse()?).unwrap()
             ))
             .reply(&routes)
             .await;
@@ -1715,7 +1912,7 @@ mod test {
             .header("authorization", "Bearer invalid")
             .path(&format!(
                 "/image/{}",
-                hashes.get(&"2021-05-02T00:00:00Z".parse()?).unwrap()
+                hashes.get(&"2021-02-01T00:00:00Z".parse()?).unwrap()
             ))
             .reply(&routes)
             .await;
@@ -1746,7 +1943,7 @@ mod test {
                     .path(&format!(
                         "/image/{}{}",
                         hashes
-                            .get(&format!("2021-05-{:02}T00:00:00Z", number).parse()?)
+                            .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
                             .unwrap(),
                         match size {
                             Size::Small => "?size=small",

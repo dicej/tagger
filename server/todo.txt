@@ -1,0 +1,7 @@
+GET /tags
+  include number of images assigned to each tag
+  accept optional query to filter tags
+allow access to (only) images with "public" tag with no authentication
+  authenticated users have access to everything and can add/update/remove tags except for those in an immutable category
+work on front end
+video support
