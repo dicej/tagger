@@ -615,6 +615,13 @@ async fn image(
     }
 }
 
+#[derive(Deserialize, Debug)]
+struct TagsQuery {
+    filter: Option<TagExpression>,
+}
+
+async fn tags(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<TagsResponse> {}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum GrantType {
@@ -832,14 +839,36 @@ fn routes(
                             })
                         }
                     })
-                    .or(auth
-                        .and(warp::path!("image" / String))
+                    .or(warp::path("tags").and(auth).and(warp::query::<TagsQuery>()).and_then({
+                        let conn = conn.clone();
+                        let options = options.clone();
+
+                        move |auth, query| {
+                            let conn = conn.clone();
+
+                            async move {
+                                let tags = serde_json::to_vec(&tags(conn.lock().await.deref_mut(), &query).await?)?;
+
+                                Ok(response()
+                                    .header(header::CONTENT_LENGTH, tags.len())
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(tags))?)
+                            }
+                            .map_err(move |e| {
+                                warn!(?auth, "error retrieving tags: {:?}", e);
+
+                                Rejection::from(HttpError::from(e))
+                            })
+                        }
+                    }))
+                    .or(warp::path!("image" / String)
+                        .and(auth)
                         .and(warp::query::<ImageQuery>())
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
 
-                            move |auth, hash: String, query| {
+                            move |hash: String, auth, query| {
                                 let hash = Arc::<str>::from(hash);
 
                                 {
