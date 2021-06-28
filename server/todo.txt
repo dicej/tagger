@@ -1,4 +1,7 @@
 allow access to (only) images with "public" tag with no authentication
-  authenticated users have access to everything and can add/update/remove tags except for those in an immutable category
+  update tests
 work on front end
 video support
+modularize
+document
+announce

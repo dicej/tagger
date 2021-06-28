@@ -477,7 +477,11 @@ struct Patch {
     action: Action,
 }
 
-async fn apply(conn: &mut SqliteConnection, patch: &Patch) -> Result<Response<Body>> {
+async fn apply(auth: Option<&Authorization>, conn: &mut SqliteConnection, patch: &Patch) -> Result<Response<Body>> {
+    if auth.is_none() {
+        return Ok(response().status(StatusCode::UNAUTHORIZED).body(Body::empty())?);
+    }
+
     if let Some(category) = &patch.category {
         if let Some(row) = sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
             .fetch_optional(&mut *conn)
@@ -610,16 +614,34 @@ struct ImageQuery {
 }
 
 async fn image(
+    auth: Option<&Authorization>,
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
     path: &str,
     query: &ImageQuery,
-) -> Result<Vec<u8>> {
-    if let Some(size) = query.size {
+) -> Result<Response<Body>> {
+    if auth.is_none()
+        && sqlx::query!(
+            "SELECT 1 as foo FROM tags WHERE hash = ?1 AND tag = 'public' AND category IS NULL",
+            path
+        )
+        .fetch_optional(conn.lock().await.deref_mut())
+        .await?
+        .is_none()
+    {
+        return Ok(response().status(StatusCode::UNAUTHORIZED).body(Body::empty())?);
+    }
+
+    let image = if let Some(size) = query.size {
         thumbnail(conn, image_dir, size, path).await
     } else {
         full_size_image(conn.lock().await.deref_mut(), image_dir, path).await
-    }
+    }?;
+
+    Ok(response()
+        .header(header::CONTENT_LENGTH, image.len())
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .body(Body::from(image))?)
 }
 
 #[derive(Deserialize, Debug)]
@@ -797,27 +819,37 @@ impl FromStr for Bearer {
     }
 }
 
-fn authorize(header: Option<Bearer>, key: &[u8]) -> Result<Arc<Authorization>, Rejection> {
-    let token = header.map(|h| h.body).ok_or_else(|| {
-        HttpError::from_slice(
-            StatusCode::UNAUTHORIZED,
-            "auth token query parameter or header required",
-        )
-    })?;
+fn authorize(header: Option<Bearer>, key: &[u8]) -> Result<Option<Arc<Authorization>>, Rejection> {
+    Ok(if let Some(token) = header.map(|h| h.body) {
+        Some(Arc::new(
+            jsonwebtoken::decode::<Authorization>(
+                &token,
+                &DecodingKey::from_secret(key),
+                &Validation::new(Algorithm::HS256),
+            )
+            .map_err(|e| {
+                warn!("received invalid token: {}: {:?}", token, e);
 
-    Ok(Arc::new(
-        jsonwebtoken::decode::<Authorization>(
-            &token,
-            &DecodingKey::from_secret(key),
-            &Validation::new(Algorithm::HS256),
-        )
-        .map_err(|e| {
-            warn!("received invalid token: {}: {:?}", token, e);
+                HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
+            })?
+            .claims,
+        ))
+    } else {
+        None
+    })
+}
 
-            HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
-        })?
-        .claims,
-    ))
+fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Option<Arc<Authorization>>) {
+    let tag = TagExpression::Tag {
+        category: None,
+        tag: "public".into(),
+    };
+
+    if let (Some(inner), None) = (filter.take(), auth) {
+        *filter = Some(TagExpression::And(Box::new(inner), Box::new(tag)));
+    } else {
+        *filter = Some(tag);
+    }
 }
 
 fn response() -> response::Builder {
@@ -866,7 +898,9 @@ fn routes(
                     .and_then({
                         let conn = conn.clone();
 
-                        move |auth, query| {
+                        move |auth, mut query: ImagesQuery| {
+                            maybe_wrap_filter(&mut query.filter, &auth);
+
                             let conn = conn.clone();
 
                             async move {
@@ -887,7 +921,9 @@ fn routes(
                     .or(warp::path("tags").and(auth).and(warp::query::<TagsQuery>()).and_then({
                         let conn = conn.clone();
 
-                        move |auth, query| {
+                        move |auth, mut query: TagsQuery| {
+                            maybe_wrap_filter(&mut query.filter, &auth);
+
                             let conn = conn.clone();
 
                             async move {
@@ -912,21 +948,17 @@ fn routes(
                             let conn = conn.clone();
                             let options = options.clone();
 
-                            move |hash: String, auth, query| {
+                            move |hash: String, auth: Option<Arc<_>>, query| {
                                 let hash = Arc::<str>::from(hash);
 
                                 {
+                                    let auth = auth.clone();
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
 
                                     async move {
-                                        let image = image(&conn, &options.image_directory, &hash, &query).await?;
-
-                                        Ok(response()
-                                            .header(header::CONTENT_LENGTH, image.len())
-                                            .header(header::CONTENT_TYPE, "image/jpeg")
-                                            .body(Body::from(image))?)
+                                        image(auth.as_deref(), &conn, &options.image_directory, &hash, &query).await
                                     }
                                 }
                                 .map_err(move |e| {
@@ -941,14 +973,15 @@ fn routes(
             .or(
                 warp::patch().and(warp::path("tags").and(auth).and(warp::body::json()).and_then({
                     let conn = conn.clone();
-                    move |auth, patch: Patch| {
+                    move |auth: Option<Arc<_>>, patch: Patch| {
                         let patch = Arc::new(patch);
 
                         {
+                            let auth = auth.clone();
                             let patch = patch.clone();
                             let conn = conn.clone();
 
-                            async move { apply(conn.lock().await.deref_mut(), &patch).await }
+                            async move { apply(auth.as_deref(), conn.lock().await.deref_mut(), &patch).await }
                         }
                         .map_err(move |e| {
                             warn!(
@@ -1271,7 +1304,7 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // A GET /images with no query parameters should give us all the images.
+        // GET /images with no query parameters should yield all the images.
 
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
@@ -1298,7 +1331,7 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // A GET /images with a "limit" parameter should give us the most recent images.
+        // GET /images with a "limit" parameter should yield the most recent images.
 
         let response = warp::test::request()
             .method("GET")
@@ -1327,7 +1360,7 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // A GET /images with "start" and "limit" parameters should give us images from the specified interval.
+        // GET /images with "start" and "limit" parameters should yield images from the specified interval.
 
         let response = warp::test::request()
             .method("GET")
@@ -1365,7 +1398,7 @@ mod test {
             action: Action::Add,
         };
 
-        // A PATCH /tags with no authorization header should yield `UNAUTHORIZED`
+        // PATCH /tags with no authorization header should yield `UNAUTHORIZED`
 
         let response = warp::test::request()
             .method("PATCH")
@@ -1388,7 +1421,31 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // A PATCH /tags with a valid authorization header should yield `OK`
+        // PATCH /tags referencing an immutable category should yield `UNAUTHORIZED`
+
+        for &(category, tag, action) in &[
+            ("year", "2021", Action::Remove),
+            ("year", "2022", Action::Add),
+            ("month", "3", Action::Remove),
+            ("month", "4", Action::Add),
+        ] {
+            let response = warp::test::request()
+                .method("PATCH")
+                .path("/tags")
+                .header("authorization", format!("Bearer {}", token))
+                .json(&Patch {
+                    hash: hashes.get(&"2021-03-01T00:00:00Z".parse()?).unwrap().clone(),
+                    tag: tag.into(),
+                    category: Some(category.into()),
+                    action,
+                })
+                .reply(&routes)
+                .await;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // PATCH /tags with a valid authorization header should yield `OK`
 
         let response = warp::test::request()
             .method("PATCH")
