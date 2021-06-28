@@ -316,7 +316,7 @@ impl<'de> serde::Deserialize<'de> for TagExpression {
 struct ImagesQuery {
     start: Option<DateTime<Utc>>,
     limit: Option<u32>,
-    tags: Option<TagExpression>,
+    filter: Option<TagExpression>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -332,7 +332,7 @@ struct ImagesResponse {
     images: HashMap<String, ImageData>,
 }
 
-fn append_images_clause(buffer: &mut String, expression: &TagExpression) {
+fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
     match expression {
         TagExpression::Tag { category, .. } => buffer.push_str(if category.is_some() {
             "EXISTS (SELECT * FROM tags WHERE hash = i.hash AND category = ? AND tag = ?)"
@@ -341,19 +341,31 @@ fn append_images_clause(buffer: &mut String, expression: &TagExpression) {
         }),
         TagExpression::And(a, b) => {
             buffer.push('(');
-            append_images_clause(buffer, a);
+            append_filter_clause(buffer, a);
             buffer.push_str(" AND ");
-            append_images_clause(buffer, b);
+            append_filter_clause(buffer, b);
             buffer.push(')');
         }
         TagExpression::Or(a, b) => {
             buffer.push('(');
-            append_images_clause(buffer, a);
+            append_filter_clause(buffer, a);
             buffer.push_str(" OR ");
-            append_images_clause(buffer, b);
+            append_filter_clause(buffer, b);
             buffer.push(')');
         }
     }
+}
+
+fn bind_filter_clause<'a>(
+    expression: &TagExpression,
+    select: Query<'a, Sqlite, SqliteArguments<'a>>,
+) -> Query<'a, Sqlite, SqliteArguments<'a>> {
+    expression.fold_tags(select, |mut select, category, tag| {
+        if let Some(category) = category {
+            select = select.bind(category.to_owned())
+        }
+        select.bind(tag.to_owned())
+    })
 }
 
 fn build_images_query<'a>(
@@ -375,9 +387,9 @@ fn build_images_query<'a>(
             "hash, datetime, (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END)
              FROM tags WHERE hash = i.hash)"
         },
-        if let Some(tags) = &query.tags {
+        if let Some(filter) = &query.filter {
             let mut buffer = String::new();
-            append_images_clause(&mut buffer, tags);
+            append_filter_clause(&mut buffer, filter);
             buffer
         } else {
             "1".into()
@@ -399,13 +411,8 @@ fn build_images_query<'a>(
         }
     }
 
-    if let Some(tags) = &query.tags {
-        select = tags.fold_tags(select, |mut select, category, tag| {
-            if let Some(category) = category {
-                select = select.bind(category.to_owned())
-            }
-            select.bind(tag.to_owned())
-        });
+    if let Some(filter) = &query.filter {
+        select = bind_filter_clause(filter, select);
     }
 
     if count {
@@ -620,7 +627,45 @@ struct TagsQuery {
     filter: Option<TagExpression>,
 }
 
-async fn tags(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<TagsResponse> {}
+type TagsResponse = HashMap<String, u32>;
+
+async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResponse> {
+    let mut buffer = String::new();
+
+    write!(
+        buffer,
+        "SELECT CASE WHEN t.category IS NULL THEN t.tag ELSE t.category || ':' || t.tag END, count(i.hash) \
+         FROM images i \
+         LEFT JOIN tags t \
+         ON i.hash = t.hash \
+         WHERE {} AND t.hash IS NOT NULL \
+         GROUP BY t.tag",
+        if let Some(filter) = &query.filter {
+            let mut buffer = String::new();
+            append_filter_clause(&mut buffer, filter);
+            buffer
+        } else {
+            "1".into()
+        }
+    )
+    .unwrap();
+
+    let mut select = sqlx::query(&buffer);
+
+    if let Some(filter) = &query.filter {
+        select = bind_filter_clause(filter, select);
+    }
+
+    let mut tags = HashMap::new();
+
+    let mut rows = select.fetch(&mut *conn);
+
+    while let Some(row) = rows.try_next().await? {
+        tags.insert(row.get(0), row.get(1));
+    }
+
+    Ok(tags)
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -841,7 +886,6 @@ fn routes(
                     })
                     .or(warp::path("tags").and(auth).and(warp::query::<TagsQuery>()).and_then({
                         let conn = conn.clone();
-                        let options = options.clone();
 
                         move |auth, query| {
                             let conn = conn.clone();
@@ -1389,11 +1433,33 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /images with a "tags" parameter should yield only the image(s) matching that expression.
+        // GET /tags should yield the new tag with an image count of one.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=foo")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            (1..=image_count)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 10)))
+                .chain(iter::once(("foo".into(), 1)))
+                .collect()
+        );
+
+        // GET /images with a "filter" parameter should yield only the image(s) matching that expression.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?filter=foo")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1461,11 +1527,34 @@ mod test {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        // GET /images?tags=foo should yield all images with that tag.
+        // GET /tags should yield the newly-applied tags.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=foo")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            (1..=image_count)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 10)))
+                .chain(iter::once(("foo".into(), 2)))
+                .chain(iter::once(("bar".into(), 2)))
+                .collect()
+        );
+
+        // GET /images?filter=foo should yield all images with that tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?filter=foo")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1499,11 +1588,34 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /images?tags=bar should yield all images with that tag.
+        // GET /tags?filter=foo should yield the tags and counts applied to images with that tag.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=bar")
+            .path("/tags?filter=foo")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            (2..=3)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 2)))
+                .chain(iter::once(("foo".into(), 2)))
+                .chain(iter::once(("bar".into(), 1)))
+                .collect()
+        );
+
+        // GET /images?filter=bar should yield all images with that tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?filter=bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1537,11 +1649,34 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=foo and bar" should yield only the image that has both tags.
+        // GET /tags?filter=bar should yield the tags and counts applied to images with that tag.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=foo%20and%20bar")
+            .path("/tags?filter=bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            (3..=4)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 2)))
+                .chain(iter::once(("foo".into(), 1)))
+                .chain(iter::once(("bar".into(), 2)))
+                .collect()
+        );
+
+        // GET "/images?filter=foo and bar" should yield only the image that has both tags.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?filter=foo%20and%20bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1571,11 +1706,34 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=foo or bar" should yield the images with either tag.
+        // GET /tags?filter=foo and bar should yield the tags and counts applied to images with both tags.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=foo%20or%20bar")
+            .path("/tags?filter=foo%20and%20bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            iter::once(3)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 1)))
+                .chain(iter::once(("foo".into(), 1)))
+                .chain(iter::once(("bar".into(), 1)))
+                .collect()
+        );
+
+        // GET "/images?filter=foo or bar" should yield the images with either tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?filter=foo%20or%20bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1608,6 +1766,29 @@ mod test {
                     }
                 )))
                 .collect::<Result<_>>()?
+        );
+
+        // GET /tags?filter=foo or bar should yield the tags and counts applied to images with either tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags?filter=foo%20or%20bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            (2..=4)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 3)))
+                .chain(iter::once(("foo".into(), 2)))
+                .chain(iter::once(("bar".into(), 2)))
+                .collect()
         );
 
         // A GET /images with a "limit" parameter should still give us the same most recent images, including the
@@ -1669,11 +1850,11 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // GET "/images?tags=bar and (foo or baz)" should yield the images which match that expression.
+        // GET "/images?filter=bar and (foo or baz)" should yield the images which match that expression.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=bar%20and%20%28foo%20or%20baz%29")
+            .path("/images?filter=bar%20and%20%28foo%20or%20baz%29")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1712,11 +1893,36 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=bar and (foo or baz)&limit=1" should yield just the fourth image.
+        // GET /tags?filter=bar and (foo or baz) should yield the tags and counts applied to images which match
+        // that expression.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=bar%20and%20%28foo%20or%20baz%29&limit=1")
+            .path("/tags?filter=bar%20and%20%28foo%20or%20baz%29")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
+
+        assert_eq!(
+            response,
+            (3..=4)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 2)))
+                .chain(iter::once(("foo".into(), 1)))
+                .chain(iter::once(("bar".into(), 2)))
+                .chain(iter::once(("baz".into(), 1)))
+                .collect()
+        );
+
+        // GET "/images?filter=bar and (foo or baz)&limit=1" should yield just the fourth image.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images?filter=bar%20and%20%28foo%20or%20baz%29&limit=1")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1746,11 +1952,11 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=foo or bar&start=2021-04-01T00:00:00Z&limit=1" should yield just the third image.
+        // GET "/images?filter=foo or bar&start=2021-04-01T00:00:00Z&limit=1" should yield just the third image.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=foo%20or%20bar&start=2021-04-01T00:00:00Z&limit=1")
+            .path("/images?filter=foo%20or%20bar&start=2021-04-01T00:00:00Z&limit=1")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1799,11 +2005,11 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        // GET /images?tags=bar should yield just the fourth image now.
+        // GET /images?filter=bar should yield just the fourth image now.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=bar")
+            .path("/images?filter=bar")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1833,11 +2039,11 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=year:2021" should yield all images.
+        // GET "/images?filter=year:2021" should yield all images.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=year:2021")
+            .path("/images?filter=year:2021")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1871,11 +2077,11 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET "/images?tags=year:2021 and month:7" should yield only the seventh image.
+        // GET "/images?filter=year:2021 and month:7" should yield only the seventh image.
 
         let response = warp::test::request()
             .method("GET")
-            .path("/images?tags=year:2021%20and%20month:7")
+            .path("/images?filter=year:2021%20and%20month:7")
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
