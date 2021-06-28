@@ -536,7 +536,7 @@ async fn full_size_image(conn: &mut SqliteConnection, image_dir: &str, path: &st
     {
         content([image_dir, &row.path].iter().collect::<PathBuf>()).await
     } else {
-        Err(anyhow!("image not found: {}", path))
+        Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
     }
 }
 
