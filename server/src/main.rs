@@ -650,19 +650,35 @@ struct TagsQuery {
     filter: Option<TagExpression>,
 }
 
-type TagsResponse = HashMap<String, u32>;
+#[derive(Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
+struct TagsResponse {
+    categories: HashMap<String, TagsResponse>,
+    tags: HashMap<String, u32>,
+}
+
+fn entry<'a>(
+    response: &'a mut TagsResponse,
+    parents: &HashMap<String, String>,
+    category: &str,
+) -> &'a mut TagsResponse {
+    if let Some(parent) = parents.get(category) {
+        entry(response, parents, parent)
+    } else {
+        response
+    }
+    .categories
+    .entry(category.to_owned())
+    .or_insert_with(TagsResponse::default)
+}
 
 async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResponse> {
-    let mut buffer = String::new();
-
-    write!(
-        buffer,
-        "SELECT CASE WHEN t.category IS NULL THEN t.tag ELSE t.category || ':' || t.tag END, count(i.hash) \
+    let select = format!(
+        "SELECT (SELECT parent from categories where name = t.category), t.category, t.tag, count(i.hash) \
          FROM images i \
          LEFT JOIN tags t \
          ON i.hash = t.hash \
          WHERE {} AND t.hash IS NOT NULL \
-         GROUP BY t.tag",
+         GROUP BY t.category, t.tag",
         if let Some(filter) = &query.filter {
             let mut buffer = String::new();
             append_filter_clause(&mut buffer, filter);
@@ -670,24 +686,48 @@ async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResp
         } else {
             "1".into()
         }
-    )
-    .unwrap();
+    );
 
-    let mut select = sqlx::query(&buffer);
+    let mut select = sqlx::query(&select);
 
     if let Some(filter) = &query.filter {
         select = bind_filter_clause(filter, select);
     }
 
+    let mut parents = HashMap::new();
+    let mut category_tags = HashMap::new();
     let mut tags = HashMap::new();
 
     let mut rows = select.fetch(&mut *conn);
 
     while let Some(row) = rows.try_next().await? {
-        tags.insert(row.get(0), row.get(1));
+        let tag = row.get(2);
+        let count = row.get(3);
+
+        if let Some(category) = row.get::<Option<String>, _>(1) {
+            if let Some(parent) = row.get::<Option<String>, _>(0) {
+                parents.insert(category.clone(), parent);
+            }
+
+            category_tags
+                .entry(category)
+                .or_insert_with(HashMap::new)
+                .insert(tag, count);
+        } else {
+            tags.insert(tag, count);
+        }
     }
 
-    Ok(tags)
+    let mut response = TagsResponse {
+        categories: HashMap::new(),
+        tags,
+    };
+
+    for (category, tags) in category_tags {
+        entry(&mut response, &parents, &category).tags = tags;
+    }
+
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -1093,7 +1133,7 @@ async fn main() -> Result<()> {
 mod test {
     use super::*;
     use image::{ImageBuffer, Rgb};
-    use maplit::hashset;
+    use maplit::{hashmap, hashset};
     use rand::{rngs::StdRng, SeedableRng};
     use std::iter;
     use tempfile::TempDir;
@@ -1506,7 +1546,10 @@ mod test {
         let response = warp::test::request().method("GET").path("/tags").reply(&routes).await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(serde_json::from_slice::<TagsResponse>(response.body())?, HashMap::new());
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse::default()
+        );
 
         // GET /tags should yield the new tag with an image count of one.
 
@@ -1520,11 +1563,24 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            (1..=image_count)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 10)))
-                .chain(iter::once(("foo".into(), 1)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: (1..=image_count).map(|n| (format!("{}", n), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 10
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1
+                ]
+            }
         );
 
         // GET /images with a "filter" parameter should yield only the image(s) matching that expression.
@@ -1611,12 +1667,25 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            (1..=image_count)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 10)))
-                .chain(iter::once(("foo".into(), 2)))
-                .chain(iter::once(("bar".into(), 2)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: (1..=image_count).map(|n| (format!("{}", n), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 10
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 2,
+                    "bar".into() => 2,
+                ]
+            }
         );
 
         // GET /images?filter=foo should yield all images with that tag.
@@ -1669,12 +1738,25 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            (2..=3)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 2)))
-                .chain(iter::once(("foo".into(), 2)))
-                .chain(iter::once(("bar".into(), 1)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: (2..=3).map(|n| (format!("{}", n), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 2
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 2,
+                    "bar".into() => 1,
+                ]
+            }
         );
 
         // GET /images?filter=bar should yield all images with that tag.
@@ -1727,12 +1809,25 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            (3..=4)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 2)))
-                .chain(iter::once(("foo".into(), 1)))
-                .chain(iter::once(("bar".into(), 2)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: (3..=4).map(|n| (format!("{}", n), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 2
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1,
+                    "bar".into() => 2,
+                ]
+            }
         );
 
         // GET "/images?filter=foo and bar" should yield only the image that has both tags.
@@ -1781,12 +1876,27 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            iter::once(3)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 1)))
-                .chain(iter::once(("foo".into(), 1)))
-                .chain(iter::once(("bar".into(), 1)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: hashmap![
+                                    "3".into() => 1
+                                ]
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 1
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1,
+                    "bar".into() => 1
+                ]
+            }
         );
 
         // GET "/images?filter=foo or bar" should yield the images with either tag.
@@ -1840,12 +1950,25 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            (2..=4)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 3)))
-                .chain(iter::once(("foo".into(), 2)))
-                .chain(iter::once(("bar".into(), 2)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: (2..=4).map(|n| (format!("{}", n), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 3
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 2,
+                    "bar".into() => 2
+                ]
+            }
         );
 
         // A GET /images with a "limit" parameter should still give us the same most recent images, including the
@@ -1963,13 +2086,26 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            (3..=4)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 2)))
-                .chain(iter::once(("foo".into(), 1)))
-                .chain(iter::once(("bar".into(), 2)))
-                .chain(iter::once(("baz".into(), 1)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: (3..=4).map(|n| (format!("{}", n), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 2
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1,
+                    "bar".into() => 2,
+                    "baz".into() => 1
+                ]
+            }
         );
 
         // GET "/images?filter=bar and (foo or baz)&limit=1" should yield just the fourth image.
@@ -2237,13 +2373,28 @@ mod test {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
-            iter::once(4)
-                .map(|number| (format!("month:{}", number), 1))
-                .chain(iter::once(("year:2021".into(), 1)))
-                .chain(iter::once(("bar".into(), 1)))
-                .chain(iter::once(("baz".into(), 1)))
-                .chain(iter::once(("public".into(), 1)))
-                .collect()
+            TagsResponse {
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                categories: HashMap::new(),
+                                tags: hashmap![
+                                    "4".into() => 1
+                                ]
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 1
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "bar".into() => 1,
+                    "baz".into() => 1,
+                    "public".into() => 1
+                ]
+            }
         );
 
         // A GET /image/<hash> with no authorization header for an image not tagged "public" should yield
