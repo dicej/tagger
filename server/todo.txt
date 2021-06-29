@@ -1,5 +1,3 @@
-allow access to (only) images with "public" tag with no authentication
-  update tests
 work on front end
 video support
 modularize
