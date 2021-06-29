@@ -3,5 +3,6 @@ allow access to (only) images with "public" tag with no authentication
 work on front end
 video support
 modularize
+break up tests
 document
 announce

@@ -136,7 +136,7 @@ fn find_new<'a>(
                         path.push(name);
                         let stripped = path.strip_prefix(root)?.to_str().ok_or_else(|| anyhow!("bad utf8"))?;
 
-                        let found = sqlx::query!("SELECT 1 as foo FROM paths WHERE path = ?1", stripped)
+                        let found = sqlx::query!("SELECT 1 as x FROM paths WHERE path = ?1", stripped)
                             .fetch_optional(conn.lock().await.deref_mut())
                             .await?
                             .is_some();
@@ -262,7 +262,7 @@ async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()
                             .execute(&mut *conn)
                             .await?;
 
-                        if sqlx::query!("SELECT 1 as foo FROM paths WHERE hash = ?1", row.hash)
+                        if sqlx::query!("SELECT 1 as x FROM paths WHERE hash = ?1", row.hash)
                             .fetch_optional(&mut *conn)
                             .await?
                             .is_none()
@@ -566,6 +566,7 @@ async fn thumbnail(
             .fetch_optional(conn.lock().await.deref_mut())
             .await?
             .and_then(|row| row.small),
+
         ThumbnailSize::Large => sqlx::query!("SELECT large FROM images WHERE hash = ?1 LIMIT 1", path)
             .fetch_optional(conn.lock().await.deref_mut())
             .await?
@@ -622,7 +623,7 @@ async fn image(
 ) -> Result<Response<Body>> {
     if auth.is_none()
         && sqlx::query!(
-            "SELECT 1 as foo FROM tags WHERE hash = ?1 AND tag = 'public' AND category IS NULL",
+            "SELECT 1 as x FROM tags WHERE hash = ?1 AND tag = 'public' AND category IS NULL",
             path
         )
         .fetch_optional(conn.lock().await.deref_mut())
@@ -748,7 +749,7 @@ async fn authenticate(
     let hash = hash_password(request.username.as_bytes(), request.password.as_bytes());
 
     let found = sqlx::query!(
-        "SELECT 1 as foo FROM users WHERE name = ?1 AND password_hash = ?2",
+        "SELECT 1 as x FROM users WHERE name = ?1 AND password_hash = ?2",
         request.username,
         hash
     )
@@ -840,15 +841,17 @@ fn authorize(header: Option<Bearer>, key: &[u8]) -> Result<Option<Arc<Authorizat
 }
 
 fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Option<Arc<Authorization>>) {
-    let tag = TagExpression::Tag {
-        category: None,
-        tag: "public".into(),
-    };
+    if auth.is_none() {
+        let tag = TagExpression::Tag {
+            category: None,
+            tag: "public".into(),
+        };
 
-    if let (Some(inner), None) = (filter.take(), auth) {
-        *filter = Some(TagExpression::And(Box::new(inner), Box::new(tag)));
-    } else {
-        *filter = Some(tag);
+        if let Some(inner) = filter.take() {
+            *filter = Some(TagExpression::And(Box::new(inner), Box::new(tag)));
+        } else {
+            *filter = Some(tag);
+        }
     }
 }
 
@@ -1229,12 +1232,6 @@ mod test {
 
         let token = serde_json::from_slice::<TokenSuccess>(response.body())?.access_token;
 
-        // Missing authorization header should yield `UNAUTHORIZED` from /images.
-
-        let response = warp::test::request().method("GET").path("/images").reply(&routes).await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
         // Invalid token should yield `UNAUTHORIZED` from /images.
 
         let response = warp::test::request()
@@ -1295,6 +1292,21 @@ mod test {
 
         sync(&conn, image_directory).await?;
 
+        // GET /images with no authorization header should yield `OK` with an empty body since no images have been
+        // tagged "public" yet.
+
+        let response = warp::test::request().method("GET").path("/images").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 0);
+        assert_eq!(response.images.len(), 0);
+
+        // GET /images with no query parameters should yield all the images.
+
         let response = warp::test::request()
             .method("GET")
             .path("/images")
@@ -1303,8 +1315,6 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        // GET /images with no query parameters should yield all the images.
 
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
@@ -1490,6 +1500,14 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
+        // GET /tags with no authorization header should yield no tags since no images have been tagged "public"
+        // yet.
+
+        let response = warp::test::request().method("GET").path("/tags").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<TagsResponse>(response.body())?, HashMap::new());
+
         // GET /tags should yield the new tag with an image count of one.
 
         let response = warp::test::request()
@@ -1500,11 +1518,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             (1..=image_count)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 10)))
@@ -1594,11 +1609,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             (1..=image_count)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 10)))
@@ -1655,11 +1667,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             (2..=3)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 2)))
@@ -1716,11 +1725,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             (3..=4)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 2)))
@@ -1763,7 +1769,7 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /tags?filter=foo and bar should yield the tags and counts applied to images with both tags.
+        // GET "/tags?filter=foo and bar" should yield the tags and counts applied to images with both tags.
 
         let response = warp::test::request()
             .method("GET")
@@ -1773,11 +1779,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             iter::once(3)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 1)))
@@ -1835,11 +1838,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             (2..=4)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 3)))
@@ -1950,7 +1950,7 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /tags?filter=bar and (foo or baz) should yield the tags and counts applied to images which match
+        // GET "/tags?filter=bar and (foo or baz)" should yield the tags and counts applied to images which match
         // that expression.
 
         let response = warp::test::request()
@@ -1961,11 +1961,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-
-        let response = serde_json::from_slice::<TagsResponse>(response.body())?;
-
         assert_eq!(
-            response,
+            serde_json::from_slice::<TagsResponse>(response.body())?,
             (3..=4)
                 .map(|number| (format!("month:{}", number), 1))
                 .chain(iter::once(("year:2021".into(), 2)))
@@ -2184,7 +2181,73 @@ mod test {
             }
         }
 
-        // A GET /image/<hash> with no authorization header should yield `UNAUTHORIZED`
+        // Let's add the "public" tag to the fourth image.
+
+        let patch = Patch {
+            hash: hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap().clone(),
+            tag: "public".into(),
+            category: None,
+            action: Action::Add,
+        };
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patch)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // GET /images with no authorization header should yield any images tagged "public".
+
+        let response = warp::test::request().method("GET").path("/images").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, 1);
+        assert_eq!(
+            response
+                .images
+                .into_iter()
+                .map(|(_, state)| (state.datetime, state.tags))
+                .collect::<HashMap<_, _>>(),
+            iter::once(4)
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    hashset![
+                        "year:2021".into(),
+                        format!("month:{}", number),
+                        "bar".into(),
+                        "baz".into(),
+                        "public".into()
+                    ]
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // GET /tags with no authorization header should yield the tags applied to any images tagged "public".
+
+        let response = warp::test::request().method("GET").path("/tags").reply(&routes).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            iter::once(4)
+                .map(|number| (format!("month:{}", number), 1))
+                .chain(iter::once(("year:2021".into(), 1)))
+                .chain(iter::once(("bar".into(), 1)))
+                .chain(iter::once(("baz".into(), 1)))
+                .chain(iter::once(("public".into(), 1)))
+                .collect()
+        );
+
+        // A GET /image/<hash> with no authorization header for an image not tagged "public" should yield
+        // `UNAUTHORIZED`.
 
         let response = warp::test::request()
             .method("GET")
@@ -2197,7 +2260,20 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // A GET /image/<hash> with an invalid authorization header should yield `UNAUTHORIZED`
+        // A GET /image/<hash> with no authorization header for an image tagged "public" should yield `OK`.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path(&format!(
+                "/image/{}",
+                hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap()
+            ))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A GET /image/<hash> with an invalid authorization header should yield `UNAUTHORIZED`.
 
         let response = warp::test::request()
             .method("GET")
@@ -2211,7 +2287,7 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // The images and thumbnails should contain the colors we specified above
+        // The images and thumbnails should contain the colors we specified above.
 
         enum Size {
             Small,
