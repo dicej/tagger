@@ -5,8 +5,6 @@ use tokio::fs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    lalrpop::process_root().unwrap();
-
     let mut db = env::current_dir()?;
     db.push("target");
     db.push("schema.dat");

@@ -2013,8 +2013,6 @@ dependencies = [
  "hyper",
  "image",
  "jsonwebtoken",
- "lalrpop",
- "lalrpop-util",
  "lazy_static",
  "maplit",
  "mime",
@@ -2030,11 +2028,22 @@ dependencies = [
  "sha2",
  "sqlx",
  "structopt",
+ "tagger-shared",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
  "warp",
+]
+
+[[package]]
+name = "tagger-shared"
+version = "0.1.0"
+dependencies = [
+ "lalrpop",
+ "lalrpop-util",
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

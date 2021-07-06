@@ -14,12 +14,10 @@ use http::{
 use hyper::Body;
 use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
 use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use lalrpop_util::lalrpop_mod;
 use lazy_static::lazy_static;
 use rand::Rng;
 use regex::Regex;
 use rexiv2::Metadata;
-use serde::Deserializer;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -37,30 +35,26 @@ use std::{
     ops::DerefMut,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
-    process,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use structopt::StructOpt;
-use tag_expression::TagExpression;
+use tagger_shared::{
+    tag_expression::TagExpression, ImageData, ImagesQuery, ImagesResponse, TagsQuery, TagsResponse,
+    TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
+};
 use tokio::{
     fs::{self, File},
     io::AsyncReadExt,
     sync::Mutex as AsyncMutex,
-    task, time,
+    time,
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use warp::{Filter, Rejection, Reply};
 use warp_util::HttpError;
 
-mod tag_expression;
 mod warp_util;
-
-lalrpop_mod!(
-    #[allow(clippy::all)]
-    tag_expression_grammar
-);
 
 const SMALL_BOUNDS: (u32, u32) = (320, 240);
 
@@ -68,15 +62,13 @@ const LARGE_BOUNDS: (u32, u32) = (1280, 960);
 
 const JPEG_QUALITY: u8 = 90;
 
-const SYNC_INTERVAL_SECONDS: u64 = 10;
-
 const INVALID_CREDENTIAL_DELAY_SECS: u64 = 5;
 
 const TOKEN_EXPIRATION_SECS: u64 = 24 * 60 * 60;
 
 const DEFAULT_LIMIT: u32 = 1000;
 
-async fn open(state_file: &str) -> Result<SqliteConnection> {
+pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
         .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
@@ -118,7 +110,8 @@ fn find_new<'a>(
     dir: impl AsRef<Path> + 'a + Send,
 ) -> BoxFuture<'a, Result<()>> {
     lazy_static! {
-        static ref DATE_TIME_PATTERN: Regex = Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
+        static ref DATE_TIME_PATTERN: Regex =
+            Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
     };
 
     let dir_buf = dir.as_ref().to_path_buf();
@@ -134,25 +127,34 @@ fn find_new<'a>(
                     if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
                         let mut path = dir_buf.clone();
                         path.push(name);
-                        let stripped = path.strip_prefix(root)?.to_str().ok_or_else(|| anyhow!("bad utf8"))?;
+                        let stripped = path
+                            .strip_prefix(root)?
+                            .to_str()
+                            .ok_or_else(|| anyhow!("bad utf8"))?;
 
-                        let found = sqlx::query!("SELECT 1 as x FROM paths WHERE path = ?1", stripped)
-                            .fetch_optional(conn.lock().await.deref_mut())
-                            .await?
-                            .is_some();
+                        let found =
+                            sqlx::query!("SELECT 1 as x FROM paths WHERE path = ?1", stripped)
+                                .fetch_optional(conn.lock().await.deref_mut())
+                                .await?
+                                .is_some();
 
                         if !found {
-                            if let Some(datetime) = Metadata::new_from_buffer(&content(&path).await?)
-                                .and_then(|m| {
-                                    m.get_tag_string("Exif.Image.DateTimeOriginal")
-                                        .or_else(|_| m.get_tag_string("Exif.Image.DateTime"))
-                                })
-                                .ok()
-                                .and_then(|s| {
-                                    DATE_TIME_PATTERN.captures(&s).map(|c| {
-                                        format!("{}-{}-{}T{}:{}:{}Z", &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]).parse()
+                            if let Some(datetime) =
+                                Metadata::new_from_buffer(&content(&path).await?)
+                                    .and_then(|m| {
+                                        m.get_tag_string("Exif.Image.DateTimeOriginal")
+                                            .or_else(|_| m.get_tag_string("Exif.Image.DateTime"))
                                     })
-                                })
+                                    .ok()
+                                    .and_then(|s| {
+                                        DATE_TIME_PATTERN.captures(&s).map(|c| {
+                                            format!(
+                                                "{}-{}-{}T{}:{}:{}Z",
+                                                &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
+                                            )
+                                            .parse()
+                                        })
+                                    })
                             {
                                 result.push((stripped.to_string(), datetime?))
                             } else {
@@ -171,7 +173,7 @@ fn find_new<'a>(
     .boxed()
 }
 
-async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()> {
+pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()> {
     let then = Instant::now();
 
     let obsolete = {
@@ -288,48 +290,6 @@ async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()
     );
 
     Ok(())
-}
-
-impl FromStr for TagExpression {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        tag_expression_grammar::TagExpressionParser::new()
-            .parse(s)
-            .map(|tags| *tags)
-            .map_err(|e| e.to_string())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for TagExpression {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct ImagesQuery {
-    start: Option<DateTime<Utc>>,
-    limit: Option<u32>,
-    filter: Option<TagExpression>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ImageData {
-    datetime: DateTime<Utc>,
-    tags: HashSet<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ImagesResponse {
-    start: u32,
-    total: u32,
-    images: HashMap<String, ImageData>,
 }
 
 fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
@@ -459,7 +419,11 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
         (row.get::<u32, _>(0), row.get::<u32, _>(1))
     };
 
-    Ok(ImagesResponse { start, total, images })
+    Ok(ImagesResponse {
+        start,
+        total,
+        images,
+    })
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone)]
@@ -477,18 +441,27 @@ struct Patch {
     action: Action,
 }
 
-async fn apply(auth: Option<&Authorization>, conn: &mut SqliteConnection, patch: &Patch) -> Result<Response<Body>> {
+async fn apply(
+    auth: Option<&Authorization>,
+    conn: &mut SqliteConnection,
+    patch: &Patch,
+) -> Result<Response<Body>> {
     if auth.is_none() {
-        return Ok(response().status(StatusCode::UNAUTHORIZED).body(Body::empty())?);
+        return Ok(response()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())?);
     }
 
     if let Some(category) = &patch.category {
-        if let Some(row) = sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
-            .fetch_optional(&mut *conn)
-            .await?
+        if let Some(row) =
+            sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
+                .fetch_optional(&mut *conn)
+                .await?
         {
             if row.immutable != 0 {
-                return Ok(response().status(StatusCode::UNAUTHORIZED).body(Body::empty())?);
+                return Ok(response()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Body::empty())?);
             }
         }
     }
@@ -529,7 +502,11 @@ async fn apply(auth: Option<&Authorization>, conn: &mut SqliteConnection, patch:
     Ok(response().body(Body::empty())?)
 }
 
-async fn full_size_image(conn: &mut SqliteConnection, image_dir: &str, path: &str) -> Result<Vec<u8>> {
+async fn full_size_image(
+    conn: &mut SqliteConnection,
+    image_dir: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
     if let Some(row) = sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
         .fetch_optional(conn)
         .await?
@@ -540,7 +517,10 @@ async fn full_size_image(conn: &mut SqliteConnection, image_dir: &str, path: &st
     }
 }
 
-fn bound((native_width, native_height): (u32, u32), (bound_width, bound_height): (u32, u32)) -> (u32, u32) {
+fn bound(
+    (native_width, native_height): (u32, u32),
+    (bound_width, bound_height): (u32, u32),
+) -> (u32, u32) {
     if native_width * bound_height > bound_width * native_height {
         (bound_width, (native_height * bound_width) / native_width)
     } else {
@@ -562,15 +542,19 @@ async fn thumbnail(
     path: &str,
 ) -> Result<Vec<u8>> {
     let result = match size {
-        ThumbnailSize::Small => sqlx::query!("SELECT small FROM images WHERE hash = ?1 LIMIT 1", path)
-            .fetch_optional(conn.lock().await.deref_mut())
-            .await?
-            .and_then(|row| row.small),
+        ThumbnailSize::Small => {
+            sqlx::query!("SELECT small FROM images WHERE hash = ?1 LIMIT 1", path)
+                .fetch_optional(conn.lock().await.deref_mut())
+                .await?
+                .and_then(|row| row.small)
+        }
 
-        ThumbnailSize::Large => sqlx::query!("SELECT large FROM images WHERE hash = ?1 LIMIT 1", path)
-            .fetch_optional(conn.lock().await.deref_mut())
-            .await?
-            .and_then(|row| row.large),
+        ThumbnailSize::Large => {
+            sqlx::query!("SELECT large FROM images WHERE hash = ?1 LIMIT 1", path)
+                .fetch_optional(conn.lock().await.deref_mut())
+                .await?
+                .and_then(|row| row.large)
+        }
     };
 
     if let Some(result) = result {
@@ -630,7 +614,9 @@ async fn image(
         .await?
         .is_none()
     {
-        return Ok(response().status(StatusCode::UNAUTHORIZED).body(Body::empty())?);
+        return Ok(response()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())?);
     }
 
     let image = if let Some(size) = query.size {
@@ -643,17 +629,6 @@ async fn image(
         .header(header::CONTENT_LENGTH, image.len())
         .header(header::CONTENT_TYPE, "image/jpeg")
         .body(Body::from(image))?)
-}
-
-#[derive(Deserialize, Debug)]
-struct TagsQuery {
-    filter: Option<TagExpression>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
-struct TagsResponse {
-    categories: HashMap<String, TagsResponse>,
-    tags: HashMap<String, u32>,
 }
 
 fn entry<'a>(
@@ -730,50 +705,17 @@ async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResp
     Ok(response)
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum GrantType {
-    Password,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TokenRequest {
-    #[serde(rename = "grant_type")]
-    _grant_type: GrantType,
-    username: String,
-    password: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TokenType {
-    Jwt,
-}
-
-#[derive(Serialize, Deserialize)]
-struct TokenSuccess {
-    access_token: String,
-    token_type: TokenType,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TokenErrorType {
-    UnauthorizedClient,
-}
-
-#[derive(Serialize, Deserialize)]
-struct TokenError {
-    error: TokenErrorType,
-    error_description: Option<String>,
-}
-
-fn hash_password(salt: &[u8], secret: &[u8]) -> String {
+pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
     let iterations = NonZeroU32::new(100_000).unwrap();
     const SIZE: usize = ring::digest::SHA256_OUTPUT_LEN;
     let mut hash: [u8; SIZE] = [0u8; SIZE];
-    ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256, iterations, salt, secret, &mut hash);
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        iterations,
+        salt,
+        secret,
+        &mut hash,
+    );
     base64::encode(&hash)
 }
 
@@ -897,9 +839,6 @@ fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Option<Arc<Autho
 
 fn response() -> response::Builder {
     Response::builder()
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "any")
-        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type, content-length")
-        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "get, post, options, head")
 }
 
 fn routes(
@@ -925,12 +864,21 @@ fn routes(
                 let conn = conn.clone();
                 let auth_mutex = auth_mutex.clone();
 
-                async move { authenticate(&conn, &body, &auth_key, &auth_mutex, invalid_credential_delay).await }
-                    .map_err(|e| {
-                        warn!("error authorizing: {:?}", e);
+                async move {
+                    authenticate(
+                        &conn,
+                        &body,
+                        &auth_key,
+                        &auth_mutex,
+                        invalid_credential_delay,
+                    )
+                    .await
+                }
+                .map_err(|e| {
+                    warn!("error authorizing: {:?}", e);
 
-                        Rejection::from(HttpError::from(e))
-                    })
+                    Rejection::from(HttpError::from(e))
+                })
             }
         })
         .or(warp::get()
@@ -947,7 +895,9 @@ fn routes(
                             let conn = conn.clone();
 
                             async move {
-                                let state = serde_json::to_vec(&images(conn.lock().await.deref_mut(), &query).await?)?;
+                                let state = serde_json::to_vec(
+                                    &images(conn.lock().await.deref_mut(), &query).await?,
+                                )?;
 
                                 Ok(response()
                                     .header(header::CONTENT_LENGTH, state.len())
@@ -961,29 +911,34 @@ fn routes(
                             })
                         }
                     })
-                    .or(warp::path("tags").and(auth).and(warp::query::<TagsQuery>()).and_then({
-                        let conn = conn.clone();
-
-                        move |auth, mut query: TagsQuery| {
-                            maybe_wrap_filter(&mut query.filter, &auth);
-
+                    .or(warp::path("tags")
+                        .and(auth)
+                        .and(warp::query::<TagsQuery>())
+                        .and_then({
                             let conn = conn.clone();
 
-                            async move {
-                                let tags = serde_json::to_vec(&tags(conn.lock().await.deref_mut(), &query).await?)?;
+                            move |auth, mut query: TagsQuery| {
+                                maybe_wrap_filter(&mut query.filter, &auth);
 
-                                Ok(response()
-                                    .header(header::CONTENT_LENGTH, tags.len())
-                                    .header(header::CONTENT_TYPE, "application/json")
-                                    .body(Body::from(tags))?)
+                                let conn = conn.clone();
+
+                                async move {
+                                    let tags = serde_json::to_vec(
+                                        &tags(conn.lock().await.deref_mut(), &query).await?,
+                                    )?;
+
+                                    Ok(response()
+                                        .header(header::CONTENT_LENGTH, tags.len())
+                                        .header(header::CONTENT_TYPE, "application/json")
+                                        .body(Body::from(tags))?)
+                                }
+                                .map_err(move |e| {
+                                    warn!(?auth, "error retrieving tags: {:?}", e);
+
+                                    Rejection::from(HttpError::from(e))
+                                })
                             }
-                            .map_err(move |e| {
-                                warn!(?auth, "error retrieving tags: {:?}", e);
-
-                                Rejection::from(HttpError::from(e))
-                            })
-                        }
-                    }))
+                        }))
                     .or(warp::path!("image" / String)
                         .and(auth)
                         .and(warp::query::<ImageQuery>())
@@ -1001,7 +956,14 @@ fn routes(
                                     let options = options.clone();
 
                                     async move {
-                                        image(auth.as_deref(), &conn, &options.image_directory, &hash, &query).await
+                                        image(
+                                            auth.as_deref(),
+                                            &conn,
+                                            &options.image_directory,
+                                            &hash,
+                                            &query,
+                                        )
+                                        .await
                                     }
                                 }
                                 .map_err(move |e| {
@@ -1013,33 +975,40 @@ fn routes(
                         }))
                     .or(warp::fs::dir(options.public_directory.clone())),
             )
-            .or(
-                warp::patch().and(warp::path("tags").and(auth).and(warp::body::json()).and_then({
-                    let conn = conn.clone();
-                    move |auth: Option<Arc<_>>, patch: Patch| {
-                        let patch = Arc::new(patch);
+            .or(warp::patch().and(
+                warp::path("tags")
+                    .and(auth)
+                    .and(warp::body::json())
+                    .and_then({
+                        let conn = conn.clone();
+                        move |auth: Option<Arc<_>>, patch: Patch| {
+                            let patch = Arc::new(patch);
 
-                        {
-                            let auth = auth.clone();
-                            let patch = patch.clone();
-                            let conn = conn.clone();
+                            {
+                                let auth = auth.clone();
+                                let patch = patch.clone();
+                                let conn = conn.clone();
 
-                            async move { apply(auth.as_deref(), conn.lock().await.deref_mut(), &patch).await }
+                                async move {
+                                    apply(auth.as_deref(), conn.lock().await.deref_mut(), &patch)
+                                        .await
+                                }
+                            }
+                            .map_err(move |e| {
+                                warn!(
+                                    ?auth,
+                                    "error applying patch {}: {:?}",
+                                    serde_json::to_string(patch.as_ref()).unwrap_or_else(|_| {
+                                        "(unable to serialize patch)".to_string()
+                                    }),
+                                    e
+                                );
+
+                                Rejection::from(HttpError::from(e))
+                            })
                         }
-                        .map_err(move |e| {
-                            warn!(
-                                ?auth,
-                                "error applying patch {}: {:?}",
-                                serde_json::to_string(patch.as_ref())
-                                    .unwrap_or_else(|_| "(unable to serialize patch)".to_string()),
-                                e
-                            );
-
-                            Rejection::from(HttpError::from(e))
-                        })
-                    }
-                })),
-            ))
+                    }),
+            )))
         .recover(warp_util::handle_rejection)
         .with(warp::log("tagger"))
 }
@@ -1056,15 +1025,22 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
     })
 }
 
-async fn serve(conn: &Arc<AsyncMutex<SqliteConnection>>, options: &Arc<Options>) -> Result<()> {
-    let routes = routes(conn, options, Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS));
+pub async fn serve(conn: &Arc<AsyncMutex<SqliteConnection>>, options: &Arc<Options>) -> Result<()> {
+    let routes = routes(
+        conn,
+        options,
+        Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS),
+    );
 
-    let (address, future) = if let (Some(cert), Some(key)) = (&options.cert_file, &options.key_file) {
+    let (address, future) = if let (Some(cert), Some(key)) = (&options.cert_file, &options.key_file)
+    {
         let server = warp::serve(routes).tls().cert_path(cert).key_path(key);
 
         // As of this writing, warp::TlsServer does not have a try_bind_ephemeral method, so we must catch panics
         // explicitly.
-        let (address, future) = catch_unwind(AssertUnwindSafe(move || server.bind_ephemeral(options.address)))?;
+        let (address, future) = catch_unwind(AssertUnwindSafe(move || {
+            server.bind_ephemeral(options.address)
+        }))?;
 
         (address, future.boxed())
     } else {
@@ -1082,51 +1058,30 @@ async fn serve(conn: &Arc<AsyncMutex<SqliteConnection>>, options: &Arc<Options>)
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
-struct Options {
-    #[structopt(long, help = "address to which to bind")]
-    address: SocketAddrV4,
+pub struct Options {
+    /// Address to which to bind
+    #[structopt(long)]
+    pub address: SocketAddrV4,
 
-    #[structopt(long, help = "directory containing image files")]
-    image_directory: String,
+    /// Directory containing image files
+    #[structopt(long)]
+    pub image_directory: String,
 
-    #[structopt(long, help = "SQLite database of image metadata to create or reuse")]
-    state_file: String,
+    /// SQLite database to create or reuse
+    #[structopt(long)]
+    pub state_file: String,
 
-    #[structopt(long, help = "directory containing static resources")]
-    public_directory: String,
+    /// Directory containing static resources
+    #[structopt(long)]
+    pub public_directory: String,
 
-    #[structopt(long, help = "file containing TLS certificate to use")]
-    cert_file: Option<String>,
+    /// File containing TLS certificate to use
+    #[structopt(long)]
+    pub cert_file: Option<String>,
 
-    #[structopt(long, help = "file containing TLS key to use")]
-    key_file: Option<String>,
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    pretty_env_logger::init_timed();
-
-    let options = Arc::new(Options::from_args());
-
-    let conn = Arc::new(AsyncMutex::new(open(&options.state_file).await?));
-
-    sync(&conn, &options.image_directory).await?;
-
-    task::spawn({
-        let options = options.clone();
-        let conn = conn.clone();
-
-        async move {
-            time::sleep(Duration::from_secs(SYNC_INTERVAL_SECONDS)).await;
-
-            if let Err(e) = sync(&conn, &options.image_directory).await {
-                error!("sync error: {:?}", e);
-                process::exit(-1)
-            }
-        }
-    });
-
-    serve(&conn, &options).await
+    /// File containing TLS key to use
+    #[structopt(long)]
+    pub key_file: Option<String>,
 }
 
 #[cfg(test)]
@@ -1137,6 +1092,7 @@ mod test {
     use rand::{rngs::StdRng, SeedableRng};
     use std::iter;
     use tempfile::TempDir;
+    use tokio::task;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
         s.parse().map_err(|e| anyhow!("{:?}", e))
@@ -1195,7 +1151,10 @@ mod test {
     async fn it_works() -> Result<()> {
         pretty_env_logger::init_timed();
 
-        let mut conn = "sqlite::memory:".parse::<SqliteConnectOptions>()?.connect().await?;
+        let mut conn = "sqlite::memory:"
+            .parse::<SqliteConnectOptions>()?
+            .connect()
+            .await?;
 
         for statement in schema::DDL_STATEMENTS {
             sqlx::query(statement).execute(&mut conn).await?;
@@ -1207,15 +1166,22 @@ mod test {
         {
             let hash = hash_password(user.as_bytes(), password.as_bytes());
 
-            sqlx::query!("INSERT INTO users (name, password_hash) VALUES (?1, ?2)", user, hash,)
-                .execute(&mut conn)
-                .await?;
+            sqlx::query!(
+                "INSERT INTO users (name, password_hash) VALUES (?1, ?2)",
+                user,
+                hash,
+            )
+            .execute(&mut conn)
+            .await?;
         }
 
         let conn = Arc::new(AsyncMutex::new(conn));
 
         let tmp_dir = TempDir::new()?;
-        let image_directory = tmp_dir.path().to_str().ok_or_else(|| anyhow!("invalid UTF-8"))?;
+        let image_directory = tmp_dir
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid UTF-8"))?;
 
         let routes = routes(
             &conn,
@@ -1264,7 +1230,10 @@ mod test {
         let response = warp::test::request()
             .method("POST")
             .path("/token")
-            .body(&format!("grant_type=password&username={}&password={}", user, password))
+            .body(&format!(
+                "grant_type=password&username={}&password={}",
+                user, password
+            ))
             .reply(&routes)
             .await;
 
@@ -1309,7 +1278,12 @@ mod test {
         let image_height = 240;
         let mut random = StdRng::seed_from_u64(42);
         let colors = (1..=image_count)
-            .map(|number| (number, Rgb([random.gen::<u8>(), random.gen(), random.gen()])))
+            .map(|number| {
+                (
+                    number,
+                    Rgb([random.gen::<u8>(), random.gen(), random.gen()]),
+                )
+            })
             .collect::<HashMap<_, _>>();
 
         for (&number, &color) in &colors {
@@ -1335,7 +1309,11 @@ mod test {
         // GET /images with no authorization header should yield `OK` with an empty body since no images have been
         // tagged "public" yet.
 
-        let response = warp::test::request().method("GET").path("/images").reply(&routes).await;
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .reply(&routes)
+            .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1442,7 +1420,10 @@ mod test {
         // Let's add the "foo" tag to the third image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-03-01T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes
+                .get(&"2021-03-01T00:00:00Z".parse()?)
+                .unwrap()
+                .clone(),
             tag: "foo".into(),
             category: None,
             action: Action::Add,
@@ -1484,7 +1465,10 @@ mod test {
                 .path("/tags")
                 .header("authorization", format!("Bearer {}", token))
                 .json(&Patch {
-                    hash: hashes.get(&"2021-03-01T00:00:00Z".parse()?).unwrap().clone(),
+                    hash: hashes
+                        .get(&"2021-03-01T00:00:00Z".parse()?)
+                        .unwrap()
+                        .clone(),
                     tag: tag.into(),
                     category: Some(category.into()),
                     action,
@@ -1532,7 +1516,11 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
-                        hashset!["year:2021".into(), format!("month:{}", number), "foo".into()]
+                        hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into()
+                        ]
                     } else {
                         hashset!["year:2021".into(), format!("month:{}", number)]
                     }
@@ -1543,7 +1531,11 @@ mod test {
         // GET /tags with no authorization header should yield no tags since no images have been tagged "public"
         // yet.
 
-        let response = warp::test::request().method("GET").path("/tags").reply(&routes).await;
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags")
+            .reply(&routes)
+            .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -1607,7 +1599,11 @@ mod test {
             iter::once(3)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".into(), format!("month:{}", number), "foo".into()]
+                    hashset![
+                        "year:2021".into(),
+                        format!("month:{}", number),
+                        "foo".into()
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1615,7 +1611,10 @@ mod test {
         // Let's add the "foo" tag to the second image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-02-01T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes
+                .get(&"2021-02-01T00:00:00Z".parse()?)
+                .unwrap()
+                .clone(),
             tag: "foo".into(),
             category: None,
             action: Action::Add,
@@ -1720,7 +1719,11 @@ mod test {
                             "bar".into()
                         ]
                     } else {
-                        hashset!["year:2021".into(), format!("month:{}", number), "foo".into()]
+                        hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into()
+                        ]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1791,7 +1794,11 @@ mod test {
                             "bar".into()
                         ]
                     } else {
-                        hashset!["year:2021".into(), format!("month:{}", number), "bar".into()]
+                        hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "bar".into()
+                        ]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1924,14 +1931,22 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
-                        4 => hashset!["year:2021".into(), format!("month:{}", number), "bar".into()],
+                        4 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "bar".into()
+                        ],
                         3 => hashset![
                             "year:2021".into(),
                             format!("month:{}", number),
                             "foo".into(),
                             "bar".into()
                         ],
-                        2 => hashset!["year:2021".into(), format!("month:{}", number), "foo".into()],
+                        2 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into()
+                        ],
                         _ => unreachable!(),
                     }
                 )))
@@ -1997,14 +2012,22 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
-                        4 => hashset!["year:2021".into(), format!("month:{}", number), "bar".into()],
+                        4 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "bar".into()
+                        ],
                         3 => hashset![
                             "year:2021".into(),
                             format!("month:{}", number),
                             "foo".into(),
                             "bar".into()
                         ],
-                        2 => hashset!["year:2021".into(), format!("month:{}", number), "foo".into()],
+                        2 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into()
+                        ],
                         _ => hashset!["year:2021".into(), format!("month:{}", number)],
                     }
                 )))
@@ -2014,7 +2037,10 @@ mod test {
         // Let's add the "baz" tag to the fourth image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes
+                .get(&"2021-04-01T00:00:00Z".parse()?)
+                .unwrap()
+                .clone(),
             tag: "baz".into(),
             category: None,
             action: Action::Add,
@@ -2179,7 +2205,10 @@ mod test {
         // Let's remove the "bar" tag from the third image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-03-01T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes
+                .get(&"2021-03-01T00:00:00Z".parse()?)
+                .unwrap()
+                .clone(),
             tag: "bar".into(),
             category: None,
             action: Action::Remove,
@@ -2260,7 +2289,11 @@ mod test {
                             "bar".into(),
                             "baz".into()
                         ],
-                        3 | 2 => hashset!["year:2021".into(), format!("month:{}", number), "foo".into()],
+                        3 | 2 => hashset![
+                            "year:2021".into(),
+                            format!("month:{}", number),
+                            "foo".into()
+                        ],
                         _ => hashset!["year:2021".into(), format!("month:{}", number)],
                     }
                 )))
@@ -2305,7 +2338,10 @@ mod test {
                     .path("/tags")
                     .header("authorization", format!("Bearer {}", token))
                     .json(&Patch {
-                        hash: hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap().clone(),
+                        hash: hashes
+                            .get(&"2021-04-01T00:00:00Z".parse()?)
+                            .unwrap()
+                            .clone(),
                         tag: "baz".into(),
                         category: Some(category.into()),
                         action,
@@ -2320,7 +2356,10 @@ mod test {
         // Let's add the "public" tag to the fourth image.
 
         let patch = Patch {
-            hash: hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap().clone(),
+            hash: hashes
+                .get(&"2021-04-01T00:00:00Z".parse()?)
+                .unwrap()
+                .clone(),
             tag: "public".into(),
             category: None,
             action: Action::Add,
@@ -2338,7 +2377,11 @@ mod test {
 
         // GET /images with no authorization header should yield any images tagged "public".
 
-        let response = warp::test::request().method("GET").path("/images").reply(&routes).await;
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .reply(&routes)
+            .await;
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -2368,7 +2411,11 @@ mod test {
 
         // GET /tags with no authorization header should yield the tags applied to any images tagged "public".
 
-        let response = warp::test::request().method("GET").path("/tags").reply(&routes).await;
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags")
+            .reply(&routes)
+            .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -2475,7 +2522,9 @@ mod test {
 
                 assert_eq!(response.status(), StatusCode::OK);
 
-                let image = image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)?.to_rgb8();
+                let image =
+                    image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)?
+                        .to_rgb8();
 
                 assert_eq!(
                     (image.width(), image.height()),
@@ -2488,7 +2537,10 @@ mod test {
 
                 for _ in 0..10 {
                     assert!(close_enough(
-                        *image.get_pixel(random.gen_range(0..image.width()), random.gen_range(0..image.height())),
+                        *image.get_pixel(
+                            random.gen_range(0..image.width()),
+                            random.gen_range(0..image.height())
+                        ),
                         color
                     ));
                 }

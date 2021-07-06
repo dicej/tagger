@@ -1,0 +1,16 @@
+# This is a configuration file for the bacon tool
+# More info at https://github.com/Canop/bacon
+
+default_job = "clippy"
+
+[jobs]
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--all-targets", "--color", "always"]
+need_stdout = false
+watch = ["build.rs", "tests", "benches", "examples"]
+
+[jobs.test]
+command = ["cargo", "test", "--release", "--color", "always"]
+need_stdout = true
+watch = ["build.rs", "tests"]

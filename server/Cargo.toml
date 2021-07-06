@@ -7,7 +7,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", features = [ "serde" ] }
+chrono = "0.4"
 futures = "0.3"
 http = "0.2"
 hyper = "0.14"
@@ -32,7 +32,7 @@ rand = "0.8"
 tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time", "sync" ] }
 tracing = { version = "0.1", features = [ "log" ] }
 warp = { version = "0.3", features = [ "tls" ] }
-lalrpop-util = "0.19"
+tagger-shared = { path = "../shared" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -43,4 +43,3 @@ anyhow = "1"
 schema = { path = "./schema" }
 sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs" ] }
-lalrpop = "0.19"

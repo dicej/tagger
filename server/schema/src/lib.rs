@@ -29,7 +29,7 @@ pub static DDL_STATEMENTS: &[&str] = &[
        FOREIGN KEY (parent) REFERENCES categories(name) ON DELETE CASCADE
      )",
     "INSERT INTO categories (name, parent, immutable)
-     VALUES ('year', NULL, 1), ('month', 'year', 1)",
+     VALUES ('year', NULL, 1), ('month', 'year', 1) ON CONFLICT DO NOTHING",
     "CREATE TABLE IF NOT EXISTS users (
        name          TEXT NOT NULL,
        password_hash TEXT NOT NULL,

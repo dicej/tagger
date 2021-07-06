@@ -3,12 +3,15 @@ name = "tagger-client"
 description = "Image tagging webapp frontend"
 version = "0.1.0"
 authors = ["Joel Dice <joel.dice@gmail.com>"]
+edition = "2018"
 
 [dependencies]
-im = { git = "https://github.com/bodil/im-rs", features = ["serde"] }
-serde = "*"
-serde_derive = "*"
-serde_json = "*"
-stdweb = "*"
-failure = "*"
-render = { path = "../render", features = ["stdweb", "im"] }
+tagger-shared = { path = "../shared" }
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-console-logger = "0.1"
+reqwest = { version = "0.11", features = ["json"] }
+sycamore = "0.5.0-beta.1"
+log = "0.4"
+futures = "0.3"
+anyhow = "1"
+web-sys = { version = "0.3", features = ["Window", "Location"] }

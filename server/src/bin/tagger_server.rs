@@ -1,0 +1,39 @@
+#![deny(warnings)]
+
+use anyhow::Result;
+use std::{process, sync::Arc, time::Duration};
+use structopt::StructOpt;
+use tagger_server::Options;
+use tokio::{sync::Mutex as AsyncMutex, task, time};
+use tracing::error;
+
+const SYNC_INTERVAL_SECONDS: u64 = 10;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    pretty_env_logger::init_timed();
+
+    let options = Arc::new(Options::from_args());
+
+    let conn = Arc::new(AsyncMutex::new(
+        tagger_server::open(&options.state_file).await?,
+    ));
+
+    tagger_server::sync(&conn, &options.image_directory).await?;
+
+    task::spawn({
+        let options = options.clone();
+        let conn = conn.clone();
+
+        async move {
+            time::sleep(Duration::from_secs(SYNC_INTERVAL_SECONDS)).await;
+
+            if let Err(e) = tagger_server::sync(&conn, &options.image_directory).await {
+                error!("sync error: {:?}", e);
+                process::exit(-1)
+            }
+        }
+    });
+
+    tagger_server::serve(&conn, &options).await
+}
