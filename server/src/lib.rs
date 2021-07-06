@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Error, Result};
 use chrono::{DateTime, Datelike, Utc};
 use futures::{
-    future::{self, BoxFuture, FutureExt, TryFutureExt},
+    future::{BoxFuture, FutureExt, TryFutureExt},
     stream::TryStreamExt,
 };
 use http::{
@@ -29,7 +29,8 @@ use sqlx::{
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
-    fmt::Write,
+    fmt::Write as _,
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddrV4,
     num::NonZeroU32,
     ops::DerefMut,
@@ -41,14 +42,15 @@ use std::{
 };
 use structopt::StructOpt;
 use tagger_shared::{
-    tag_expression::TagExpression, ImageData, ImagesQuery, ImagesResponse, TagsQuery, TagsResponse,
-    TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
+    tag_expression::TagExpression, ImageData, ImageQuery, ImagesQuery, ImagesResponse, TagsQuery,
+    TagsResponse, ThumbnailSize, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
 };
+use tempfile::NamedTempFile;
 use tokio::{
     fs::{self, File},
     io::AsyncReadExt,
     sync::Mutex as AsyncMutex,
-    time,
+    task, time,
 };
 use tracing::{info, warn};
 use warp::{Filter, Rejection, Reply};
@@ -528,13 +530,6 @@ fn bound(
     }
 }
 
-#[derive(Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-enum ThumbnailSize {
-    Small,
-    Large,
-}
-
 async fn thumbnail(
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
@@ -573,6 +568,33 @@ async fn thumbnail(
                 .resize(width, height, FilterType::Lanczos3)
                 .write_to(&mut encoded, ImageOutputFormat::Jpeg(JPEG_QUALITY))?;
 
+            let metadata = Metadata::new_from_buffer(&image)
+                .map(|metadata| {
+                    let orientation = metadata.get_orientation();
+                    metadata.clear();
+                    metadata.set_orientation(orientation);
+                    metadata
+                })
+                .ok();
+
+            if let Some(metadata) = &metadata {
+                task::block_in_place(|| {
+                    let mut file = NamedTempFile::new()?;
+
+                    file.write_all(&encoded)?;
+
+                    metadata.save_to_file(file.path())?;
+
+                    file.seek(SeekFrom::Start(0))?;
+
+                    encoded.clear();
+
+                    file.read_to_end(&mut encoded)?;
+
+                    Ok::<_, Error>(())
+                })?;
+            }
+
             Ok::<_, Error>(encoded)
         };
 
@@ -593,18 +615,20 @@ async fn thumbnail(
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct ImageQuery {
-    size: Option<ThumbnailSize>,
-}
-
 async fn image(
-    auth: Option<&Authorization>,
+    mut auth: Option<Arc<Authorization>>,
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
     path: &str,
     query: &ImageQuery,
+    auth_key: &[u8],
 ) -> Result<Response<Body>> {
+    if auth.is_none() {
+        if let Some(token) = &query.token {
+            auth = Some(authorize(token, auth_key)?);
+        }
+    }
+
     if auth.is_none()
         && sqlx::query!(
             "SELECT 1 as x FROM tags WHERE hash = ?1 AND tag = 'public' AND category IS NULL",
@@ -802,24 +826,20 @@ impl FromStr for Bearer {
     }
 }
 
-fn authorize(header: Option<Bearer>, key: &[u8]) -> Result<Option<Arc<Authorization>>, Rejection> {
-    Ok(if let Some(token) = header.map(|h| h.body) {
-        Some(Arc::new(
-            jsonwebtoken::decode::<Authorization>(
-                &token,
-                &DecodingKey::from_secret(key),
-                &Validation::new(Algorithm::HS256),
-            )
-            .map_err(|e| {
-                warn!("received invalid token: {}: {:?}", token, e);
+fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpError> {
+    Ok(Arc::new(
+        jsonwebtoken::decode::<Authorization>(
+            &token,
+            &DecodingKey::from_secret(key),
+            &Validation::new(Algorithm::HS256),
+        )
+        .map_err(|e| {
+            warn!("received invalid token: {}: {:?}", token, e);
 
-                HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
-            })?
-            .claims,
-        ))
-    } else {
-        None
-    })
+            HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
+        })?
+        .claims,
+    ))
 }
 
 fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Option<Arc<Authorization>>) {
@@ -851,8 +871,15 @@ fn routes(
 
     let auth_mutex = Arc::new(AsyncMutex::new(()));
 
-    let auth = warp::header::optional::<Bearer>("authorization")
-        .and_then(move |header| future::ready(authorize(header, &auth_key)));
+    let auth = warp::header::optional::<Bearer>("authorization").and_then(
+        move |header: Option<Bearer>| async move {
+            Ok::<_, Rejection>(if let Some(token) = header.map(|h| h.body) {
+                Some(authorize(&token, &auth_key)?)
+            } else {
+                None
+            })
+        },
+    );
 
     warp::post()
         .and(warp::path("token"))
@@ -957,11 +984,12 @@ fn routes(
 
                                     async move {
                                         image(
-                                            auth.as_deref(),
+                                            auth,
                                             &conn,
                                             &options.image_directory,
                                             &hash,
                                             &query,
+                                            &auth_key,
                                         )
                                         .await
                                     }
@@ -1092,7 +1120,6 @@ mod test {
     use rand::{rngs::StdRng, SeedableRng};
     use std::iter;
     use tempfile::TempDir;
-    use tokio::task;
 
     fn parse_te(s: &str) -> Result<TagExpression> {
         s.parse().map_err(|e| anyhow!("{:?}", e))

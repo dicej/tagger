@@ -29,6 +29,7 @@ ring = "0.16"
 base64 = "0.13"
 jsonwebtoken = "7"
 rand = "0.8"
+tempfile = "3"
 tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time", "sync" ] }
 tracing = { version = "0.1", features = [ "log" ] }
 warp = { version = "0.3", features = [ "tls" ] }

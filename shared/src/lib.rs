@@ -81,3 +81,16 @@ pub struct ImagesResponse {
     pub total: u32,
     pub images: HashMap<String, ImageData>,
 }
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum ThumbnailSize {
+    Small,
+    Large,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ImageQuery {
+    pub size: Option<ThumbnailSize>,
+    pub token: Option<String>,
+}
