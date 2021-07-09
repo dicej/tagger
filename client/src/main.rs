@@ -85,10 +85,10 @@ fn main() -> Result<()> {
             vec.sort_by(|a, b| {
                 images_response
                     .images
-                    .get(a.deref())
+                    .get(b.deref())
                     .unwrap()
                     .datetime
-                    .cmp(&images_response.images.get(b.deref()).unwrap().datetime)
+                    .cmp(&images_response.images.get(a.deref()).unwrap().datetime)
             });
 
             image_vec.set(vec);
@@ -100,21 +100,38 @@ fn main() -> Result<()> {
         })
     });
 
+    let image_keys = KeyedProps {
+        iterable: image_vec.handle(),
+        template: move |hash| {
+            let href = syc::create_memo({
+                let hash = hash.clone();
+                let root = root.clone();
+                let token = token.clone();
+
+                move || format!("{}/image/{}?token={}", root, hash, token.get())
+            });
+
+            let src = syc::create_memo({
+                let hash = hash.clone();
+                let root = root.clone();
+                let token = token.clone();
+
+                move || format!("{}/image/{}?token={}&size=small", root, hash, token.get())
+            });
+
+            template! {
+                a(href=href.get()) {
+                    img(src=src.get())
+                }
+            }
+        },
+        key: |hash| hash.clone(),
+    };
+
     syc::render(move || {
         template! {
             div {
-                Keyed(KeyedProps {
-                    iterable: image_vec.handle(),
-                    template: move |hash| {
-                        let root = root.clone();
-                        let token = token.clone();
-
-                        template! {
-                            img(src=format!("{}/image/{}?size=small&token={}", root, hash, token.get()))
-                        }
-                    },
-                    key: |hash| hash.clone(),
-                })
+                Keyed(image_keys)
             }
             pre { (tags.get()) }
             pre { (images.get()) }
