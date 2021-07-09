@@ -112,7 +112,6 @@ fn main() -> Result<()> {
             });
 
             let src = syc::create_memo({
-                let hash = hash.clone();
                 let root = root.clone();
                 let token = token.clone();
 
