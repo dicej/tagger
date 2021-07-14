@@ -10,5 +10,9 @@ serde_derive = "1"
 lalrpop-util = "0.19"
 chrono = { version = "0.4", features = [ "serde" ] }
 
+[dev-dependencies]
+maplit = "1"
+anyhow = "1"
+
 [build-dependencies]
 lalrpop = "0.19"

@@ -1,4 +1,4 @@
-use crate::tag_expression::TagExpression;
+use crate::tag_expression::{TagExpression, Tag};
 
 grammar;
 
@@ -13,14 +13,14 @@ And = {
 }
 
 Term: Box<TagExpression> = {
-    <category:Name> ":" <tag:Name> => Box::new(TagExpression::Tag {
+    <category:Name> ":" <tag:Name> => Box::new(TagExpression::Tag(Tag {
       category: Some(category.to_owned()),
-      tag: tag.to_owned()
-    }),
-     <tag:Name> => Box::new(TagExpression::Tag {
+      value: tag.to_owned()
+    })),
+     <tag:Name> => Box::new(TagExpression::Tag(Tag {
        category: None,
-       tag: tag.to_owned()
-    }),
+       value: tag.to_owned()
+    })),
     "(" <s:TagExpression> ")" => s
 }
 

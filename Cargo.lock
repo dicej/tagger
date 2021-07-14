@@ -1574,26 +1574,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ref-cast"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "300f2a835d808734ee295d45007adacb9ebb29dd3ae2424acfa17930cae541da"
-dependencies = [
- "ref-cast-impl",
-]
-
-[[package]]
-name = "ref-cast-impl"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c38e3aecd2b21cb3959637b883bb3714bc7e43f0268b9a29d3743ee3e55cdd2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "regex"
 version = "1.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2045,13 +2025,14 @@ dependencies = [
 
 [[package]]
 name = "sycamore"
-version = "0.5.0-beta.1"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47974ea524002f184222435e97a193deb8db58fd85e33c9965fa2b13fd6dc2b0"
+checksum = "9870ca801d5a92562dbc06bb0148c2ddb3d1127ea753abb7872d5063f4a6c303"
 dependencies = [
  "chrono",
+ "indexmap",
  "js-sys",
- "ref-cast",
+ "smallvec",
  "sycamore-macro",
  "wasm-bindgen",
  "web-sys",
@@ -2059,9 +2040,9 @@ dependencies = [
 
 [[package]]
 name = "sycamore-macro"
-version = "0.5.0-beta.1"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f486647fd2b0dd2870da2a8e5e0b9c9d7d753cacf7cb4728284f1dc55f83d67b"
+checksum = "03839201087c16ce78e4cce0f1bc587f55b663cf334a46a48d8225aa9974f80d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2087,6 +2068,7 @@ dependencies = [
  "futures",
  "log",
  "reqwest",
+ "serde",
  "sycamore",
  "tagger-shared",
  "wasm-bindgen-console-logger",
@@ -2133,9 +2115,11 @@ dependencies = [
 name = "tagger-shared"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "lalrpop",
  "lalrpop-util",
+ "maplit",
  "serde",
  "serde_derive",
 ]

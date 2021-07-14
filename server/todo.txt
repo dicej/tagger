@@ -1,6 +1,0 @@
-work on front end
-video support
-modularize
-break up tests
-document
-announce

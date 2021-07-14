@@ -1121,59 +1121,6 @@ mod test {
     use std::iter;
     use tempfile::TempDir;
 
-    fn parse_te(s: &str) -> Result<TagExpression> {
-        s.parse().map_err(|e| anyhow!("{:?}", e))
-    }
-
-    fn cat_tag(category: &str, tag: &str) -> TagExpression {
-        TagExpression::Tag {
-            category: Some(category.into()),
-            tag: tag.into(),
-        }
-    }
-
-    fn tag(tag: &str) -> TagExpression {
-        TagExpression::Tag {
-            category: None,
-            tag: tag.into(),
-        }
-    }
-
-    fn and(a: TagExpression, b: TagExpression) -> TagExpression {
-        TagExpression::And(Box::new(a), Box::new(b))
-    }
-
-    fn or(a: TagExpression, b: TagExpression) -> TagExpression {
-        TagExpression::Or(Box::new(a), Box::new(b))
-    }
-
-    #[test]
-    fn tags() -> Result<()> {
-        assert_eq!(tag("foo"), parse_te("foo")?);
-        assert_eq!(tag("foo"), parse_te("(foo)")?);
-        assert_eq!(cat_tag("um", "foo"), parse_te("um:foo")?);
-        assert_eq!(and(tag("foo"), tag("bar")), parse_te("foo and bar")?);
-        assert_eq!(or(tag("foo"), tag("bar")), parse_te("foo or bar")?);
-        assert_eq!(
-            or(tag("foo"), and(tag("bar"), tag("baz"))),
-            parse_te("foo or (bar and baz)")?
-        );
-        assert_eq!(
-            or(tag("foo"), and(tag("bar"), tag("baz"))),
-            parse_te("foo or bar and baz")?
-        );
-        assert_eq!(
-            and(or(tag("foo"), cat_tag("wat", "bar")), tag("baz")),
-            parse_te("(foo or wat:bar) and baz")?
-        );
-        assert_eq!(
-            and(or(tag("foo"), tag("bar")), tag("baz")),
-            parse_te("((foo or bar) and baz)")?
-        );
-
-        Ok(())
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_works() -> Result<()> {
         pretty_env_logger::init_timed();

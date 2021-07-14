@@ -56,7 +56,7 @@ pub struct TagsQuery {
     pub filter: Option<TagExpression>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Default, Clone)]
 pub struct TagsResponse {
     pub categories: HashMap<String, TagsResponse>,
     pub tags: HashMap<String, u32>,
@@ -75,7 +75,7 @@ pub struct ImageData {
     pub tags: HashSet<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ImagesResponse {
     pub start: u32,
     pub total: u32,
