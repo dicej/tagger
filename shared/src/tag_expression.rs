@@ -55,8 +55,8 @@ impl Display for TagExpression {
                     write!(f, "{}", tag.value)
                 }
             }
-            TagExpression::And(a, b) => write!(f, "({} AND {})", a, b),
-            TagExpression::Or(a, b) => write!(f, "({} OR {})", a, b),
+            TagExpression::And(a, b) => write!(f, "({} and {})", a, b),
+            TagExpression::Or(a, b) => write!(f, "({} or {})", a, b),
         }
     }
 }

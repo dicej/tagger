@@ -42,8 +42,9 @@ use std::{
 };
 use structopt::StructOpt;
 use tagger_shared::{
-    tag_expression::TagExpression, ImageData, ImageQuery, ImagesQuery, ImagesResponse, TagsQuery,
-    TagsResponse, ThumbnailSize, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
+    tag_expression::{Tag, TagExpression},
+    ImageData, ImageQuery, ImagesQuery, ImagesResponse, TagsQuery, TagsResponse, ThumbnailSize,
+    TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -296,7 +297,7 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
 
 fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
     match expression {
-        TagExpression::Tag { category, .. } => buffer.push_str(if category.is_some() {
+        TagExpression::Tag(tag) => buffer.push_str(if tag.category.is_some() {
             "EXISTS (SELECT * FROM tags WHERE hash = i.hash AND category = ? AND tag = ?)"
         } else {
             "EXISTS (SELECT * FROM tags WHERE hash = i.hash AND category IS NULL AND tag = ?)"
@@ -844,10 +845,10 @@ fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpError> {
 
 fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Option<Arc<Authorization>>) {
     if auth.is_none() {
-        let tag = TagExpression::Tag {
+        let tag = TagExpression::Tag(Tag {
             category: None,
-            tag: "public".into(),
-        };
+            value: "public".into(),
+        });
 
         if let Some(inner) = filter.take() {
             *filter = Some(TagExpression::And(Box::new(inner), Box::new(tag)));

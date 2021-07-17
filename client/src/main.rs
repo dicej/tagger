@@ -4,7 +4,7 @@ use anyhow::{anyhow, Error, Result};
 use futures::future::TryFutureExt;
 use reqwest::Client;
 use serde::Deserialize;
-use std::{collections::HashMap, ops::Deref, rc::Rc};
+use std::{collections::HashMap, fmt, ops::Deref, panic, rc::Rc};
 use sycamore::prelude::{
     self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
 };
@@ -13,52 +13,41 @@ use tagger_shared::{
     GrantType, ImagesResponse, TagsResponse, TokenRequest, TokenSuccess,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum List<T> {
     Nil,
     Cons(Rc<(T, List<T>)>),
 }
 
-struct TagMenuProps {
-    state: Rc<State>,
-    filter_tree: StateHandle<TagTree>,
-    filter_chain: List<Tag>,
-    tags: StateHandle<TagsResponse>,
-    category: Option<Rc<str>>,
-}
-
 fn find_categories<'a>(
     filter_chain: &List<Tag>,
     categories: &'a HashMap<String, TagsResponse>,
-) -> &'a HashMap<String, TagsResponse> {
+) -> Option<&'a HashMap<String, TagsResponse>> {
     if let List::Cons(cons) = filter_chain {
         let next = find_categories(&cons.1, categories);
         if let Some(category) = cons.0.category.as_ref() {
-            &next.get(category).unwrap().categories
+            next.and_then(|next| next.get(category).map(|tags| &tags.categories))
         } else {
-            &next
+            next
         }
     } else {
-        categories
+        Some(categories)
     }
 }
 
-fn to_expression(mut filter_chain: &List<Tag>) -> Option<TagExpression> {
-    let mut expression = None;
-    loop {
+fn to_tree(filter_chain: &List<Tag>) -> TagTree {
+    fn recurse(filter_chain: &List<Tag>, tree: TagTree) -> TagTree {
         match filter_chain {
-            List::Nil => break expression,
+            List::Nil => tree,
             List::Cons(cons) => {
-                let tag = TagExpression::Tag(cons.0.clone());
-                expression = Some(if let Some(expression) = expression {
-                    TagExpression::And(Box::new(tag), Box::new(expression))
-                } else {
-                    tag
-                });
-                filter_chain = &cons.1;
+                let mut parent = TagTree::default();
+                parent.0.insert(cons.0.clone(), recurse(&cons.1, tree));
+                parent
             }
         }
     }
+
+    recurse(filter_chain, TagTree::default())
 }
 
 fn find_tag<'a>(
@@ -80,11 +69,98 @@ fn find_tag<'a>(
     }
 }
 
+fn resolve<'a>(filter_chain: &List<Tag>, filter: &'a TagTree) -> Option<&'a TagTree> {
+    match filter_chain {
+        List::Nil => Some(filter),
+        List::Cons(cons) => resolve(&cons.1, filter).and_then(|tree| tree.0.get(&cons.0)),
+    }
+}
+
+fn resolve_mut<'a>(filter_chain: &List<Tag>, filter: &'a mut TagTree) -> Option<&'a mut TagTree> {
+    match filter_chain {
+        List::Nil => Some(filter),
+        List::Cons(cons) => resolve_mut(&cons.1, filter).and_then(|tree| tree.0.get_mut(&cons.0)),
+    }
+}
+
+fn is_filtered(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> bool {
+    resolve(filter_chain, filter)
+        .map(|tree| tree.0.contains_key(tag))
+        .unwrap_or(false)
+}
+
+struct TagMenuItemProps {
+    state: Rc<State>,
+    tag: Tag,
+    filter: Signal<TagTree>,
+    filter_chain: List<Tag>,
+}
+
+#[component(TagMenuItem<G>)]
+fn tag_menu_item(props: TagMenuItemProps) -> Template<G> {
+    let TagMenuItemProps {
+        state,
+        tag,
+        filter,
+        filter_chain,
+    } = props;
+
+    let tag_menu = {
+        let tag = tag.clone();
+        let filter_chain = filter_chain.clone();
+        let filter = filter.clone();
+
+        move || {
+            let filter_chain = List::Cons(Rc::new((tag.clone(), filter_chain.clone())));
+
+            TagMenuProps {
+                state: state.clone(),
+                filter: filter.clone(),
+                filter_chain: filter_chain.clone(),
+                tags: watch::<TagsResponse>(
+                    "tags",
+                    state.clone(),
+                    Signal::new(to_tree(&filter_chain)).into_handle(),
+                ),
+                category: None,
+            }
+        }
+    };
+
+    tag_menu();
+
+    let is_filtered =
+        syc::create_selector(move || is_filtered(&filter_chain, filter.get().deref(), &tag));
+
+    template! {
+        (if *is_filtered.get() {
+            let tag_menu = tag_menu();
+            template! {
+                ul {
+                    TagMenu(tag_menu)
+                }
+            }
+        } else {
+            template! {
+
+            }
+        })
+    }
+}
+
+struct TagMenuProps {
+    state: Rc<State>,
+    filter: Signal<TagTree>,
+    filter_chain: List<Tag>,
+    tags: StateHandle<TagsResponse>,
+    category: Option<Rc<str>>,
+}
+
 #[component(TagMenu<G>)]
 fn tag_menu(props: TagMenuProps) -> Template<G> {
     let TagMenuProps {
         state,
-        filter_tree,
+        filter,
         filter_chain,
         tags,
         category,
@@ -92,13 +168,17 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
 
     let categories = if category.is_none() {
         let categories = KeyedProps {
-            iterable: syc::create_memo({
+            iterable: syc::create_selector({
                 let tags = tags.clone();
+                let filter_chain = filter_chain.clone();
 
                 move || {
                     let tags = tags.get();
 
+                    let empty = HashMap::new();
+
                     let mut vec = find_categories(&filter_chain, &tags.categories)
+                        .unwrap_or(&empty)
                         .iter()
                         .map(|(category, _)| category.clone())
                         .collect::<Vec<_>>();
@@ -109,20 +189,27 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                 }
             }),
 
-            template: move |category| {
-                let tag_menu = TagMenuProps {
-                    state,
-                    filter_tree,
-                    filter_chain,
-                    tags,
-                    category: Some(Rc::from(category)),
-                };
+            template: {
+                let filter_chain = filter_chain.clone();
+                let tags = tags.clone();
+                let state = state.clone();
+                let filter = filter.clone();
 
-                template! {
-                    li {
-                        (category)
-                        ul {
-                            TagMenu(tag_menu)
+                move |category| {
+                    let tag_menu = TagMenuProps {
+                        state: state.clone(),
+                        filter: filter.clone(),
+                        filter_chain: filter_chain.clone(),
+                        tags: tags.clone(),
+                        category: Some(Rc::from(category.clone())),
+                    };
+
+                    template! {
+                        li {
+                            (category)
+                            ul {
+                                TagMenu(tag_menu)
+                            }
                         }
                     }
                 }
@@ -139,65 +226,93 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
     };
 
     let tags = KeyedProps {
-        iterable: syc::create_memo(move || {
-            let tags = tags.get();
+        iterable: syc::create_selector({
+            let category = category.clone();
+            let filter_chain = filter_chain.clone();
 
-            let mut vec = if let Some(category) = category {
-                find_categories(&filter_chain, &tags.categories)
-                    .get(category.deref())
-                    .unwrap()
-            } else {
-                tags.deref()
-            }
-            .tags
-            .iter()
-            .filter_map(|(tag, count)| {
-                if find_tag(&filter_chain, category.as_deref(), tag).is_none() {
-                    Some((tag.clone(), *count))
+            move || {
+                let tags = tags.get();
+
+                let empty = TagsResponse::default();
+
+                let mut vec = if let Some(category) = &category {
+                    find_categories(&filter_chain, &tags.categories)
+                        .and_then(|categories| categories.get(category.deref()))
+                        .unwrap_or(&empty)
                 } else {
-                    None
+                    tags.deref()
                 }
-            })
-            .collect::<Vec<_>>();
+                .tags
+                .iter()
+                .filter_map(|(tag, count)| {
+                    if find_tag(&filter_chain, category.as_deref(), tag).is_none() {
+                        Some((tag.clone(), *count))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
 
-            vec.sort_by(|(a, _), (b, _)| a.cmp(b));
+                vec.sort_by(|(a, _), (b, _)| a.cmp(b));
 
-            vec
+                vec
+            }
         }),
 
-        template: move |(tag, count)| {
+        template: move |(tag_value, count)| {
             let tag = Tag {
                 category: category.as_deref().map(String::from),
-                value: tag.clone(),
+                value: tag_value.clone(),
             };
 
-            let sub_list = if let Some(filter_tree) = filter_tree.get().0.get(&tag) {
-                let filter_chain = List::Cons(Rc::new((tag, filter_chain)));
+            let item = TagMenuItemProps {
+                state: state.clone(),
+                tag: tag.clone(),
+                filter: filter.clone(),
+                filter_chain: filter_chain.clone(),
+            };
 
-                let tag_menu = TagMenuProps {
-                    state,
-                    filter_tree: Signal::new(filter_tree.clone()).into_handle(),
-                    filter_chain,
-                    tags: watch::<TagsResponse>(
-                        "tags",
-                        state,
-                        Signal::new(to_expression(&filter_chain)).into_handle(),
-                    ),
-                    category: None,
-                };
+            let is_filtered = syc::create_selector({
+                let filter_chain = filter_chain.clone();
+                let filter = filter.clone();
+                let tag = tag.clone();
 
-                template! {
-                    ul {
-                        TagMenu(tag_menu)
+                move || is_filtered(&filter_chain, filter.get().deref(), &tag)
+            });
+
+            let toggle = {
+                let filter_chain = filter_chain.clone();
+                let filter = filter.clone();
+                let is_filtered = is_filtered.clone();
+
+                move |_| {
+                    let mut new_filter = filter.get().deref().clone();
+                    if let Some(tree) = resolve_mut(&filter_chain, &mut new_filter) {
+                        if *is_filtered.get() {
+                            tree.0.remove(&tag);
+                        } else {
+                            tree.0.insert(tag.clone(), TagTree::default());
+                        }
+
+                        filter.set(new_filter);
                     }
                 }
-            } else {
-                template! {}
             };
 
             template! {
                 li {
-                    (tag.value) " (" (count) ")" (sub_list)
+                    a(href="javascript:void(0);", on:click=toggle) {
+                        (if *is_filtered.get() {
+                            template! {
+                                i(class="fa fa-check-square")
+                            }
+                        } else {
+                            template! {
+                                i(class="fa fa-square")
+                            }
+                        }) " " (tag_value) " (" (count) ")"
+                    }
+                    TagMenuItem(item)
                 }
             }
         },
@@ -223,7 +338,7 @@ fn images(props: ImagesProps) -> Template<G> {
     let ImagesProps { state, images } = props;
 
     let images = KeyedProps {
-        iterable: syc::create_memo(move || {
+        iterable: syc::create_selector(move || {
             let images = images.get();
 
             let mut vec = images
@@ -245,7 +360,7 @@ fn images(props: ImagesProps) -> Template<G> {
         }),
 
         template: move |hash| {
-            let href = syc::create_memo({
+            let href = syc::create_selector({
                 let hash = hash.clone();
                 let state = state.clone();
 
@@ -263,7 +378,7 @@ fn images(props: ImagesProps) -> Template<G> {
                 }
             });
 
-            let src = syc::create_memo({
+            let src = syc::create_selector({
                 let state = state.clone();
 
                 move || {
@@ -297,48 +412,51 @@ fn images(props: ImagesProps) -> Template<G> {
     }
 }
 
-fn watch<T: Default + for<'de> Deserialize<'de>>(
+fn watch<T: fmt::Debug + Default + for<'de> Deserialize<'de>>(
     uri: &'static str,
     state: Rc<State>,
-    filter: StateHandle<Option<TagExpression>>,
+    filter: StateHandle<TagTree>,
 ) -> StateHandle<T> {
     let signal = Signal::new(T::default());
 
-    syc::create_effect(move || {
-        let state = state.clone();
-        let token = state.token.get();
-        let filter = filter.get();
+    syc::create_effect({
+        let signal = signal.clone();
 
-        wasm_bindgen_futures::spawn_local(
-            {
-                let state = state.clone();
-                let signal = signal.clone();
+        move || {
+            let token = state.token.get();
+            let filter = filter.get();
 
-                async move {
-                    let mut request = state.client.get(format!(
-                        "{}/{}?filter={}",
-                        state.root,
-                        uri,
-                        if let Some(filter) = filter.deref() {
-                            filter.to_string()
-                        } else {
-                            String::new()
+            wasm_bindgen_futures::spawn_local(
+                {
+                    let state = state.clone();
+                    let signal = signal.clone();
+
+                    async move {
+                        let mut request = state.client.get(format!(
+                            "{}/{}{}",
+                            state.root,
+                            uri,
+                            if let Some(filter) = Option::<TagExpression>::from(filter.deref()) {
+                                format!("?filter={}", filter.to_string())
+                            } else {
+                                String::new()
+                            }
+                        ));
+
+                        if let Some(token) = token.deref() {
+                            request = request.header("authorization", &format!("Bearer {}", token));
                         }
-                    ));
 
-                    if let Some(token) = token.deref() {
-                        request = request.header("authorization", &format!("Bearer {}", token));
+                        signal.set(request.send().await?.json::<T>().await?);
+
+                        Ok::<_, Error>(())
                     }
-
-                    signal.set(request.send().await?.json::<T>().await?);
-
-                    Ok::<_, Error>(())
                 }
-            }
-            .unwrap_or_else(move |e| {
-                log::error!("error retrieving {}: {:?}", uri, e);
-            }),
-        )
+                .unwrap_or_else(move |e| {
+                    log::error!("error retrieving {}: {:?}", uri, e);
+                }),
+            )
+        }
     });
 
     signal.into_handle()
@@ -351,6 +469,8 @@ struct State {
 }
 
 fn main() -> Result<()> {
+    panic::set_hook(Box::new(console_error_panic_hook::hook));
+
     log::set_logger(&wasm_bindgen_console_logger::DEFAULT_LOGGER)
         .map_err(|e| anyhow!("{:?}", e))?;
     log::set_max_level(log::LevelFilter::Info);
@@ -369,7 +489,7 @@ fn main() -> Result<()> {
         client: Client::new(),
     });
 
-    let filter = Signal::new(None);
+    let filter = Signal::new(TagTree::default());
 
     let tags = watch::<TagsResponse>("tags", state.clone(), filter.handle());
 
@@ -404,11 +524,14 @@ fn main() -> Result<()> {
 
     let show_menu = Signal::new(true);
 
-    let images = ImagesProps { state, images };
+    let images = ImagesProps {
+        state: state.clone(),
+        images,
+    };
 
     let tag_menu = TagMenuProps {
         state,
-        filter_tree: syc::create_memo(move || TagTree::from(filter.get().as_ref().as_ref())),
+        filter,
         filter_chain: List::Nil,
         tags,
         category: None,
