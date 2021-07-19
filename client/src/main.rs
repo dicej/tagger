@@ -382,23 +382,7 @@ fn images(props: ImagesProps) -> Template<G> {
         }),
 
         template: move |hash| {
-            let src = syc::create_selector({
-                let hash = hash.clone();
-                let state = state.clone();
-
-                move || {
-                    format!(
-                        "{}/image/{}?size=small{}",
-                        state.root,
-                        hash,
-                        if let Some(token) = state.token.get().deref() {
-                            format!("&token={}", token)
-                        } else {
-                            String::new()
-                        }
-                    )
-                }
-            });
+            let src = format!("{}/image/{}?size=small", state.root, hash);
 
             let image = image_states.get().get(&hash).unwrap().clone();
 
@@ -477,7 +461,7 @@ fn images(props: ImagesProps) -> Template<G> {
 
             template! {
                 span(class=if *image.selected.get() { "thumbnail-selected" } else { "thumbnail" }) {
-                    img(src=src.get(),
+                    img(src=src,
                         class="thumbnail",
                         on:mousedown=down.clone(),
                         on:mouseup=up.clone(),
@@ -551,26 +535,24 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
 }
 
 fn full_size_image_url(state: Rc<State>, hash: &str) -> String {
-    format!(
-        "{}/image/{}{}",
-        state.root,
-        hash,
-        if let Some(token) = state.token.get().deref() {
-            format!("?token={}", token)
-        } else {
-            String::new()
-        }
-    )
+    format!("{}/image/{}?size=large", state.root, hash)
 }
 
 fn event_coordinates(event: Event) -> Option<(i32, i32)> {
     match event.dyn_into::<MouseEvent>() {
         Ok(event) => Some((event.client_x(), event.client_y())),
         Err(event) => match event.dyn_into::<TouchEvent>() {
-            Ok(event) => event
-                .changed_touches()
-                .get(0)
-                .map(|touch| (touch.client_x(), touch.client_y())),
+            Ok(event) => {
+                let touches = event.changed_touches();
+
+                if touches.length() == 1 {
+                    touches
+                        .get(0)
+                        .map(|touch| (touch.client_x(), touch.client_y()))
+                } else {
+                    None
+                }
+            }
             Err(_) => None,
         },
     }
@@ -707,7 +689,6 @@ fn main() -> Result<()> {
     }
 
     let next = {
-        let image_states = image_states.clone();
         let full_size_image = full_size_image.clone();
 
         move |direction| {

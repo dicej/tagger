@@ -1,15 +1,15 @@
 front end
-  browse by tag
   select and add or remove tags
     show div for adding or removing when at least one image selected
-  full size view with arrow and slide forward/back
+  zoom image from large to full size
+    and pan
+  shift select
   pagination
   login/logout
     disallow selection when logged out
   minimize expensive clones
   im-based iteration?
 video support
-split thumbnail cache into separate database (which need not be backed up)
 modularize
 break up tests
 document

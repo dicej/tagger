@@ -3,7 +3,10 @@
 use chrono::{DateTime, Utc};
 use lalrpop_util::lalrpop_mod;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::{self, Display},
+};
 use tag_expression::{Tag, TagExpression};
 
 pub mod tag_expression;
@@ -89,8 +92,16 @@ pub enum ThumbnailSize {
     Large,
 }
 
+impl Display for ThumbnailSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ThumbnailSize::Small => write!(f, "small"),
+            ThumbnailSize::Large => write!(f, "large"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImageQuery {
     pub size: Option<ThumbnailSize>,
-    pub token: Option<String>,
 }

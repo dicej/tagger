@@ -7,9 +7,7 @@ pub static DDL_STATEMENTS: &[&str] = &[
      )",
     "CREATE TABLE IF NOT EXISTS images (
        hash          TEXT NOT NULL PRIMARY KEY,
-       datetime      TEXT NOT NULL,
-       small         BLOB,
-       large         BLOB
+       datetime      TEXT NOT NULL
      )",
     "CREATE TABLE IF NOT EXISTS tags (
        hash          TEXT NOT NULL,

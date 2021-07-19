@@ -49,7 +49,7 @@ use tagger_shared::{
 use tempfile::NamedTempFile;
 use tokio::{
     fs::{self, File},
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::Mutex as AsyncMutex,
     task, time,
 };
@@ -59,9 +59,9 @@ use warp_util::HttpError;
 
 mod warp_util;
 
-const SMALL_BOUNDS: (u32, u32) = (320, 240);
+const SMALL_BOUNDS: (u32, u32) = (480, 320);
 
-const LARGE_BOUNDS: (u32, u32) = (1280, 960);
+const LARGE_BOUNDS: (u32, u32) = (1920, 1280);
 
 const JPEG_QUALITY: u8 = 90;
 
@@ -91,6 +91,15 @@ async fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
     File::open(path).await?.read_to_end(&mut buffer).await?;
 
     Ok(buffer)
+}
+
+async fn write<P: AsRef<Path>>(path: P, buffer: &[u8]) -> Result<()> {
+    File::create(path.as_ref())
+        .await?
+        .write_all(&buffer)
+        .await?;
+
+    Ok(())
 }
 
 fn hash(data: &[u8]) -> String {
@@ -534,26 +543,15 @@ fn bound(
 async fn thumbnail(
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
+    thumbnail_dir: &str,
     size: ThumbnailSize,
     path: &str,
 ) -> Result<Vec<u8>> {
-    let result = match size {
-        ThumbnailSize::Small => {
-            sqlx::query!("SELECT small FROM images WHERE hash = ?1 LIMIT 1", path)
-                .fetch_optional(conn.lock().await.deref_mut())
-                .await?
-                .and_then(|row| row.small)
-        }
+    let filename = format!("{}/{}/{}.jpg", thumbnail_dir, size, path);
 
-        ThumbnailSize::Large => {
-            sqlx::query!("SELECT large FROM images WHERE hash = ?1 LIMIT 1", path)
-                .fetch_optional(conn.lock().await.deref_mut())
-                .await?
-                .and_then(|row| row.large)
-        }
-    };
+    let result = content(&filename).await;
 
-    if let Some(result) = result {
+    if let Ok(result) = result {
         Ok(result)
     } else {
         let image = full_size_image(conn.lock().await.deref_mut(), image_dir, path).await?;
@@ -599,67 +597,30 @@ async fn thumbnail(
             Ok::<_, Error>(encoded)
         };
 
-        Ok(match size {
-            ThumbnailSize::Small => {
-                let resized = resize(SMALL_BOUNDS)?;
+        let resized = resize(match size {
+            ThumbnailSize::Small => SMALL_BOUNDS,
+            ThumbnailSize::Large => LARGE_BOUNDS,
+        })?;
 
-                sqlx::query!(
-                    "UPDATE images SET small = ?1 WHERE hash = ?2",
-                    resized,
-                    path
-                )
-                .execute(conn.lock().await.deref_mut())
-                .await?;
+        if let Some(parent) = Path::new(&filename).parent() {
+            let _ = fs::create_dir(parent).await;
+        }
 
-                resized
-            }
-            ThumbnailSize::Large => {
-                let resized = resize(LARGE_BOUNDS)?;
+        write(&filename, &resized).await?;
 
-                sqlx::query!(
-                    "UPDATE images SET large = ?1 WHERE hash = ?2",
-                    resized,
-                    path
-                )
-                .execute(conn.lock().await.deref_mut())
-                .await?;
-
-                resized
-            }
-        })
+        Ok(resized)
     }
 }
 
 async fn image(
-    mut auth: Option<Arc<Authorization>>,
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
+    thumbnail_dir: &str,
     path: &str,
     query: &ImageQuery,
-    auth_key: &[u8],
 ) -> Result<Response<Body>> {
-    if auth.is_none() {
-        if let Some(token) = &query.token {
-            auth = Some(authorize(token, auth_key)?);
-        }
-    }
-
-    if auth.is_none()
-        && sqlx::query!(
-            "SELECT 1 as x FROM tags WHERE hash = ?1 AND tag = 'public' AND category IS NULL",
-            path
-        )
-        .fetch_optional(conn.lock().await.deref_mut())
-        .await?
-        .is_none()
-    {
-        return Ok(response()
-            .status(StatusCode::UNAUTHORIZED)
-            .body(Body::empty())?);
-    }
-
     let image = if let Some(size) = query.size {
-        thumbnail(conn, image_dir, size, path).await
+        thumbnail(conn, image_dir, thumbnail_dir, size, path).await
     } else {
         full_size_image(conn.lock().await.deref_mut(), image_dir, path).await
     }?;
@@ -992,19 +953,17 @@ fn routes(
                                 let hash = Arc::<str>::from(hash);
 
                                 {
-                                    let auth = auth.clone();
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
 
                                     async move {
                                         image(
-                                            auth,
                                             &conn,
                                             &options.image_directory,
+                                            &options.thumbnail_directory,
                                             &hash,
                                             &query,
-                                            &auth_key,
                                         )
                                         .await
                                     }
@@ -1110,6 +1069,10 @@ pub struct Options {
     #[structopt(long)]
     pub image_directory: String,
 
+    /// Directory in which to cache generated thumbnail images
+    #[structopt(long)]
+    pub thumbnail_directory: String,
+
     /// SQLite database to create or reuse
     #[structopt(long)]
     pub state_file: String,
@@ -1166,8 +1129,14 @@ mod test {
 
         let conn = Arc::new(AsyncMutex::new(conn));
 
-        let tmp_dir = TempDir::new()?;
-        let image_directory = tmp_dir
+        let image_tmp_dir = TempDir::new()?;
+        let image_dir = image_tmp_dir
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid UTF-8"))?;
+
+        let thumbnail_tmp_dir = TempDir::new()?;
+        let thumbnail_dir = thumbnail_tmp_dir
             .path()
             .to_str()
             .ok_or_else(|| anyhow!("invalid UTF-8"))?;
@@ -1176,7 +1145,8 @@ mod test {
             &conn,
             &Arc::new(Options {
                 address: "0.0.0.0:0".parse()?,
-                image_directory: image_directory.to_owned(),
+                image_directory: image_dir.to_owned(),
+                thumbnail_directory: thumbnail_dir.to_owned(),
                 state_file: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 public_directory: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 cert_file: None,
@@ -1260,11 +1230,11 @@ mod test {
         assert_eq!(response.total, 0);
         assert!(response.images.is_empty());
 
-        // Let's add some images to `tmp_dir` and call `sync` to add them to the database.
+        // Let's add some images to `image_tmp_dir` and call `sync` to add them to the database.
 
         let image_count = 10_u32;
-        let image_width = 320;
-        let image_height = 240;
+        let image_width = 480;
+        let image_height = 320;
         let mut random = StdRng::seed_from_u64(42);
         let colors = (1..=image_count)
             .map(|number| {
@@ -1276,7 +1246,7 @@ mod test {
             .collect::<HashMap<_, _>>();
 
         for (&number, &color) in &colors {
-            let mut path = tmp_dir.path().to_owned();
+            let mut path = image_tmp_dir.path().to_owned();
             path.push(format!("{}.jpg", number));
 
             task::block_in_place(|| {
@@ -1293,7 +1263,7 @@ mod test {
             })?;
         }
 
-        sync(&conn, image_directory).await?;
+        sync(&conn, image_dir).await?;
 
         // GET /images with no authorization header should yield `OK` with an empty body since no images have been
         // tagged "public" yet.
@@ -2432,47 +2402,6 @@ mod test {
                 ]
             }
         );
-
-        // A GET /image/<hash> with no authorization header for an image not tagged "public" should yield
-        // `UNAUTHORIZED`.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path(&format!(
-                "/image/{}",
-                hashes.get(&"2021-02-01T00:00:00Z".parse()?).unwrap()
-            ))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // A GET /image/<hash> with no authorization header for an image tagged "public" should yield `OK`.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path(&format!(
-                "/image/{}",
-                hashes.get(&"2021-04-01T00:00:00Z".parse()?).unwrap()
-            ))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // A GET /image/<hash> with an invalid authorization header should yield `UNAUTHORIZED`.
-
-        let response = warp::test::request()
-            .method("GET")
-            .header("authorization", "Bearer invalid")
-            .path(&format!(
-                "/image/{}",
-                hashes.get(&"2021-02-01T00:00:00Z".parse()?).unwrap()
-            ))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // The images and thumbnails should contain the colors we specified above.
 
