@@ -406,8 +406,8 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
                         .get::<&str, _>(2)
                         .split(',')
                         .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect::<HashSet<_>>(),
+                        .map(Tag::from_str)
+                        .collect::<Result<HashSet<_>>>()?,
                 },
             );
         }
@@ -599,19 +599,33 @@ async fn thumbnail(
             Ok::<_, Error>(encoded)
         };
 
-        let small = resize(SMALL_BOUNDS)?;
-        sqlx::query!("UPDATE images SET small = ?1 WHERE hash = ?2", small, path)
-            .execute(conn.lock().await.deref_mut())
-            .await?;
-
-        let large = resize(LARGE_BOUNDS)?;
-        sqlx::query!("UPDATE images SET large = ?1 WHERE hash = ?2", large, path)
-            .execute(conn.lock().await.deref_mut())
-            .await?;
-
         Ok(match size {
-            ThumbnailSize::Small => small,
-            ThumbnailSize::Large => large,
+            ThumbnailSize::Small => {
+                let resized = resize(SMALL_BOUNDS)?;
+
+                sqlx::query!(
+                    "UPDATE images SET small = ?1 WHERE hash = ?2",
+                    resized,
+                    path
+                )
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+
+                resized
+            }
+            ThumbnailSize::Large => {
+                let resized = resize(LARGE_BOUNDS)?;
+
+                sqlx::query!(
+                    "UPDATE images SET large = ?1 WHERE hash = ?2",
+                    resized,
+                    path
+                )
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+
+                resized
+            }
         })
     }
 }
@@ -1329,7 +1343,7 @@ mod test {
             (1..=image_count)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".into(), format!("month:{}", number)]
+                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1358,7 +1372,7 @@ mod test {
             ((image_count - 1)..=image_count)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".into(), format!("month:{}", number)]
+                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1387,7 +1401,7 @@ mod test {
             (2..=3)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".into(), format!("month:{}", number)]
+                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1492,12 +1506,12 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
                         hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?
                         ]
                     } else {
-                        hashset!["year:2021".into(), format!("month:{}", number)]
+                        hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1575,9 +1589,9 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset![
-                        "year:2021".into(),
-                        format!("month:{}", number),
-                        "foo".into()
+                        "year:2021".parse()?,
+                        format!("month:{}", number).parse()?,
+                        "foo".parse()?
                     ]
                 )))
                 .collect::<Result<_>>()?
@@ -1688,16 +1702,16 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
                         hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into(),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?,
+                            "bar".parse()?
                         ]
                     } else {
                         hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?
                         ]
                     }
                 )))
@@ -1763,16 +1777,16 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
                         hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into(),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?,
+                            "bar".parse()?
                         ]
                     } else {
                         hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "bar".parse()?
                         ]
                     }
                 )))
@@ -1837,10 +1851,10 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset![
-                        "year:2021".into(),
-                        format!("month:{}", number),
-                        "foo".into(),
-                        "bar".into()
+                        "year:2021".parse()?,
+                        format!("month:{}", number).parse()?,
+                        "foo".parse()?,
+                        "bar".parse()?
                     ]
                 )))
                 .collect::<Result<_>>()?
@@ -1907,20 +1921,20 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
                         4 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "bar".parse()?
                         ],
                         3 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into(),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?,
+                            "bar".parse()?
                         ],
                         2 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?
                         ],
                         _ => unreachable!(),
                     }
@@ -1988,22 +2002,22 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
                         4 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "bar".parse()?
                         ],
                         3 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into(),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?,
+                            "bar".parse()?
                         ],
                         2 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?
                         ],
-                        _ => hashset!["year:2021".into(), format!("month:{}", number)],
+                        _ => hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -2057,16 +2071,16 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
                         4 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "bar".into(),
-                            "baz".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "bar".parse()?,
+                            "baz".parse()?
                         ],
                         3 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into(),
-                            "bar".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?,
+                            "bar".parse()?
                         ],
                         _ => unreachable!(),
                     }
@@ -2134,10 +2148,10 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset![
-                        "year:2021".into(),
-                        format!("month:{}", number),
-                        "bar".into(),
-                        "baz".into()
+                        "year:2021".parse()?,
+                        format!("month:{}", number).parse()?,
+                        "bar".parse()?,
+                        "baz".parse()?
                     ]
                 )))
                 .collect::<Result<_>>()?
@@ -2168,10 +2182,10 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset![
-                        "year:2021".into(),
-                        format!("month:{}", number),
-                        "foo".into(),
-                        "bar".into()
+                        "year:2021".parse()?,
+                        format!("month:{}", number).parse()?,
+                        "foo".parse()?,
+                        "bar".parse()?
                     ]
                 )))
                 .collect::<Result<_>>()?
@@ -2224,10 +2238,10 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset![
-                        "year:2021".into(),
-                        format!("month:{}", number),
-                        "bar".into(),
-                        "baz".into()
+                        "year:2021".parse()?,
+                        format!("month:{}", number).parse()?,
+                        "bar".parse()?,
+                        "baz".parse()?
                     ]
                 )))
                 .collect::<Result<_>>()?
@@ -2259,17 +2273,17 @@ mod test {
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
                         4 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "bar".into(),
-                            "baz".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "bar".parse()?,
+                            "baz".parse()?
                         ],
                         3 | 2 => hashset![
-                            "year:2021".into(),
-                            format!("month:{}", number),
-                            "foo".into()
+                            "year:2021".parse()?,
+                            format!("month:{}", number).parse()?,
+                            "foo".parse()?
                         ],
-                        _ => hashset!["year:2021".into(), format!("month:{}", number)],
+                        _ => hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -2299,7 +2313,7 @@ mod test {
             iter::once(7)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".into(), format!("month:{}", number)]
+                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -2374,11 +2388,11 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset![
-                        "year:2021".into(),
-                        format!("month:{}", number),
-                        "bar".into(),
-                        "baz".into(),
-                        "public".into()
+                        "year:2021".parse()?,
+                        format!("month:{}", number).parse()?,
+                        "bar".parse()?,
+                        "baz".parse()?,
+                        "public".parse()?
                     ]
                 )))
                 .collect::<Result<_>>()?

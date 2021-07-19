@@ -1,4 +1,5 @@
 use crate::tag_expression_grammar::TagExpressionParser;
+use anyhow::{anyhow, Error};
 use serde::{Deserializer, Serializer};
 use std::{
     collections::BTreeMap,
@@ -6,10 +7,58 @@ use std::{
     str::FromStr,
 };
 
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct Tag {
     pub category: Option<String>,
     pub value: String,
+}
+
+impl FromStr for Tag {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(if let Some((a, b)) = s.split_once(':') {
+            Tag {
+                category: Some(a.into()),
+                value: b.into(),
+            }
+        } else {
+            Tag {
+                category: None,
+                value: s.into(),
+            }
+        })
+    }
+}
+
+impl Display for Tag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(category) = &self.category {
+            write!(f, "{}:{}", category, self.value)
+        } else {
+            write!(f, "{}", self.value)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Tag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for Tag {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -35,26 +84,20 @@ impl TagExpression {
 }
 
 impl FromStr for TagExpression {
-    type Err = String;
+    type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         TagExpressionParser::new()
             .parse(s)
             .map(|tags| *tags)
-            .map_err(|e| e.to_string())
+            .map_err(|e| anyhow!("{}", e))
     }
 }
 
 impl Display for TagExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TagExpression::Tag(tag) => {
-                if let Some(category) = &tag.category {
-                    write!(f, "{}:{}", category, tag.value)
-                } else {
-                    write!(f, "{}", tag.value)
-                }
-            }
+            TagExpression::Tag(tag) => write!(f, "{}", tag),
             TagExpression::And(a, b) => write!(f, "({} and {})", a, b),
             TagExpression::Or(a, b) => write!(f, "({} or {})", a, b),
         }

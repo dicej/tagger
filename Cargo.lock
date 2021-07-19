@@ -2081,6 +2081,7 @@ name = "tagger-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "console_error_panic_hook",
  "futures",
  "log",

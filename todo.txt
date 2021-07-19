@@ -3,6 +3,7 @@ front end
   select and add or remove tags
     show div for adding or removing when at least one image selected
   full size view with arrow and slide forward/back
+  pagination
   login/logout
     disallow selection when logged out
   minimize expensive clones

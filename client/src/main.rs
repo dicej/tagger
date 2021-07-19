@@ -1,10 +1,16 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 
 use anyhow::{anyhow, Error, Result};
+use chrono::{DateTime, Utc};
 use futures::future::TryFutureExt;
 use reqwest::Client;
 use serde::Deserialize;
-use std::{collections::HashMap, fmt, ops::Deref, panic, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+    panic,
+    rc::Rc,
+};
 use sycamore::prelude::{
     self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
 };
@@ -89,16 +95,16 @@ fn is_filtered(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> bool {
         .unwrap_or(false)
 }
 
-struct TagMenuItemProps {
+struct TagSubMenuProps {
     state: Rc<State>,
     tag: Tag,
     filter: Signal<TagTree>,
     filter_chain: List<Tag>,
 }
 
-#[component(TagMenuItem<G>)]
-fn tag_menu_item(props: TagMenuItemProps) -> Template<G> {
-    let TagMenuItemProps {
+#[component(TagSubMenu<G>)]
+fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
+    let TagSubMenuProps {
         state,
         tag,
         filter,
@@ -141,9 +147,7 @@ fn tag_menu_item(props: TagMenuItemProps) -> Template<G> {
                 }
             }
         } else {
-            template! {
-
-            }
+            template! {}
         })
     }
 }
@@ -265,7 +269,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                 value: tag_value.clone(),
             };
 
-            let item = TagMenuItemProps {
+            let sub_menu = TagSubMenuProps {
                 state: state.clone(),
                 tag: tag.clone(),
                 filter: filter.clone(),
@@ -312,7 +316,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                             }
                         }) " " (tag_value) " (" (count) ")"
                     }
-                    TagMenuItem(item)
+                    TagSubMenu(sub_menu)
                 }
             }
         },
@@ -328,35 +332,47 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
     }
 }
 
+#[derive(Clone)]
+struct ImageState {
+    datetime: DateTime<Utc>,
+    selected: Signal<bool>,
+    tags: Signal<HashSet<Tag>>,
+}
+
 struct ImagesProps {
     state: Rc<State>,
-    images: StateHandle<ImagesResponse>,
+    image_states: StateHandle<Rc<HashMap<Rc<str>, ImageState>>>,
 }
 
 #[component(Images<G>)]
 fn images(props: ImagesProps) -> Template<G> {
-    let ImagesProps { state, images } = props;
+    let ImagesProps {
+        state,
+        image_states,
+    } = props;
 
     let images = KeyedProps {
-        iterable: syc::create_selector(move || {
-            let images = images.get();
+        iterable: syc::create_selector({
+            let image_states = image_states.clone();
 
-            let mut vec = images
-                .images
-                .iter()
-                .map(|(hash, _)| hash.clone())
-                .collect::<Vec<_>>();
+            move || {
+                let image_states = image_states.get();
 
-            vec.sort_by(|a, b| {
-                images
-                    .images
-                    .get(b.deref())
-                    .unwrap()
-                    .datetime
-                    .cmp(&images.images.get(a.deref()).unwrap().datetime)
-            });
+                let mut vec = image_states
+                    .iter()
+                    .map(|(hash, _)| hash.clone())
+                    .collect::<Vec<_>>();
 
-            vec
+                vec.sort_by(|a, b| {
+                    image_states
+                        .get(b.deref())
+                        .unwrap()
+                        .datetime
+                        .cmp(&image_states.get(a.deref()).unwrap().datetime)
+                });
+
+                vec
+            }
         }),
 
         template: move |hash| {
@@ -379,6 +395,7 @@ fn images(props: ImagesProps) -> Template<G> {
             });
 
             let src = syc::create_selector({
+                let hash = hash.clone();
                 let state = state.clone();
 
                 move || {
@@ -395,9 +412,38 @@ fn images(props: ImagesProps) -> Template<G> {
                 }
             });
 
+            let image = image_states.get().get(&hash).unwrap().clone();
+
+            let tags = KeyedProps {
+                iterable: syc::create_selector({
+                    let tags = image.tags.clone();
+
+                    move || {
+                        let mut vec = tags.get().iter().cloned().collect::<Vec<_>>();
+
+                        vec.sort();
+
+                        vec
+                    }
+                }),
+
+                template: move |tag| {
+                    template! {
+                        span(class="tag") {
+                            (tag)
+                        }
+                    }
+                },
+
+                key: |tag| tag.clone(),
+            };
+
             template! {
-                a(href=href.get()) {
-                    img(src=src.get())
+                span(class=if *image.selected.get() { "thumbnail-selected" } else { "thumbnail" }) {
+                    a(href=href.get()) {
+                        img(src=src.get(), class="thumbnail")
+                    }
+                    Keyed(tags)
                 }
             }
         },
@@ -412,7 +458,7 @@ fn images(props: ImagesProps) -> Template<G> {
     }
 }
 
-fn watch<T: fmt::Debug + Default + for<'de> Deserialize<'de>>(
+fn watch<T: Default + for<'de> Deserialize<'de>>(
     uri: &'static str,
     state: Rc<State>,
     filter: StateHandle<TagTree>,
@@ -524,9 +570,39 @@ fn main() -> Result<()> {
 
     let show_menu = Signal::new(true);
 
+    let mut image_states = Rc::new(HashMap::<Rc<str>, ImageState>::new());
+
     let images = ImagesProps {
         state: state.clone(),
-        images,
+        image_states: syc::create_memo(move || {
+            log::info!("dicej memo image states");
+            image_states = Rc::new(
+                images
+                    .get()
+                    .images
+                    .iter()
+                    .map(|(hash, data)| {
+                        (
+                            Rc::from(hash.deref()),
+                            if let Some(state) = image_states.get(hash.deref()) {
+                                state.tags.set(data.tags.clone());
+                                state.clone()
+                            } else {
+                                ImageState {
+                                    datetime: data.datetime,
+                                    tags: Signal::new(data.tags.clone()),
+                                    selected: Signal::new(false),
+                                }
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+            );
+
+            log::info!("dicej done memo image states");
+
+            image_states.clone()
+        }),
     };
 
     let tag_menu = TagMenuProps {

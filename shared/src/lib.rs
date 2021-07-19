@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use lalrpop_util::lalrpop_mod;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tag_expression::TagExpression;
+use tag_expression::{Tag, TagExpression};
 
 pub mod tag_expression;
 
@@ -72,7 +72,7 @@ pub struct ImagesQuery {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImageData {
     pub datetime: DateTime<Utc>,
-    pub tags: HashSet<String>,
+    pub tags: HashSet<Tag>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
