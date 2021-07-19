@@ -1,15 +1,18 @@
-//#![deny(warnings)]
+#![deny(warnings)]
 
 use anyhow::{anyhow, Error, Result};
 use chrono::{DateTime, Utc};
+use fluvio_wasm_timer::Delay;
 use futures::future::TryFutureExt;
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ops::Deref,
     panic,
     rc::Rc,
+    time::Duration,
 };
 use sycamore::prelude::{
     self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
@@ -18,6 +21,12 @@ use tagger_shared::{
     tag_expression::{Tag, TagExpression, TagTree},
     GrantType, ImagesResponse, TagsResponse, TokenRequest, TokenSuccess,
 };
+use wasm_bindgen::{closure::Closure, JsCast};
+use web_sys::{Event, KeyboardEvent, MouseEvent, TouchEvent};
+
+const LONG_CLICK_DELAY: Duration = Duration::from_secs(1);
+
+const SWIPE_THRESHOLD_PIXELS: i32 = 50;
 
 #[derive(Clone, Debug)]
 enum List<T> {
@@ -183,8 +192,8 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
 
                     let mut vec = find_categories(&filter_chain, &tags.categories)
                         .unwrap_or(&empty)
-                        .iter()
-                        .map(|(category, _)| category.clone())
+                        .keys()
+                        .cloned()
                         .collect::<Vec<_>>();
 
                     vec.sort();
@@ -358,10 +367,7 @@ fn images(props: ImagesProps) -> Template<G> {
             move || {
                 let image_states = image_states.get();
 
-                let mut vec = image_states
-                    .iter()
-                    .map(|(hash, _)| hash.clone())
-                    .collect::<Vec<_>>();
+                let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
 
                 vec.sort_by(|a, b| {
                     image_states
@@ -376,24 +382,6 @@ fn images(props: ImagesProps) -> Template<G> {
         }),
 
         template: move |hash| {
-            let href = syc::create_selector({
-                let hash = hash.clone();
-                let state = state.clone();
-
-                move || {
-                    format!(
-                        "{}/image/{}{}",
-                        state.root,
-                        hash,
-                        if let Some(token) = state.token.get().deref() {
-                            format!("?token={}", token)
-                        } else {
-                            String::new()
-                        }
-                    )
-                }
-            });
-
             let src = syc::create_selector({
                 let hash = hash.clone();
                 let state = state.clone();
@@ -438,11 +426,65 @@ fn images(props: ImagesProps) -> Template<G> {
                 key: |tag| tag.clone(),
             };
 
+            let is_down = Rc::new(Cell::new(false));
+
+            let down = {
+                let image_states = image_states.clone();
+                let is_down = is_down.clone();
+                let selected = image.selected.clone();
+
+                move |event: Event| {
+                    event.prevent_default();
+
+                    if image_states
+                        .get()
+                        .values()
+                        .any(|state| *state.selected.get())
+                    {
+                        selected.set(!*selected.get());
+                    } else {
+                        is_down.set(true);
+
+                        wasm_bindgen_futures::spawn_local({
+                            let is_down = is_down.clone();
+                            let selected = selected.clone();
+
+                            async move {
+                                let _ = Delay::new(LONG_CLICK_DELAY).await;
+
+                                if is_down.get() {
+                                    is_down.set(false);
+                                    selected.set(!*selected.get());
+                                }
+                            }
+                        });
+                    }
+                }
+            };
+
+            let up = {
+                let full_size_image = state.full_size_image.clone();
+
+                move |event: Event| {
+                    event.prevent_default();
+
+                    if is_down.get() {
+                        is_down.set(false);
+                        full_size_image.set(Some(hash.clone()));
+                    }
+                }
+            };
+
             template! {
                 span(class=if *image.selected.get() { "thumbnail-selected" } else { "thumbnail" }) {
-                    a(href=href.get()) {
-                        img(src=src.get(), class="thumbnail")
-                    }
+                    img(src=src.get(),
+                        class="thumbnail",
+                        on:mousedown=down.clone(),
+                        on:mouseup=up.clone(),
+                        on:mouseleave=up.clone(),
+                        on:touchstart=down,
+                        on:touchend=up.clone(),
+                        on:touchcancel=up)
                     Keyed(tags)
                 }
             }
@@ -508,10 +550,37 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
     signal.into_handle()
 }
 
+fn full_size_image_url(state: Rc<State>, hash: &str) -> String {
+    format!(
+        "{}/image/{}{}",
+        state.root,
+        hash,
+        if let Some(token) = state.token.get().deref() {
+            format!("?token={}", token)
+        } else {
+            String::new()
+        }
+    )
+}
+
+fn event_coordinates(event: Event) -> Option<(i32, i32)> {
+    match event.dyn_into::<MouseEvent>() {
+        Ok(event) => Some((event.client_x(), event.client_y())),
+        Err(event) => match event.dyn_into::<TouchEvent>() {
+            Ok(event) => event
+                .changed_touches()
+                .get(0)
+                .map(|touch| (touch.client_x(), touch.client_y())),
+            Err(_) => None,
+        },
+    }
+}
+
 struct State {
     token: Signal<Option<String>>,
     root: String,
     client: Client,
+    full_size_image: Signal<Option<Rc<str>>>,
 }
 
 fn main() -> Result<()> {
@@ -521,9 +590,9 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("{:?}", e))?;
     log::set_max_level(log::LevelFilter::Info);
 
-    let location = web_sys::window()
-        .ok_or_else(|| anyhow!("can't get browser window"))?
-        .location();
+    let window = web_sys::window().ok_or_else(|| anyhow!("can't get browser window"))?;
+
+    let location = window.location();
 
     let state = Rc::new(State {
         token: Signal::new(None),
@@ -533,6 +602,7 @@ fn main() -> Result<()> {
             location.host().map_err(|e| anyhow!("{:?}", e))?
         ),
         client: Client::new(),
+        full_size_image: Signal::new(None),
     });
 
     let filter = Signal::new(TagTree::default());
@@ -568,59 +638,184 @@ fn main() -> Result<()> {
         })
     });
 
-    let show_menu = Signal::new(true);
+    let show_menu = Signal::new(false);
 
     let mut image_states = Rc::new(HashMap::<Rc<str>, ImageState>::new());
 
+    let image_states = syc::create_memo(move || {
+        image_states = Rc::new(
+            images
+                .get()
+                .images
+                .iter()
+                .map(|(hash, data)| {
+                    (
+                        Rc::from(hash.deref()),
+                        if let Some(state) = image_states.get(hash.deref()) {
+                            state.tags.set(data.tags.clone());
+                            state.clone()
+                        } else {
+                            ImageState {
+                                datetime: data.datetime,
+                                tags: Signal::new(data.tags.clone()),
+                                selected: Signal::new(false),
+                            }
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        );
+
+        image_states.clone()
+    });
+
     let images = ImagesProps {
         state: state.clone(),
-        image_states: syc::create_memo(move || {
-            log::info!("dicej memo image states");
-            image_states = Rc::new(
-                images
-                    .get()
-                    .images
-                    .iter()
-                    .map(|(hash, data)| {
-                        (
-                            Rc::from(hash.deref()),
-                            if let Some(state) = image_states.get(hash.deref()) {
-                                state.tags.set(data.tags.clone());
-                                state.clone()
-                            } else {
-                                ImageState {
-                                    datetime: data.datetime,
-                                    tags: Signal::new(data.tags.clone()),
-                                    selected: Signal::new(false),
-                                }
-                            },
-                        )
-                    })
-                    .collect::<HashMap<_, _>>(),
-            );
-
-            log::info!("dicej done memo image states");
-
-            image_states.clone()
-        }),
+        image_states: image_states.clone(),
     };
 
+    let full_size_image = state.full_size_image.clone();
+    let full_size_image_visible = syc::create_selector({
+        let full_size_image = full_size_image.clone();
+
+        move || full_size_image.get().is_some()
+    });
+
     let tag_menu = TagMenuProps {
-        state,
+        state: state.clone(),
         filter,
         filter_chain: List::Nil,
         tags,
         category: None,
     };
 
+    let toggle = {
+        let show_menu = show_menu.clone();
+
+        move |_| show_menu.set(!*show_menu.get())
+    };
+
+    let close_full_size = {
+        let full_size_image = full_size_image.clone();
+
+        move |_| full_size_image.set(None)
+    };
+
+    enum Direction {
+        Left,
+        Right,
+    }
+
+    let next = {
+        let image_states = image_states.clone();
+        let full_size_image = full_size_image.clone();
+
+        move |direction| {
+            if let Some(image) = full_size_image.get().deref() {
+                let image_states = image_states.get();
+
+                let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
+
+                vec.sort_by(|a, b| {
+                    image_states
+                        .get(b.deref())
+                        .unwrap()
+                        .datetime
+                        .cmp(&image_states.get(a.deref()).unwrap().datetime)
+                });
+
+                if let Some(index) = vec.iter().position(|hash| hash == image) {
+                    match direction {
+                        Direction::Left => full_size_image
+                            .set(Some(vec[(index + (vec.len() - 1)) % vec.len()].clone())),
+                        Direction::Right => {
+                            full_size_image.set(Some(vec[(index + 1) % vec.len()].clone()))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let keydown = Closure::wrap(Box::new({
+        let next = next.clone();
+
+        move |event: KeyboardEvent| match event.key().deref() {
+            "ArrowLeft" => next(Direction::Left),
+            "ArrowRight" => next(Direction::Right),
+            _ => (),
+        }
+    }) as Box<dyn Fn(KeyboardEvent)>);
+
+    let down_coordinates = Rc::new(Cell::new(None));
+
+    let mousedown = {
+        let down_coordinates = down_coordinates.clone();
+
+        move |event: Event| {
+            event.prevent_default();
+
+            down_coordinates.set(event_coordinates(event));
+        }
+    };
+
+    let mouseup = {
+        let full_size_image = state.full_size_image.clone();
+
+        move |event: Event| {
+            event.prevent_default();
+
+            if let Some((down_x, down_y)) = down_coordinates.get() {
+                down_coordinates.set(None);
+
+                if let Some((up_x, up_y)) = event_coordinates(event) {
+                    if (up_y - down_y).abs() > 2 * (up_x - down_x).abs() {
+                        if (up_y - down_y).abs() > SWIPE_THRESHOLD_PIXELS {
+                            full_size_image.set(None);
+                        }
+                    } else if (up_x - down_x).abs() > 2 * (up_y - down_y).abs() {
+                        if up_x + SWIPE_THRESHOLD_PIXELS < down_x {
+                            next(Direction::Right);
+                        } else if down_x + SWIPE_THRESHOLD_PIXELS < up_x {
+                            next(Direction::Left);
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    window
+        .document()
+        .ok_or_else(|| anyhow!("can't get browser document"))?
+        .set_onkeydown(Some(keydown.as_ref().unchecked_ref()));
+
+    keydown.forget();
+
     sycamore::render(move || {
-        let toggle = {
-            let show_menu = show_menu.clone();
-
-            move |_| show_menu.set(!*show_menu.get())
-        };
-
         template! {
+            div(class="overlay",
+                style=format!("height:{};", if *full_size_image_visible.get() { "100%" } else { "0" })) {
+
+                span(class="close cursor", on:click=close_full_size) {
+                    "×"
+                }
+
+                (if let Some(image) = full_size_image.get().deref() {
+                    let url = full_size_image_url(state.clone(), image);
+                    template! {
+                        img(src=url,
+                            on:mousedown=mousedown.clone(),
+                            on:mouseup=mouseup.clone(),
+                            on:mouseleave=mouseup.clone(),
+                            on:touchstart=mousedown.clone(),
+                            on:touchend=mouseup.clone(),
+                            on:touchcancel=mouseup.clone())
+                    }
+                } else {
+                    template! {}
+                })
+            }
             div {
                 a(href="javascript:void(0);", class="icon", on:click=toggle) {
                     i(class="fa fa-bars")

@@ -2,6 +2,11 @@ body {
     font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
     background-color: black;
     color: #ccf;
+    font-size: 35px;
+}
+
+a.icon {
+    font-size: 70px;
 }
 
 a {
@@ -29,14 +34,14 @@ ul ul {
 
 span.thumbnail {
     display: inline-block;
-    margin: 1em;
-    border: 0.5em hidden;
+    margin: 0;
+    border: 0.5em solid black;
 }
 
 span.thumbnail-selected {
     display: inline-block;
-    margin: 1em;
-    border: 0.5em solid red;
+    margin: 0;
+    border: 0.5em solid #8ebf42;
 }
 
 img.thumbnail {
@@ -46,4 +51,39 @@ img.thumbnail {
 span.tag {
     padding: 2px;
     border: 1px solid white;
+}
+
+div.overlay {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+    position: fixed;
+    z-index: 1;
+    left: 0;
+    top: 0;
+    background-color: rgba(0, 0, 0, 0.8);
+    overflow-x: hidden;
+    transition: 0.5s;
+}
+
+div.overlay img {
+    max-width: 100%;
+    max-height: 100%;
+}
+
+span.close {
+    color: white;
+    position: absolute;
+    top: 10px;
+    right: 25px;
+    font-size: 70px;
+    font-weight: bold;
+}
+
+span.close:hover,
+span.close:focus {
+    color: #8ebf42;
+    text-decoration: none;
+    cursor: pointer;
 }
