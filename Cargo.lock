@@ -2042,8 +2042,6 @@ dependencies = [
 [[package]]
 name = "sycamore"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7e7b80a870c344ec63aafd28735199cb936f24589daea834ff65edf25a49104"
 dependencies = [
  "chrono",
  "indexmap",
@@ -2057,8 +2055,6 @@ dependencies = [
 [[package]]
 name = "sycamore-macro"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cba0f47f2c4f02924ee52c79563dcd95d737afff3ab4d6ff0b8bb08762c3bf04"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -5,6 +5,10 @@ body {
     font-size: 35px;
 }
 
+input {
+    font-size: 35px;
+}
+
 a.icon {
     font-size: 70px;
 }
@@ -15,11 +19,10 @@ a.select {
     right: 16px;
 }
 
-a.selected-tag {
-    display: block;
-    text-align: right;
-    padding: 2px;
-    margin: 2px;
+span.selected-tag {
+    display: inline-block;
+    padding: 0.2em;
+    margin: 0.2em;
     border: 1px solid white;
 }
 
@@ -33,6 +36,10 @@ a {
 
 a:link {
     color: white;
+}
+
+a.remove:link {
+    color: #f54;
 }
 
 ul {
@@ -57,8 +64,8 @@ img.selected {
 }
 
 span.tag {
-    padding: 2px;
-    margin: 2px;
+    padding: 0.2em;
+    margin: 0.2em;
     border: 1px solid white;
 }
 
@@ -85,10 +92,6 @@ div.overlay {
 div.overlay img {
     max-width: 100%;
     max-height: 100%;
-}
-
-input.edit {
-    text-align: right;
 }
 
 span.close {

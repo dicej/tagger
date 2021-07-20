@@ -380,6 +380,8 @@ fn images(props: ImagesProps) -> Template<G> {
         }),
 
         template: move |hash| {
+            log::info!("make template for {}", hash);
+
             let src = format!("{}/image/{}?size=small", state.root, hash);
 
             let image = image_states.get().get(&hash).unwrap().clone();
@@ -838,8 +840,16 @@ fn main() -> Result<()> {
                 });
 
                 template! {
-                    a(href="javascript:void(0);", class="selected-tag", on:click=remove.clone()) {
-                        (if *immutable.get() { "" } else { "× " }) (tag)
+                    span(class="selected-tag") {
+                        (tag) " " (if *immutable.get() {
+                            template! {}
+                        } else {
+                            template! {
+                                a(href="javascript:void(0);", class="remove", on:click=remove.clone()) {
+                                    i(class="fa fa-times-circle")
+                                }
+                            }
+                        })
                     }
                 }
             }
@@ -891,6 +901,8 @@ fn main() -> Result<()> {
 
                         Err(e) => log::error!("unable to parse tag {}: {:?}", input_value.get(), e),
                     }
+
+                    input_value.set(String::new());
                 }
             }
         }
@@ -973,7 +985,7 @@ fn main() -> Result<()> {
                       class=format!("icon select {}", if *selecting.get() { " enabled" } else { "" }),
                       on:click=toggle_selecting)
                     {
-                        i(class="fa fa-hand-pointer-o")
+                        i(class="fa fa-th-large")
                     }
                 }
 
@@ -981,12 +993,14 @@ fn main() -> Result<()> {
                     TagMenu(tag_menu)
                 }
 
-                div(class="edit", style=format!("display:{};", if *selected.get() { "block" } else { "none" })) {
-                    "add a tag: "
+                div(style=format!("display:{};", if *selected.get() { "block" } else { "none" })) {
+                    div {
+                        "tags: " Keyed(selected_tags)
+                    }
 
-                    input(on:keyup=inputkey, bind:value=input_value, class="edit") {}
-
-                    Keyed(selected_tags)
+                    div {
+                        "new tag: " input(on:keyup=inputkey, bind:value=input_value, class="edit")
+                    }
                 }
             }
 
