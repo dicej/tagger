@@ -373,25 +373,63 @@ fn images(props: ImagesProps) -> Template<G> {
                         .cmp(&image_states.get(a.deref()).unwrap().datetime)
                 });
 
-                log::info!("images vec is {:?}", vec);
-
                 vec
             }
         }),
 
         template: move |hash| {
-            log::info!("make template for {}", hash);
-
             let src = format!("{}/image/{}?size=small", state.root, hash);
 
             let image = image_states.get().get(&hash).unwrap().clone();
 
             let click = {
-                let selected = image.selected.clone();
+                let image_states = image_states.clone();
                 let state = state.clone();
 
-                move |_| {
+                move |event: Event| {
                     if *state.selecting.get() {
+                        let image_states = image_states.get();
+
+                        if let Ok(event) = event.dyn_into::<MouseEvent>() {
+                            if event.get_modifier_state("Shift") {
+                                let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
+
+                                vec.sort_by(|a, b| {
+                                    image_states
+                                        .get(b.deref())
+                                        .unwrap()
+                                        .datetime
+                                        .cmp(&image_states.get(a.deref()).unwrap().datetime)
+                                });
+
+                                if let (Some(first_selected), Some(last_selected), Some(me)) = (
+                                    vec.iter().position(|hash| {
+                                        *image_states.get(hash.deref()).unwrap().selected.get()
+                                    }),
+                                    vec.iter().rposition(|hash| {
+                                        *image_states.get(hash.deref()).unwrap().selected.get()
+                                    }),
+                                    vec.iter().position(|other| other == &hash),
+                                ) {
+                                    let range = if me < first_selected {
+                                        me..first_selected
+                                    } else if last_selected < me {
+                                        (last_selected + 1)..(me + 1)
+                                    } else {
+                                        me..(me + 1)
+                                    };
+
+                                    for hash in &vec[range] {
+                                        let selected = &image_states.get(hash).unwrap().selected;
+                                        selected.set(!*selected.get());
+                                    }
+
+                                    return;
+                                }
+                            }
+                        }
+
+                        let selected = &image_states.get(&hash).unwrap().selected;
                         selected.set(!*selected.get());
                     } else {
                         state.full_size_image.set(Some(hash.clone()));
@@ -623,11 +661,6 @@ fn main() -> Result<()> {
                     )
                 })
                 .collect::<HashMap<_, _>>(),
-        );
-
-        log::info!(
-            "image states for {:?}",
-            image_states.keys().collect::<Vec<_>>()
         );
 
         image_states.clone()
@@ -999,7 +1032,7 @@ fn main() -> Result<()> {
                     }
 
                     div {
-                        "new tag: " input(on:keyup=inputkey, bind:value=input_value, class="edit")
+                        "add tag: " input(on:keyup=inputkey, bind:value=input_value, class="edit")
                     }
                 }
             }
