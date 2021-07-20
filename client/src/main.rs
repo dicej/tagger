@@ -2,7 +2,6 @@
 
 use anyhow::{anyhow, Error, Result};
 use chrono::{DateTime, Utc};
-use fluvio_wasm_timer::Delay;
 use futures::future::TryFutureExt;
 use reqwest::Client;
 use serde::Deserialize;
@@ -12,19 +11,16 @@ use std::{
     ops::Deref,
     panic,
     rc::Rc,
-    time::Duration,
 };
 use sycamore::prelude::{
     self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
 };
 use tagger_shared::{
     tag_expression::{Tag, TagExpression, TagTree},
-    GrantType, ImagesResponse, TagsResponse, TokenRequest, TokenSuccess,
+    Action, GrantType, ImagesResponse, Patch, TagsResponse, TokenRequest, TokenSuccess,
 };
 use wasm_bindgen::{closure::Closure, JsCast};
 use web_sys::{Event, KeyboardEvent, MouseEvent, TouchEvent};
-
-const LONG_CLICK_DELAY: Duration = Duration::from_secs(1);
 
 const SWIPE_THRESHOLD_PIXELS: i32 = 50;
 
@@ -377,6 +373,8 @@ fn images(props: ImagesProps) -> Template<G> {
                         .cmp(&image_states.get(a.deref()).unwrap().datetime)
                 });
 
+                log::info!("images vec is {:?}", vec);
+
                 vec
             }
         }),
@@ -386,91 +384,23 @@ fn images(props: ImagesProps) -> Template<G> {
 
             let image = image_states.get().get(&hash).unwrap().clone();
 
-            let tags = KeyedProps {
-                iterable: syc::create_selector({
-                    let tags = image.tags.clone();
-
-                    move || {
-                        let mut vec = tags.get().iter().cloned().collect::<Vec<_>>();
-
-                        vec.sort();
-
-                        vec
-                    }
-                }),
-
-                template: move |tag| {
-                    template! {
-                        span(class="tag") {
-                            (tag)
-                        }
-                    }
-                },
-
-                key: |tag| tag.clone(),
-            };
-
-            let is_down = Rc::new(Cell::new(false));
-
-            let down = {
-                let image_states = image_states.clone();
-                let is_down = is_down.clone();
+            let click = {
                 let selected = image.selected.clone();
+                let state = state.clone();
 
-                move |event: Event| {
-                    event.prevent_default();
-
-                    if image_states
-                        .get()
-                        .values()
-                        .any(|state| *state.selected.get())
-                    {
+                move |_| {
+                    if *state.selecting.get() {
                         selected.set(!*selected.get());
                     } else {
-                        is_down.set(true);
-
-                        wasm_bindgen_futures::spawn_local({
-                            let is_down = is_down.clone();
-                            let selected = selected.clone();
-
-                            async move {
-                                let _ = Delay::new(LONG_CLICK_DELAY).await;
-
-                                if is_down.get() {
-                                    is_down.set(false);
-                                    selected.set(!*selected.get());
-                                }
-                            }
-                        });
-                    }
-                }
-            };
-
-            let up = {
-                let full_size_image = state.full_size_image.clone();
-
-                move |event: Event| {
-                    event.prevent_default();
-
-                    if is_down.get() {
-                        is_down.set(false);
-                        full_size_image.set(Some(hash.clone()));
+                        state.full_size_image.set(Some(hash.clone()));
                     }
                 }
             };
 
             template! {
-                span(class=if *image.selected.get() { "thumbnail-selected" } else { "thumbnail" }) {
-                    img(src=src,
-                        class="thumbnail",
-                        on:mousedown=down.clone(),
-                        on:mouseup=up.clone(),
-                        on:mouseleave=up.clone(),
-                        on:touchstart=down,
-                        on:touchend=up.clone(),
-                        on:touchcancel=up)
-                    Keyed(tags)
-                }
+                img(src=src,
+                    class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
+                    on:click=click)
             }
         },
 
@@ -534,10 +464,6 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
     signal.into_handle()
 }
 
-fn full_size_image_url(state: Rc<State>, hash: &str) -> String {
-    format!("{}/image/{}?size=large", state.root, hash)
-}
-
 fn event_coordinates(event: Event) -> Option<(i32, i32)> {
     match event.dyn_into::<MouseEvent>() {
         Ok(event) => Some((event.client_x(), event.client_y())),
@@ -558,11 +484,59 @@ fn event_coordinates(event: Event) -> Option<(i32, i32)> {
     }
 }
 
+fn patch_tags(state: Rc<State>, patches: Vec<Patch>) {
+    wasm_bindgen_futures::spawn_local(
+        {
+            async move {
+                let mut request = state.client.patch(format!("{}/tags", state.root));
+
+                if let Some(token) = state.token.get().deref() {
+                    request = request.header("authorization", &format!("Bearer {}", token));
+                }
+
+                let status = request.json(&patches).send().await?.status();
+
+                if !status.is_success() {
+                    return Err(anyhow!("unexpected status code: {}", status));
+                }
+
+                state.token.trigger_subscribers();
+
+                Ok::<_, Error>(())
+            }
+        }
+        .unwrap_or_else(move |e| {
+            log::error!("error patching tags: {:?}", e);
+        }),
+    )
+}
+
+fn is_immutable_category(tags: &TagsResponse, category: Option<&str>) -> bool {
+    fn recurse(tags: &TagsResponse, category: &str) -> Option<bool> {
+        for (cat, tags) in &tags.categories {
+            if cat == category {
+                return Some(tags.immutable.unwrap_or(false));
+            } else if let Some(answer) = recurse(tags, category) {
+                return Some(answer);
+            }
+        }
+        None
+    }
+
+    if let Some(category) = category {
+        recurse(tags, category)
+    } else {
+        tags.immutable
+    }
+    .unwrap_or(false)
+}
+
 struct State {
     token: Signal<Option<String>>,
     root: String,
     client: Client,
     full_size_image: Signal<Option<Rc<str>>>,
+    selecting: Signal<bool>,
 }
 
 fn main() -> Result<()> {
@@ -585,6 +559,7 @@ fn main() -> Result<()> {
         ),
         client: Client::new(),
         full_size_image: Signal::new(None),
+        selecting: Signal::new(false),
     });
 
     let filter = Signal::new(TagTree::default());
@@ -648,6 +623,11 @@ fn main() -> Result<()> {
                 .collect::<HashMap<_, _>>(),
         );
 
+        log::info!(
+            "image states for {:?}",
+            image_states.keys().collect::<Vec<_>>()
+        );
+
         image_states.clone()
     });
 
@@ -667,14 +647,29 @@ fn main() -> Result<()> {
         state: state.clone(),
         filter,
         filter_chain: List::Nil,
-        tags,
+        tags: tags.clone(),
         category: None,
     };
 
-    let toggle = {
+    let toggle_menu = {
         let show_menu = show_menu.clone();
 
         move |_| show_menu.set(!*show_menu.get())
+    };
+
+    let toggle_selecting = {
+        let selecting = state.selecting.clone();
+        let image_states = image_states.clone();
+
+        move |_| {
+            if *selecting.get() {
+                for state in image_states.get().values() {
+                    state.selected.set(false);
+                }
+            }
+
+            selecting.set(!*selecting.get())
+        }
     };
 
     let close_full_size = {
@@ -690,6 +685,7 @@ fn main() -> Result<()> {
 
     let next = {
         let full_size_image = full_size_image.clone();
+        let image_states = image_states.clone();
 
         move |direction| {
             if let Some(image) = full_size_image.get().deref() {
@@ -734,18 +730,15 @@ fn main() -> Result<()> {
         let down_coordinates = down_coordinates.clone();
 
         move |event: Event| {
-            event.prevent_default();
-
             down_coordinates.set(event_coordinates(event));
         }
     };
 
     let mouseup = {
         let full_size_image = state.full_size_image.clone();
+        let state = state.clone();
 
         move |event: Event| {
-            event.prevent_default();
-
             if let Some((down_x, down_y)) = down_coordinates.get() {
                 down_coordinates.set(None);
 
@@ -753,14 +746,21 @@ fn main() -> Result<()> {
                     if (up_y - down_y).abs() > 2 * (up_x - down_x).abs() {
                         if (up_y - down_y).abs() > SWIPE_THRESHOLD_PIXELS {
                             full_size_image.set(None);
+                            return;
                         }
                     } else if (up_x - down_x).abs() > 2 * (up_y - down_y).abs() {
                         if up_x + SWIPE_THRESHOLD_PIXELS < down_x {
                             next(Direction::Right);
+                            return;
                         } else if down_x + SWIPE_THRESHOLD_PIXELS < up_x {
                             next(Direction::Left);
+                            return;
                         }
                     }
+                }
+
+                if let Some(image) = full_size_image.get().deref() {
+                    let _ = location.assign(&format!("{}/image/{}", state.root, image));
                 }
             }
         }
@@ -773,6 +773,142 @@ fn main() -> Result<()> {
 
     keydown.forget();
 
+    let selected_tags = KeyedProps {
+        iterable: syc::create_selector({
+            let image_states = image_states.clone();
+
+            move || {
+                let mut vec = image_states
+                    .get()
+                    .values()
+                    .filter(|state| *state.selected.get())
+                    .flat_map(|state| state.tags.get().deref().clone())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+
+                vec.sort();
+
+                vec
+            }
+        }),
+
+        template: {
+            let state = state.clone();
+            let image_states = image_states.clone();
+            let tags = tags.clone();
+
+            move |tag| {
+                let remove = {
+                    let tag = tag.clone();
+                    let tags = tags.clone();
+                    let state = state.clone();
+                    let image_states = image_states.clone();
+
+                    move |_| {
+                        if !is_immutable_category(tags.get().deref(), tag.category.as_deref()) {
+                            patch_tags(
+                                state.clone(),
+                                image_states
+                                    .get()
+                                    .iter()
+                                    .filter_map(|(hash, state)| {
+                                        if *state.selected.get() && state.tags.get().contains(&tag)
+                                        {
+                                            Some(Patch {
+                                                hash: String::from(hash.deref()),
+                                                tag: tag.clone(),
+                                                action: Action::Remove,
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                        }
+                    }
+                };
+
+                let immutable = syc::create_selector({
+                    let tag = tag.clone();
+                    let tags = tags.clone();
+
+                    move || is_immutable_category(tags.get().deref(), tag.category.as_deref())
+                });
+
+                template! {
+                    a(href="javascript:void(0);", class="selected-tag", on:click=remove.clone()) {
+                        (if *immutable.get() { "" } else { "× " }) (tag)
+                    }
+                }
+            }
+        },
+
+        key: |tag| tag.clone(),
+    };
+
+    let input_value = Signal::new(String::new());
+
+    let inputkey = {
+        let state = state.clone();
+        let input_value = input_value.clone();
+        let image_states = image_states.clone();
+
+        move |event: Event| {
+            if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
+                if event.key().deref() == "Enter" {
+                    match input_value.get().parse::<Tag>() {
+                        Ok(tag) => {
+                            if is_immutable_category(tags.get().deref(), tag.category.as_deref()) {
+                                log::error!(
+                                    "cannot add tag {} since it belongs to an immutable category",
+                                    tag
+                                )
+                            } else {
+                                patch_tags(
+                                    state.clone(),
+                                    image_states
+                                        .get()
+                                        .iter()
+                                        .filter_map(|(hash, state)| {
+                                            if *state.selected.get()
+                                                && !state.tags.get().contains(&tag)
+                                            {
+                                                Some(Patch {
+                                                    hash: String::from(hash.deref()),
+                                                    tag: tag.clone(),
+                                                    action: Action::Add,
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect(),
+                                )
+                            }
+                        }
+
+                        Err(e) => log::error!("unable to parse tag {}: {:?}", input_value.get(), e),
+                    }
+                }
+            }
+        }
+    };
+
+    let selecting = state.selecting.clone();
+
+    let selected = syc::create_selector({
+        let image_states = image_states.clone();
+
+        move || {
+            image_states
+                .get()
+                .values()
+                .any(|state| *state.selected.get())
+        }
+    });
+
     sycamore::render(move || {
         template! {
             div(class="overlay",
@@ -783,7 +919,32 @@ fn main() -> Result<()> {
                 }
 
                 (if let Some(image) = full_size_image.get().deref() {
-                    let url = full_size_image_url(state.clone(), image);
+                    let url = format!("{}/image/{}?size=large", state.root, image);
+
+                    let image = image_states.get().get(image).unwrap().clone();
+
+                    let tags = KeyedProps {
+                        iterable: syc::create_selector({
+                            move || {
+                                let mut vec = image.tags.get().iter().cloned().collect::<Vec<_>>();
+
+                                vec.sort();
+
+                                vec
+                            }
+                        }),
+
+                        template: move |tag| {
+                            template! {
+                                span(class="tag") {
+                                    (tag)
+                                }
+                            }
+                        },
+
+                        key: |tag| tag.clone(),
+                    };
+
                     template! {
                         img(src=url,
                             on:mousedown=mousedown.clone(),
@@ -791,20 +952,44 @@ fn main() -> Result<()> {
                             on:mouseleave=mouseup.clone(),
                             on:touchstart=mousedown.clone(),
                             on:touchend=mouseup.clone(),
-                            on:touchcancel=mouseup.clone())
+                            on:touchcancel=mouseup.clone()) {}
+
+                        span(class="tags") {
+                            Keyed(tags)
+                        }
                     }
                 } else {
                     template! {}
                 })
             }
+
             div {
-                a(href="javascript:void(0);", class="icon", on:click=toggle) {
-                    i(class="fa fa-bars")
+                div {
+                    a(href="javascript:void(0);", class="icon", on:click=toggle_menu) {
+                        i(class="fa fa-bars")
+                    }
+
+                    a(href="javascript:void(0);",
+                      class=format!("icon select {}", if *selecting.get() { " enabled" } else { "" }),
+                      on:click=toggle_selecting)
+                    {
+                        i(class="fa fa-hand-pointer-o")
+                    }
                 }
+
                 div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
                     TagMenu(tag_menu)
                 }
+
+                div(class="edit", style=format!("display:{};", if *selected.get() { "block" } else { "none" })) {
+                    "add a tag: "
+
+                    input(on:keyup=inputkey, bind:value=input_value, class="edit") {}
+
+                    Keyed(selected_tags)
+                }
             }
+
             Images(images)
         }
     });

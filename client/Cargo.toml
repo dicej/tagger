@@ -9,7 +9,6 @@ edition = "2018"
 tagger-shared = { path = "../shared" }
 wasm-bindgen-futures = "0.4"
 wasm-bindgen-console-logger = "0.1"
-fluvio-wasm-timer = "0.2"
 reqwest = { version = "0.11", features = ["json"] }
 sycamore = "0.5"
 log = "0.4"

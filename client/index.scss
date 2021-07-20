@@ -9,16 +9,30 @@ a.icon {
     font-size: 70px;
 }
 
+a.select {
+    position: absolute;
+    top: 0px;
+    right: 16px;
+}
+
+a.selected-tag {
+    display: block;
+    text-align: right;
+    padding: 2px;
+    margin: 2px;
+    border: 1px solid white;
+}
+
+a.enabled:link {
+    color: #8ebf42;
+}
+
 a {
     text-decoration: none;
 }
 
 a:link {
     color: white;
-}
-
-a:hover {
-    color: #8ebf42;
 }
 
 ul {
@@ -32,27 +46,26 @@ ul ul {
     margin-left: 0.5em;
 }
 
-span.thumbnail {
-    display: inline-block;
-    margin: 0;
-    border: 0.5em solid black;
-}
-
-span.thumbnail-selected {
-    display: inline-block;
-    margin: 0;
-    border: 0.5em solid #8ebf42;
-}
-
 img.thumbnail {
-    display: block;
+    display: inline-block;
+    margin: 0;
+    border: 3px solid black;
+}
+
+img.selected {
+    border: 3px solid #8ebf42;
 }
 
 span.tag {
-    font-size: 20px;
     padding: 2px;
     margin: 2px;
     border: 1px solid white;
+}
+
+span.tags {
+    position: absolute;
+    bottom: 8px;
+    right: 16px;
 }
 
 div.overlay {
@@ -74,12 +87,16 @@ div.overlay img {
     max-height: 100%;
 }
 
+input.edit {
+    text-align: right;
+}
+
 span.close {
     color: white;
     position: absolute;
     top: 10px;
     right: 25px;
-    font-size: 70px;
+    font-size: 100px;
     font-weight: bold;
 }
 

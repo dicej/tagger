@@ -61,6 +61,7 @@ pub struct TagsQuery {
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Default, Clone)]
 pub struct TagsResponse {
+    pub immutable: Option<bool>,
     pub categories: HashMap<String, TagsResponse>,
     pub tags: HashMap<String, u32>,
 }
@@ -104,4 +105,18 @@ impl Display for ThumbnailSize {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImageQuery {
     pub size: Option<ThumbnailSize>,
+}
+
+#[derive(Serialize, Deserialize, Copy, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Add,
+    Remove,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Patch {
+    pub hash: String,
+    pub tag: Tag,
+    pub action: Action,
 }

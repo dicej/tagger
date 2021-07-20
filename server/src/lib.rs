@@ -18,7 +18,7 @@ use lazy_static::lazy_static;
 use rand::Rng;
 use regex::Regex;
 use rexiv2::Metadata;
-use serde_derive::{Deserialize, Serialize};
+use serde_derive::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -43,8 +43,8 @@ use std::{
 use structopt::StructOpt;
 use tagger_shared::{
     tag_expression::{Tag, TagExpression},
-    ImageData, ImageQuery, ImagesQuery, ImagesResponse, TagsQuery, TagsResponse, ThumbnailSize,
-    TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
+    Action, ImageData, ImageQuery, ImagesQuery, ImagesResponse, Patch, TagsQuery, TagsResponse,
+    ThumbnailSize, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -438,25 +438,10 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
     })
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-enum Action {
-    Add,
-    Remove,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Patch {
-    hash: String,
-    tag: String,
-    category: Option<String>,
-    action: Action,
-}
-
 async fn apply(
     auth: Option<&Authorization>,
     conn: &mut SqliteConnection,
-    patch: &Patch,
+    patches: &[Patch],
 ) -> Result<Response<Body>> {
     if auth.is_none() {
         return Ok(response()
@@ -464,49 +449,51 @@ async fn apply(
             .body(Body::empty())?);
     }
 
-    if let Some(category) = &patch.category {
-        if let Some(row) =
-            sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
-                .fetch_optional(&mut *conn)
-                .await?
-        {
-            if row.immutable != 0 {
-                return Ok(response()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(Body::empty())?);
+    for patch in patches {
+        if let Some(category) = &patch.tag.category {
+            if let Some(row) =
+                sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
+                    .fetch_optional(&mut *conn)
+                    .await?
+            {
+                if row.immutable != 0 {
+                    return Ok(response()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .body(Body::empty())?);
+                }
             }
         }
-    }
 
-    match patch.action {
-        Action::Add => {
-            sqlx::query!(
-                "INSERT INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
-                patch.hash,
-                patch.tag,
-                patch.category
-            )
-            .execute(conn)
-            .await?;
-        }
-        Action::Remove => {
-            if let Some(category) = &patch.category {
+        match patch.action {
+            Action::Add => {
                 sqlx::query!(
-                    "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category = ?3",
+                    "INSERT INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
                     patch.hash,
-                    patch.tag,
-                    category
+                    patch.tag.value,
+                    patch.tag.category
                 )
-                .execute(conn)
+                .execute(&mut *conn)
                 .await?;
-            } else {
-                sqlx::query!(
-                    "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category IS NULL",
-                    patch.hash,
-                    patch.tag
-                )
-                .execute(conn)
-                .await?;
+            }
+            Action::Remove => {
+                if let Some(category) = &patch.tag.category {
+                    sqlx::query!(
+                        "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category = ?3",
+                        patch.hash,
+                        patch.tag.value,
+                        category
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+                } else {
+                    sqlx::query!(
+                        "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category IS NULL",
+                        patch.hash,
+                        patch.tag.value
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+                }
             }
         }
     }
@@ -648,7 +635,11 @@ fn entry<'a>(
 
 async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResponse> {
     let select = format!(
-        "SELECT (SELECT parent from categories where name = t.category), t.category, t.tag, count(i.hash) \
+        "SELECT (SELECT parent from categories where name = t.category), \
+                (SELECT immutable from categories where name = t.category), \
+                t.category, \
+                t.tag, \
+                count(i.hash) \
          FROM images i \
          LEFT JOIN tags t \
          ON i.hash = t.hash \
@@ -671,15 +662,20 @@ async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResp
 
     let mut parents = HashMap::new();
     let mut category_tags = HashMap::new();
+    let mut category_immutable = HashMap::new();
     let mut tags = HashMap::new();
 
     let mut rows = select.fetch(&mut *conn);
 
     while let Some(row) = rows.try_next().await? {
-        let tag = row.get(2);
-        let count = row.get(3);
+        let tag = row.get(3);
+        let count = row.get(4);
 
-        if let Some(category) = row.get::<Option<String>, _>(1) {
+        if let Some(category) = row.get::<Option<String>, _>(2) {
+            if let Some(immutable) = row.get::<Option<bool>, _>(1) {
+                category_immutable.insert(category.clone(), immutable);
+            }
+
             if let Some(parent) = row.get::<Option<String>, _>(0) {
                 parents.insert(category.clone(), parent);
             }
@@ -694,12 +690,16 @@ async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResp
     }
 
     let mut response = TagsResponse {
+        immutable: None,
         categories: HashMap::new(),
         tags,
     };
 
     for (category, tags) in category_tags {
-        entry(&mut response, &parents, &category).tags = tags;
+        let entry = entry(&mut response, &parents, &category);
+
+        entry.tags = tags;
+        entry.immutable = category_immutable.get(&category).cloned();
     }
 
     Ok(response)
@@ -983,16 +983,16 @@ fn routes(
                     .and(warp::body::json())
                     .and_then({
                         let conn = conn.clone();
-                        move |auth: Option<Arc<_>>, patch: Patch| {
-                            let patch = Arc::new(patch);
+                        move |auth: Option<Arc<_>>, patches: Vec<Patch>| {
+                            let patches = Arc::new(patches);
 
                             {
                                 let auth = auth.clone();
-                                let patch = patch.clone();
+                                let patches = patches.clone();
                                 let conn = conn.clone();
 
                                 async move {
-                                    apply(auth.as_deref(), conn.lock().await.deref_mut(), &patch)
+                                    apply(auth.as_deref(), conn.lock().await.deref_mut(), &patches)
                                         .await
                                 }
                             }
@@ -1000,8 +1000,8 @@ fn routes(
                                 warn!(
                                     ?auth,
                                     "error applying patch {}: {:?}",
-                                    serde_json::to_string(patch.as_ref()).unwrap_or_else(|_| {
-                                        "(unable to serialize patch)".to_string()
+                                    serde_json::to_string(patches.as_ref()).unwrap_or_else(|_| {
+                                        "(unable to serialize patches)".to_string()
                                     }),
                                     e
                                 );
@@ -1378,22 +1378,21 @@ mod test {
 
         // Let's add the "foo" tag to the third image.
 
-        let patch = Patch {
+        let patches = vec![Patch {
             hash: hashes
                 .get(&"2021-03-01T00:00:00Z".parse()?)
                 .unwrap()
                 .clone(),
-            tag: "foo".into(),
-            category: None,
+            tag: "foo".parse()?,
             action: Action::Add,
-        };
+        }];
 
         // PATCH /tags with no authorization header should yield `UNAUTHORIZED`
 
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -1405,7 +1404,7 @@ mod test {
             .method("PATCH")
             .path("/tags")
             .header("authorization", "Bearer invalid")
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -1423,15 +1422,17 @@ mod test {
                 .method("PATCH")
                 .path("/tags")
                 .header("authorization", format!("Bearer {}", token))
-                .json(&Patch {
+                .json(&vec![Patch {
                     hash: hashes
                         .get(&"2021-03-01T00:00:00Z".parse()?)
                         .unwrap()
                         .clone(),
-                    tag: tag.into(),
-                    category: Some(category.into()),
+                    tag: Tag {
+                        value: tag.into(),
+                        category: Some(category.into()),
+                    },
                     action,
-                })
+                }])
                 .reply(&routes)
                 .await;
 
@@ -1444,7 +1445,7 @@ mod test {
             .method("PATCH")
             .path("/tags")
             .header("authorization", format!("Bearer {}", token))
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -1515,10 +1516,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: (1..=image_count).map(|n| (format!("{}", n), 1)).collect()
                             }
@@ -1569,21 +1573,20 @@ mod test {
 
         // Let's add the "foo" tag to the second image.
 
-        let patch = Patch {
+        let patches = vec![Patch {
             hash: hashes
                 .get(&"2021-02-01T00:00:00Z".parse()?)
                 .unwrap()
                 .clone(),
-            tag: "foo".into(),
-            category: None,
+            tag: "foo".parse()?,
             action: Action::Add,
-        };
+        }];
 
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
             .header("authorization", format!("Bearer {}", token))
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -1591,27 +1594,28 @@ mod test {
 
         // Let's add the "bar" tag to the third and fourth images.
 
-        for number in 3..=4 {
-            let patch = Patch {
-                hash: hashes
-                    .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
-                    .unwrap()
-                    .clone(),
-                tag: "bar".into(),
-                category: None,
-                action: Action::Add,
-            };
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(
+                &(3..=4)
+                    .map(|number| {
+                        Ok(Patch {
+                            hash: hashes
+                                .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
+                                .unwrap()
+                                .clone(),
+                            tag: "bar".parse()?,
+                            action: Action::Add,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+            .reply(&routes)
+            .await;
 
-            let response = warp::test::request()
-                .method("PATCH")
-                .path("/tags")
-                .header("authorization", format!("Bearer {}", token))
-                .json(&patch)
-                .reply(&routes)
-                .await;
-
-            assert_eq!(response.status(), StatusCode::OK);
-        }
+        assert_eq!(response.status(), StatusCode::OK);
 
         // GET /tags should yield the newly-applied tags.
 
@@ -1626,10 +1630,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: (1..=image_count).map(|n| (format!("{}", n), 1)).collect()
                             }
@@ -1701,10 +1708,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: (2..=3).map(|n| (format!("{}", n), 1)).collect()
                             }
@@ -1776,10 +1786,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: (3..=4).map(|n| (format!("{}", n), 1)).collect()
                             }
@@ -1843,10 +1856,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: hashmap![
                                     "3".into() => 1
@@ -1925,10 +1941,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: (2..=4).map(|n| (format!("{}", n), 1)).collect()
                             }
@@ -1995,21 +2014,20 @@ mod test {
 
         // Let's add the "baz" tag to the fourth image.
 
-        let patch = Patch {
+        let patches = vec![Patch {
             hash: hashes
                 .get(&"2021-04-01T00:00:00Z".parse()?)
                 .unwrap()
                 .clone(),
-            tag: "baz".into(),
-            category: None,
+            tag: "baz".parse()?,
             action: Action::Add,
-        };
+        }];
 
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
             .header("authorization", format!("Bearer {}", token))
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -2072,10 +2090,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: (3..=4).map(|n| (format!("{}", n), 1)).collect()
                             }
@@ -2163,21 +2184,21 @@ mod test {
 
         // Let's remove the "bar" tag from the third image.
 
-        let patch = Patch {
+        let patches = vec![Patch {
             hash: hashes
                 .get(&"2021-03-01T00:00:00Z".parse()?)
                 .unwrap()
                 .clone(),
-            tag: "bar".into(),
-            category: None,
+            tag: "bar".parse()?,
+
             action: Action::Remove,
-        };
+        }];
 
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
             .header("authorization", format!("Bearer {}", token))
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -2296,15 +2317,17 @@ mod test {
                     .method("PATCH")
                     .path("/tags")
                     .header("authorization", format!("Bearer {}", token))
-                    .json(&Patch {
+                    .json(&vec![Patch {
                         hash: hashes
                             .get(&"2021-04-01T00:00:00Z".parse()?)
                             .unwrap()
                             .clone(),
-                        tag: "baz".into(),
-                        category: Some(category.into()),
+                        tag: Tag {
+                            value: "baz".into(),
+                            category: Some(category.into()),
+                        },
                         action,
-                    })
+                    }])
                     .reply(&routes)
                     .await;
 
@@ -2314,21 +2337,20 @@ mod test {
 
         // Let's add the "public" tag to the fourth image.
 
-        let patch = Patch {
+        let patches = vec![Patch {
             hash: hashes
                 .get(&"2021-04-01T00:00:00Z".parse()?)
                 .unwrap()
                 .clone(),
-            tag: "public".into(),
-            category: None,
+            tag: "public".parse()?,
             action: Action::Add,
-        };
+        }];
 
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
             .header("authorization", format!("Bearer {}", token))
-            .json(&patch)
+            .json(&patches)
             .reply(&routes)
             .await;
 
@@ -2380,10 +2402,13 @@ mod test {
         assert_eq!(
             serde_json::from_slice::<TagsResponse>(response.body())?,
             TagsResponse {
+                immutable: None,
                 categories: hashmap![
                     "year".into() => TagsResponse {
+                        immutable: Some(true),
                         categories: hashmap![
                             "month".into() => TagsResponse {
+                                immutable: Some(true),
                                 categories: HashMap::new(),
                                 tags: hashmap![
                                     "4".into() => 1

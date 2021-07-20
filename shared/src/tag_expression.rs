@@ -1,5 +1,5 @@
 use crate::tag_expression_grammar::TagExpressionParser;
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, Error, Result};
 use serde::{Deserializer, Serializer};
 use std::{
     collections::BTreeMap,
@@ -13,16 +13,29 @@ pub struct Tag {
     pub value: String,
 }
 
+fn validate(s: &str) -> Result<()> {
+    if s.chars().all(regex_syntax::is_word_character) {
+        Ok(())
+    } else {
+        Err(anyhow!("found non-word character in {}", s))
+    }
+}
+
 impl FromStr for Tag {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(if let Some((a, b)) = s.split_once(':') {
+            validate(a)?;
+            validate(b)?;
+
             Tag {
                 category: Some(a.into()),
                 value: b.into(),
             }
         } else {
+            validate(s)?;
+
             Tag {
                 category: None,
                 value: s.into(),
