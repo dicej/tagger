@@ -1,11 +1,13 @@
 front end
   pagination
+    disable lightbox wrapping and instead page forward/backward or stop if limit reached
   login/logout
     disallow selection when logged out
-  minimize expensive clones
-  im-based iteration?
+  get rid of State?
 video support
-modularize
+modularize, componentize, reduce inline template code, reduce unwraps and misc clean up
+minimize expensive clones
 break up tests
 document
+demo site?
 announce

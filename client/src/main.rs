@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    convert::TryFrom,
     ops::Deref,
     panic,
     rc::Rc,
@@ -23,6 +24,10 @@ use wasm_bindgen::{closure::Closure, JsCast};
 use web_sys::{Event, KeyboardEvent, MouseEvent, TouchEvent};
 
 const SWIPE_THRESHOLD_PIXELS: i32 = 50;
+
+const MAX_CLICK_DISTANCE_PIXELS: f64 = 5.0;
+
+const MAX_IMAGES_PER_PAGE: u32 = 3;
 
 #[derive(Clone, Debug)]
 enum List<T> {
@@ -129,7 +134,7 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
                 filter: filter.clone(),
                 filter_chain: filter_chain.clone(),
                 tags: watch::<TagsResponse>(
-                    "tags",
+                    Signal::new("tags".into()).into_handle(),
                     state.clone(),
                     Signal::new(to_tree(&filter_chain)).into_handle(),
                 ),
@@ -364,6 +369,7 @@ struct ImageState {
 struct ImagesProps {
     state: Rc<State>,
     image_states: StateHandle<Rc<HashMap<Rc<str>, ImageState>>>,
+    sorted_images: StateHandle<Vec<Rc<str>>>,
 }
 
 #[component(Images<G>)]
@@ -371,93 +377,76 @@ fn images(props: ImagesProps) -> Template<G> {
     let ImagesProps {
         state,
         image_states,
+        sorted_images,
     } = props;
 
     let images = KeyedProps {
-        iterable: syc::create_selector({
-            let image_states = image_states.clone();
-
-            move || {
-                let image_states = image_states.get();
-
-                let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
-
-                vec.sort_by(|a, b| {
-                    image_states
-                        .get(b.deref())
-                        .unwrap()
-                        .datetime
-                        .cmp(&image_states.get(a.deref()).unwrap().datetime)
-                });
-
-                vec
-            }
-        }),
+        iterable: sorted_images.clone(),
 
         template: move |hash| {
             let src = format!("{}/image/{}?size=small", state.root, hash);
 
-            let image = image_states.get().get(&hash).unwrap().clone();
+            if let Some(image) = image_states.get().get(&hash) {
+                let image = image.clone();
 
-            let click = {
-                let image_states = image_states.clone();
-                let state = state.clone();
+                let click = {
+                    let image_states = image_states.clone();
+                    let sorted_images = sorted_images.clone();
+                    let state = state.clone();
 
-                move |event: Event| {
-                    if *state.selecting.get() {
-                        let image_states = image_states.get();
+                    move |event: Event| {
+                        if *state.selecting.get() {
+                            let image_states = image_states.get();
 
-                        if let Ok(event) = event.dyn_into::<MouseEvent>() {
-                            if event.get_modifier_state("Shift") {
-                                let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
+                            if let Ok(event) = event.dyn_into::<MouseEvent>() {
+                                if event.get_modifier_state("Shift") {
+                                    let sorted_images = sorted_images.get();
 
-                                vec.sort_by(|a, b| {
-                                    image_states
-                                        .get(b.deref())
-                                        .unwrap()
-                                        .datetime
-                                        .cmp(&image_states.get(a.deref()).unwrap().datetime)
-                                });
+                                    if let (Some(first_selected), Some(last_selected), Some(me)) = (
+                                        sorted_images.iter().position(|hash| {
+                                            *image_states.get(hash.deref()).unwrap().selected.get()
+                                        }),
+                                        sorted_images.iter().rposition(|hash| {
+                                            *image_states.get(hash.deref()).unwrap().selected.get()
+                                        }),
+                                        sorted_images.iter().position(|other| other == &hash),
+                                    ) {
+                                        let range = if me < first_selected {
+                                            me..first_selected
+                                        } else if last_selected < me {
+                                            (last_selected + 1)..(me + 1)
+                                        } else {
+                                            me..(me + 1)
+                                        };
 
-                                if let (Some(first_selected), Some(last_selected), Some(me)) = (
-                                    vec.iter().position(|hash| {
-                                        *image_states.get(hash.deref()).unwrap().selected.get()
-                                    }),
-                                    vec.iter().rposition(|hash| {
-                                        *image_states.get(hash.deref()).unwrap().selected.get()
-                                    }),
-                                    vec.iter().position(|other| other == &hash),
-                                ) {
-                                    let range = if me < first_selected {
-                                        me..first_selected
-                                    } else if last_selected < me {
-                                        (last_selected + 1)..(me + 1)
-                                    } else {
-                                        me..(me + 1)
-                                    };
+                                        for hash in &sorted_images[range] {
+                                            let selected =
+                                                &image_states.get(hash).unwrap().selected;
+                                            selected.set(!*selected.get());
+                                        }
 
-                                    for hash in &vec[range] {
-                                        let selected = &image_states.get(hash).unwrap().selected;
-                                        selected.set(!*selected.get());
+                                        return;
                                     }
-
-                                    return;
                                 }
                             }
+
+                            if let Some(state) = image_states.get(&hash) {
+                                let selected = &state.selected;
+                                selected.set(!*selected.get());
+                            }
+                        } else {
+                            state.full_size_image.set(Some(hash.clone()));
                         }
-
-                        let selected = &image_states.get(&hash).unwrap().selected;
-                        selected.set(!*selected.get());
-                    } else {
-                        state.full_size_image.set(Some(hash.clone()));
                     }
-                }
-            };
+                };
 
-            template! {
-                img(src=src,
-                    class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
-                    on:click=click)
+                template! {
+                    img(src=src,
+                        class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
+                        on:click=click)
+                }
+            } else {
+                template! {}
             }
         },
 
@@ -472,7 +461,7 @@ fn images(props: ImagesProps) -> Template<G> {
 }
 
 fn watch<T: Default + for<'de> Deserialize<'de>>(
-    uri: &'static str,
+    uri: StateHandle<String>,
     state: Rc<State>,
     filter: StateHandle<TagTree>,
 ) -> StateHandle<T> {
@@ -484,11 +473,13 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
         move || {
             let token = state.token.get();
             let filter = filter.get();
+            let uri = uri.get();
+            let state = state.clone();
+            let signal = signal.clone();
 
             wasm_bindgen_futures::spawn_local(
                 {
-                    let state = state.clone();
-                    let signal = signal.clone();
+                    let uri = uri.clone();
 
                     async move {
                         let mut request = state.client.get(format!(
@@ -496,7 +487,11 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
                             state.root,
                             uri,
                             if let Some(filter) = Option::<TagExpression>::from(filter.deref()) {
-                                format!("?filter={}", filter.to_string())
+                                format!(
+                                    "{}filter={}",
+                                    if uri.contains('?') { '&' } else { '?' },
+                                    filter.to_string()
+                                )
                             } else {
                                 String::new()
                             }
@@ -588,6 +583,18 @@ fn is_immutable_category(tags: &TagsResponse, category: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+enum Direction {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+enum Select {
+    None,
+    First,
+    Last,
+}
+
 struct State {
     token: Signal<Option<String>>,
     root: String,
@@ -619,11 +626,44 @@ fn main() -> Result<()> {
         selecting: Signal::new(false),
     });
 
+    let now = Utc::now();
+
+    let page_starts = Signal::new(vec![now]);
+
     let filter = Signal::new(TagTree::default());
 
-    let tags = watch::<TagsResponse>("tags", state.clone(), filter.handle());
+    syc::create_effect({
+        let filter = filter.clone();
+        let page_starts = page_starts.clone();
 
-    let images = watch::<ImagesResponse>("images", state.clone(), filter.handle());
+        move || {
+            let _ = filter.get();
+
+            page_starts.set(vec![now]);
+        }
+    });
+
+    let tags = watch::<TagsResponse>(
+        Signal::new("tags".into()).into_handle(),
+        state.clone(),
+        filter.handle(),
+    );
+
+    let images = watch::<ImagesResponse>(
+        syc::create_selector({
+            let page_starts = page_starts.clone();
+
+            move || {
+                format!(
+                    "images?start={}&limit={}",
+                    page_starts.get().last().unwrap_or(&now),
+                    MAX_IMAGES_PER_PAGE
+                )
+            }
+        }),
+        state.clone(),
+        filter.handle(),
+    );
 
     wasm_bindgen_futures::spawn_local({
         let state = state.clone();
@@ -656,43 +696,98 @@ fn main() -> Result<()> {
 
     let mut image_states = Rc::new(HashMap::<Rc<str>, ImageState>::new());
 
-    let image_states = syc::create_memo(move || {
-        image_states = Rc::new(
-            images
-                .get()
-                .images
-                .iter()
-                .map(|(hash, data)| {
-                    (
-                        Rc::from(hash.deref()),
-                        if let Some(state) = image_states.get(hash.deref()) {
-                            state.tags.set(data.tags.clone());
-                            state.clone()
-                        } else {
-                            ImageState {
-                                datetime: data.datetime,
-                                tags: Signal::new(data.tags.clone()),
-                                selected: Signal::new(false),
-                            }
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>(),
-        );
+    let image_states = syc::create_memo({
+        let images = images.clone();
 
-        image_states.clone()
+        move || {
+            image_states = Rc::new(
+                images
+                    .get()
+                    .images
+                    .iter()
+                    .map(|(hash, data)| {
+                        (
+                            Rc::from(hash.deref()),
+                            if let Some(state) = image_states.get(hash.deref()) {
+                                state.tags.set(data.tags.clone());
+                                state.clone()
+                            } else {
+                                ImageState {
+                                    datetime: data.datetime,
+                                    tags: Signal::new(data.tags.clone()),
+                                    selected: Signal::new(false),
+                                }
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+            );
+
+            image_states.clone()
+        }
     });
-
-    let images = ImagesProps {
-        state: state.clone(),
-        image_states: image_states.clone(),
-    };
 
     let full_size_image = state.full_size_image.clone();
     let full_size_image_visible = syc::create_selector({
         let full_size_image = full_size_image.clone();
 
         move || full_size_image.get().is_some()
+    });
+
+    let sorted_images = syc::create_selector({
+        let image_states = image_states.clone();
+
+        move || {
+            let image_states = image_states.get();
+
+            let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
+
+            vec.sort_by(|a, b| {
+                image_states
+                    .get(b.deref())
+                    .unwrap()
+                    .datetime
+                    .cmp(&image_states.get(a.deref()).unwrap().datetime)
+            });
+
+            vec
+        }
+    });
+
+    let images_props = ImagesProps {
+        state: state.clone(),
+        image_states: image_states.clone(),
+        sorted_images: sorted_images.clone(),
+    };
+
+    let full_size_image_select = Rc::new(Cell::new(Select::None));
+
+    syc::create_effect({
+        let full_size_image = full_size_image.clone();
+        let full_size_image_select = full_size_image_select.clone();
+        let sorted_images = sorted_images.clone();
+
+        move || {
+            let sorted_images = sorted_images.get();
+
+            match full_size_image_select.get() {
+                Select::None => full_size_image.set(None),
+
+                Select::First => {
+                    if let Some(first) = sorted_images.first() {
+                        full_size_image.set(Some(first.clone()));
+                    }
+                }
+
+                Select::Last => {
+                    if let Some(last) = sorted_images.last() {
+                        full_size_image.set(Some(last.clone()));
+                    }
+                }
+            }
+
+            full_size_image_select.set(Select::None);
+        }
     });
 
     let tag_menu = TagMenuProps {
@@ -730,35 +825,66 @@ fn main() -> Result<()> {
         move |_| full_size_image.set(None)
     };
 
-    enum Direction {
-        Left,
-        Right,
-    }
+    let page_back = {
+        let page_starts = page_starts.clone();
+
+        move || {
+            let mut new_page_starts = page_starts.get().deref().clone();
+            if new_page_starts.len() > 1 {
+                new_page_starts.pop();
+                page_starts.set(new_page_starts);
+            }
+        }
+    };
+
+    let page_forward = {
+        let page_starts = page_starts.clone();
+        let images = images.clone();
+
+        move || {
+            if let Some(min) = images.get().images.values().map(|data| data.datetime).min() {
+                let mut new_page_starts = page_starts.get().deref().clone();
+                new_page_starts.push(min);
+                page_starts.set(new_page_starts);
+            }
+        }
+    };
 
     let next = {
+        let page_starts = page_starts.clone();
+        let page_back = page_back.clone();
+        let page_forward = page_forward.clone();
         let full_size_image = full_size_image.clone();
-        let image_states = image_states.clone();
+        let images = images.clone();
 
         move |direction| {
             if let Some(image) = full_size_image.get().deref() {
-                let image_states = image_states.get();
+                let sorted_images = sorted_images.get();
 
-                let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
-
-                vec.sort_by(|a, b| {
-                    image_states
-                        .get(b.deref())
-                        .unwrap()
-                        .datetime
-                        .cmp(&image_states.get(a.deref()).unwrap().datetime)
-                });
-
-                if let Some(index) = vec.iter().position(|hash| hash == image) {
+                if let Some(index) = sorted_images.iter().position(|hash| hash == image) {
                     match direction {
-                        Direction::Left => full_size_image
-                            .set(Some(vec[(index + (vec.len() - 1)) % vec.len()].clone())),
+                        Direction::Left => {
+                            if index > 0 {
+                                full_size_image.set(Some(sorted_images[index - 1].clone()))
+                            } else if page_starts.get().len() > 1 {
+                                full_size_image_select.set(Select::Last);
+                                page_back();
+                            }
+                        }
+
                         Direction::Right => {
-                            full_size_image.set(Some(vec[(index + 1) % vec.len()].clone()))
+                            if index + 1 < sorted_images.len() {
+                                full_size_image.set(Some(sorted_images[index + 1].clone()))
+                            } else {
+                                let images = images.get();
+                                let count = u32::try_from(images.images.len()).unwrap();
+                                let ImagesResponse { start, total, .. } = *images.deref();
+
+                                if start + count < total {
+                                    full_size_image_select.set(Select::First);
+                                    page_forward();
+                                }
+                            }
                         }
                     }
                 }
@@ -782,6 +908,8 @@ fn main() -> Result<()> {
         let down_coordinates = down_coordinates.clone();
 
         move |event: Event| {
+            event.prevent_default();
+
             down_coordinates.set(event_coordinates(event));
         }
     };
@@ -791,6 +919,8 @@ fn main() -> Result<()> {
         let state = state.clone();
 
         move |event: Event| {
+            event.prevent_default();
+
             if let Some((down_x, down_y)) = down_coordinates.get() {
                 down_coordinates.set(None);
 
@@ -809,10 +939,14 @@ fn main() -> Result<()> {
                             return;
                         }
                     }
-                }
 
-                if let Some(image) = full_size_image.get().deref() {
-                    let _ = location.assign(&format!("{}/image/{}", state.root, image));
+                    if let Some(image) = full_size_image.get().deref() {
+                        if f64::from((down_x - up_x).pow(2) + (down_y - up_y).pow(2)).sqrt()
+                            <= MAX_CLICK_DISTANCE_PIXELS
+                        {
+                            let _ = location.assign(&format!("{}/image/{}", state.root, image));
+                        }
+                    }
                 }
             }
         }
@@ -972,6 +1106,10 @@ fn main() -> Result<()> {
         }
     });
 
+    let page_back_event = move |_| page_back();
+
+    let page_forward_event = move |_| page_forward();
+
     sycamore::render(move || {
         template! {
             div(class="overlay",
@@ -984,42 +1122,46 @@ fn main() -> Result<()> {
                 (if let Some(image) = full_size_image.get().deref() {
                     let url = format!("{}/image/{}?size=large", state.root, image);
 
-                    let image = image_states.get().get(image).unwrap().clone();
+                    if let Some(image) = image_states.get().get(image) {
+                        let image = image.clone();
 
-                    let tags = KeyedProps {
-                        iterable: syc::create_selector({
-                            move || {
-                                let mut vec = image.tags.get().iter().cloned().collect::<Vec<_>>();
+                        let tags = KeyedProps {
+                            iterable: syc::create_selector({
+                                move || {
+                                    let mut vec = image.tags.get().iter().cloned().collect::<Vec<_>>();
 
-                                vec.sort();
+                                    vec.sort();
 
-                                vec
-                            }
-                        }),
-
-                        template: move |tag| {
-                            template! {
-                                span(class="tag") {
-                                    (tag)
+                                    vec
                                 }
+                            }),
+
+                            template: move |tag| {
+                                template! {
+                                    span(class="tag") {
+                                        (tag)
+                                    }
+                                }
+                            },
+
+                            key: |tag| tag.clone(),
+                        };
+
+                        template! {
+                            img(src=url,
+                                on:mousedown=mousedown.clone(),
+                                on:mouseup=mouseup.clone(),
+                                on:mouseleave=mouseup.clone(),
+                                on:touchstart=mousedown.clone(),
+                                on:touchend=mouseup.clone(),
+                                on:touchcancel=mouseup.clone()) {}
+
+                            span(class="tags") {
+                                Keyed(tags)
                             }
-                        },
-
-                        key: |tag| tag.clone(),
-                    };
-
-                    template! {
-                        img(src=url,
-                            on:mousedown=mousedown.clone(),
-                            on:mouseup=mouseup.clone(),
-                            on:mouseleave=mouseup.clone(),
-                            on:touchstart=mousedown.clone(),
-                            on:touchend=mouseup.clone(),
-                            on:touchcancel=mouseup.clone()) {}
-
-                        span(class="tags") {
-                            Keyed(tags)
                         }
+                    } else {
+                        template! {}
                     }
                 } else {
                     template! {}
@@ -1030,6 +1172,55 @@ fn main() -> Result<()> {
                 div(class="nav") {
                     a(href="javascript:void(0);", class="icon filter", on:click=toggle_menu) {
                         i(class="fa fa-bars")
+                    }
+
+                    span(class="pagination") {
+                        ({
+                            let images = images.get();
+                            let count = u32::try_from(images.images.len()).unwrap();
+                            let ImagesResponse { start, total, .. } = *images.deref();
+                            let page_starts = page_starts.clone();
+
+                            if total == 0 {
+                                template! {
+                                    em {
+                                        "No images match current filter"
+                                    }
+                                }
+                            } else {
+                                template! {
+                                    a(href="javascript:void(0);",
+                                      class="icon",
+                                      on:click=page_back_event.clone(),
+                                      style=format!("visibility:{};",
+                                                    if page_starts.get().len() > 1 {
+                                                        "visible"
+                                                    } else {
+                                                        "hidden"
+                                                    }))
+                                    {
+                                        i(class="fa fa-angle-left")
+                                    }
+
+                                    (format!(" {}-{} of {} ",
+                                             start + 1,
+                                             start + count,
+                                             total))
+
+                                    a(href="javascript:void(0);",
+                                      class="icon",
+                                      on:click=page_forward_event.clone(),
+                                      style=format!("visibility:{};",
+                                                    if start + count < total {
+                                                        "visible"
+                                                    } else {
+                                                        "hidden"
+                                                    }))
+                                    {
+                                        i(class="fa fa-angle-right")
+                                    }
+                                }
+                            }})
                     }
 
                     a(href="javascript:void(0);",
@@ -1071,7 +1262,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            Images(images)
+            Images(images_props)
         }
     });
 
