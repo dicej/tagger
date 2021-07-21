@@ -1,11 +1,13 @@
-front end
-  pagination
-    disable lightbox wrapping and instead page forward/backward or stop if limit reached
-  login/logout
-    disallow selection when logged out
-  get rid of State?
 video support
-modularize, componentize, reduce inline template code, reduce unwraps and misc clean up
+  including motion photo
+performance (e.g. O(n) ops in FE)
+login/logout
+  disallow selection when logged out
+clean up
+  modularize FE and BE
+  componentize FE
+  reduce inline template code in FE
+  remove State from FE?
 minimize expensive clones
 break up tests
 document

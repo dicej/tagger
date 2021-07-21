@@ -115,17 +115,58 @@ fn hash(data: &[u8]) -> String {
         .concat()
 }
 
-fn find_new<'a>(
-    conn: &'a AsyncMutex<SqliteConnection>,
-    root: &'a str,
-    result: &'a mut Vec<(String, DateTime<Utc>)>,
-    dir: impl AsRef<Path> + 'a + Send,
-) -> BoxFuture<'a, Result<()>> {
+#[derive(Debug)]
+struct ExifData {
+    datetime: DateTime<Utc>,
+    mp4_offset: Option<i64>,
+}
+
+fn exif_data(image: &[u8]) -> Result<ExifData> {
+    let metadata = Metadata::new_from_buffer(image)?;
+
+    let datetime = metadata
+        .get_tag_string("Exif.Image.DateTimeOriginal")
+        .or_else(|_| metadata.get_tag_string("Exif.Image.DateTime"))?;
+
     lazy_static! {
         static ref DATE_TIME_PATTERN: Regex =
             Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
     };
 
+    Ok(ExifData {
+        datetime: DATE_TIME_PATTERN
+            .captures(&datetime)
+            .map(|c| {
+                format!(
+                    "{}-{}-{}T{}:{}:{}Z",
+                    &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
+                )
+            })
+            .ok_or_else(|| anyhow!("unrecognized DateTime format: {}", datetime))?
+            .parse()?,
+
+        mp4_offset: if metadata
+            .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Mime")
+            .ok()
+            .as_deref()
+            == Some("video/mp4")
+        {
+            metadata
+                .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Length")
+                .ok()
+                .and_then(|offset| offset.parse().ok())
+        } else {
+            None
+        },
+    })
+}
+
+fn find_new<'a>(
+    conn: &'a AsyncMutex<SqliteConnection>,
+    root: &'a str,
+    result: &'a mut Vec<(String, ExifData)>,
+    dir: impl AsRef<Path> + 'a + Send,
+) -> BoxFuture<'a, Result<()>> {
     let dir_buf = dir.as_ref().to_path_buf();
 
     async move {
@@ -133,12 +174,15 @@ fn find_new<'a>(
 
         while let Some(entry) = dir.next_entry().await? {
             let path = entry.path();
+
             if path.is_file() {
                 if let Some(name) = entry.file_name().to_str() {
                     let lowercase = name.to_lowercase();
+
                     if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
                         let mut path = dir_buf.clone();
                         path.push(name);
+
                         let stripped = path
                             .strip_prefix(root)?
                             .to_str()
@@ -151,26 +195,11 @@ fn find_new<'a>(
                                 .is_some();
 
                         if !found {
-                            if let Some(datetime) =
-                                Metadata::new_from_buffer(&content(&path).await?)
-                                    .and_then(|m| {
-                                        m.get_tag_string("Exif.Image.DateTimeOriginal")
-                                            .or_else(|_| m.get_tag_string("Exif.Image.DateTime"))
-                                    })
-                                    .ok()
-                                    .and_then(|s| {
-                                        DATE_TIME_PATTERN.captures(&s).map(|c| {
-                                            format!(
-                                                "{}-{}-{}T{}:{}:{}Z",
-                                                &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
-                                            )
-                                            .parse()
-                                        })
-                                    })
-                            {
-                                result.push((stripped.to_string(), datetime?))
-                            } else {
-                                warn!("unable to get metadata for {}", lowercase);
+                            match exif_data(&content(&path).await?) {
+                                Ok(data) => result.push((stripped.to_string(), data)),
+                                Err(e) => {
+                                    warn!("unable to get metadata for {}: {:?}", lowercase, e)
+                                }
                             }
                         }
                     }
@@ -215,10 +244,10 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
 
     let new_len = new.len();
 
-    for (path, datetime) in new {
+    for (path, data) in new {
         let hash = hash(&content([image_dir, &path].iter().collect::<PathBuf>()).await?);
 
-        info!("insert {} (hash {}; datetime {})", path, hash, datetime);
+        info!("insert {} (hash {}; data {:?})", path, hash, data);
 
         conn.lock()
             .await
@@ -228,14 +257,16 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
                         .execute(&mut *conn)
                         .await?;
 
-                    let year = datetime.year();
-                    let month = datetime.month();
-                    let datetime = datetime.to_string();
+                    let year = data.datetime.year();
+                    let month = data.datetime.month();
+                    let datetime = data.datetime.to_string();
+                    let mp4_offset = data.mp4_offset;
 
                     sqlx::query!(
-                        "INSERT OR IGNORE INTO images (hash, datetime) VALUES (?1, ?2)",
+                        "INSERT OR IGNORE INTO images (hash, datetime, mp4_offset) VALUES (?1, ?2, ?3)",
                         hash,
-                        datetime
+                        datetime,
+                        mp4_offset
                     )
                     .execute(&mut *conn)
                     .await?;
