@@ -9,14 +9,26 @@ input {
     font-size: 35px;
 }
 
+div.nav {
+    display: flex;
+    width: 100%;
+    height: 72px;
+}
+
 a.icon {
     font-size: 70px;
+}
+
+a.filter {
+    position: absolute;
+    top: 0px;
+    left: 10px;
 }
 
 a.select {
     position: absolute;
     top: 0px;
-    right: 16px;
+    right: 10px;
 }
 
 span.selected-tag {

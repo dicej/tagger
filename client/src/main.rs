@@ -289,6 +289,17 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                 move || is_filtered(&filter_chain, filter.get().deref(), &tag)
             });
 
+            let have_filter = syc::create_selector({
+                let filter_chain = filter_chain.clone();
+                let filter = filter.clone();
+
+                move || {
+                    resolve(&filter_chain, filter.get().deref())
+                        .map(|tree| !tree.0.is_empty())
+                        .unwrap_or(false)
+                }
+            });
+
             let toggle = {
                 let filter_chain = filter_chain.clone();
                 let filter = filter.clone();
@@ -311,13 +322,19 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
             template! {
                 li {
                     a(href="javascript:void(0);", on:click=toggle) {
-                        (if *is_filtered.get() {
-                            template! {
-                                i(class="fa fa-check-square")
+                        (if *have_filter.get() {
+                            if *is_filtered.get() {
+                                template! {
+                                    i(class="fa fa-check-square")
+                                }
+                            } else {
+                                template! {
+                                    i(class="fa fa-square")
+                                }
                             }
                         } else {
                             template! {
-                                i(class="fa fa-square")
+                                i(class="fa fa-minus-square")
                             }
                         }) " " (tag_value) " (" (count) ")"
                     }
@@ -942,6 +959,7 @@ fn main() -> Result<()> {
     };
 
     let selecting = state.selecting.clone();
+    let selecting2 = state.selecting.clone();
 
     let selected = syc::create_selector({
         let image_states = image_states.clone();
@@ -1009,8 +1027,8 @@ fn main() -> Result<()> {
             }
 
             div {
-                div {
-                    a(href="javascript:void(0);", class="icon", on:click=toggle_menu) {
+                div(class="nav") {
+                    a(href="javascript:void(0);", class="icon filter", on:click=toggle_menu) {
                         i(class="fa fa-bars")
                     }
 
@@ -1026,14 +1044,30 @@ fn main() -> Result<()> {
                     TagMenu(tag_menu)
                 }
 
-                div(style=format!("display:{};", if *selected.get() { "block" } else { "none" })) {
-                    div {
-                        "tags: " Keyed(selected_tags)
-                    }
+                div(style=format!("display:{};", if *selecting2.get() { "block" } else { "none" })) {
+                    (if *selected.get() {
+                        template! {
+                            div {
+                                "tags: " Keyed(KeyedProps {
+                                    iterable: selected_tags.iterable.clone(),
+                                    template: selected_tags.template.clone(),
+                                    key: selected_tags.key
+                                })
+                            }
 
-                    div {
-                        "add tag: " input(on:keyup=inputkey, bind:value=input_value, class="edit")
-                    }
+                            div {
+                                "add tag: " input(on:keyup=inputkey.clone(),
+                                                  bind:value=input_value.clone(),
+                                                  class="edit")
+                            }
+                        }
+                    } else {
+                        template! {
+                            em {
+                                "Click images to select them"
+                            }
+                        }
+                    })
                 }
             }
 
