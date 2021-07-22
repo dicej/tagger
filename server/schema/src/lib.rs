@@ -8,7 +8,7 @@ pub static DDL_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS images (
        hash          TEXT NOT NULL PRIMARY KEY,
        datetime      TEXT NOT NULL,
-       mp4_offset    INTEGER
+       video_offset  INTEGER
      )",
     "CREATE TABLE IF NOT EXISTS tags (
        hash          TEXT NOT NULL,

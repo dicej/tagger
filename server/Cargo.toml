@@ -30,10 +30,11 @@ base64 = "0.13"
 jsonwebtoken = "7"
 rand = "0.8"
 tempfile = "3"
-tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time", "sync" ] }
+tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time", "sync", "process" ] }
 tracing = { version = "0.1", features = [ "log" ] }
 warp = { version = "0.3", features = [ "tls" ] }
 tagger-shared = { path = "../shared" }
+mp4parse = { path = "../../mp4parse-rust/mp4parse" }
 
 [dev-dependencies]
 tempfile = "3"

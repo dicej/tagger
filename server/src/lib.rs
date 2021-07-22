@@ -1,7 +1,7 @@
 #![deny(warnings)]
 
 use anyhow::{anyhow, Error, Result};
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use futures::{
     future::{BoxFuture, FutureExt, TryFutureExt},
     stream::TryStreamExt,
@@ -17,7 +17,7 @@ use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation
 use lazy_static::lazy_static;
 use rand::Rng;
 use regex::Regex;
-use rexiv2::Metadata;
+use rexiv2::Metadata as ExifMetadata;
 use serde_derive::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -28,7 +28,7 @@ use sqlx::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    convert::Infallible,
+    convert::{Infallible, TryInto},
     fmt::Write as _,
     io::{Read, Seek, SeekFrom, Write},
     net::SocketAddrV4,
@@ -50,6 +50,7 @@ use tempfile::NamedTempFile;
 use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
     sync::Mutex as AsyncMutex,
     task, time,
 };
@@ -116,13 +117,13 @@ fn hash(data: &[u8]) -> String {
 }
 
 #[derive(Debug)]
-struct ExifData {
+struct Metadata {
     datetime: DateTime<Utc>,
-    mp4_offset: Option<i64>,
+    video_offset: Option<i64>,
 }
 
-fn exif_data(image: &[u8]) -> Result<ExifData> {
-    let metadata = Metadata::new_from_buffer(image)?;
+fn exif_metadata(path: &Path) -> Result<Metadata> {
+    let metadata = ExifMetadata::new_from_path(path)?;
 
     let datetime = metadata
         .get_tag_string("Exif.Image.DateTimeOriginal")
@@ -133,7 +134,7 @@ fn exif_data(image: &[u8]) -> Result<ExifData> {
             Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
     };
 
-    Ok(ExifData {
+    Ok(Metadata {
         datetime: DATE_TIME_PATTERN
             .captures(&datetime)
             .map(|c| {
@@ -145,7 +146,7 @@ fn exif_data(image: &[u8]) -> Result<ExifData> {
             .ok_or_else(|| anyhow!("unrecognized DateTime format: {}", datetime))?
             .parse()?,
 
-        mp4_offset: if metadata
+        video_offset: if metadata
             .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Mime")
             .ok()
             .as_deref()
@@ -161,10 +162,31 @@ fn exif_data(image: &[u8]) -> Result<ExifData> {
     })
 }
 
+fn mp4_metadata(path: &Path) -> Result<Metadata> {
+    const SECONDS_FROM_1904_TO_1970: u64 = 2_082_844_800;
+
+    Ok(Metadata {
+        datetime: DateTime::<Utc>::from_utc(
+            NaiveDateTime::from_timestamp(
+                mp4parse::read_mp4(&mut std::fs::File::open(path)?)?
+                    .creation
+                    .ok_or_else(|| anyhow!("missing creation time"))?
+                    .0
+                    .saturating_sub(SECONDS_FROM_1904_TO_1970)
+                    .try_into()
+                    .unwrap(),
+                0,
+            ),
+            Utc,
+        ),
+        video_offset: Some(0),
+    })
+}
+
 fn find_new<'a>(
     conn: &'a AsyncMutex<SqliteConnection>,
     root: &'a str,
-    result: &'a mut Vec<(String, ExifData)>,
+    result: &'a mut Vec<(String, Metadata)>,
     dir: impl AsRef<Path> + 'a + Send,
 ) -> BoxFuture<'a, Result<()>> {
     let dir_buf = dir.as_ref().to_path_buf();
@@ -179,7 +201,10 @@ fn find_new<'a>(
                 if let Some(name) = entry.file_name().to_str() {
                     let lowercase = name.to_lowercase();
 
-                    if lowercase.ends_with(".jpg") || lowercase.ends_with(".jpeg") {
+                    if lowercase.ends_with(".jpg")
+                        || lowercase.ends_with(".jpeg")
+                        || lowercase.ends_with(".mp4")
+                    {
                         let mut path = dir_buf.clone();
                         path.push(name);
 
@@ -195,7 +220,15 @@ fn find_new<'a>(
                                 .is_some();
 
                         if !found {
-                            match exif_data(&content(&path).await?) {
+                            let metadata = task::block_in_place(|| {
+                                if lowercase.ends_with(".mp4") {
+                                    mp4_metadata(&path)
+                                } else {
+                                    exif_metadata(&path)
+                                }
+                            });
+
+                            match metadata {
                                 Ok(data) => result.push((stripped.to_string(), data)),
                                 Err(e) => {
                                     warn!("unable to get metadata for {}: {:?}", lowercase, e)
@@ -260,13 +293,13 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
                     let year = data.datetime.year();
                     let month = data.datetime.month();
                     let datetime = data.datetime.to_string();
-                    let mp4_offset = data.mp4_offset;
+                    let video_offset = data.video_offset;
 
                     sqlx::query!(
-                        "INSERT OR IGNORE INTO images (hash, datetime, mp4_offset) VALUES (?1, ?2, ?3)",
+                        "INSERT OR IGNORE INTO images (hash, datetime, video_offset) VALUES (?1, ?2, ?3)",
                         hash,
                         datetime,
-                        mp4_offset
+                        video_offset
                     )
                     .execute(&mut *conn)
                     .await?;
@@ -532,16 +565,12 @@ async fn apply(
     Ok(response().body(Body::empty())?)
 }
 
-async fn full_size_image(
-    conn: &mut SqliteConnection,
-    image_dir: &str,
-    path: &str,
-) -> Result<Vec<u8>> {
+async fn path(conn: &mut SqliteConnection, path: &str) -> Result<String> {
     if let Some(row) = sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
         .fetch_optional(conn)
         .await?
     {
-        content([image_dir, &row.path].iter().collect::<PathBuf>()).await
+        Ok(row.path)
     } else {
         Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
     }
@@ -558,34 +587,66 @@ fn bound(
     }
 }
 
+async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
+    let full_path = [image_dir, &path].iter().collect::<PathBuf>();
+
+    if path.to_lowercase().ends_with(".mp4") {
+        let output = Command::new("ffmpeg")
+            .arg("-i")
+            .arg(full_path)
+            .arg("-ss")
+            .arg("00:00:00")
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-f")
+            .arg("singlejpeg")
+            .arg("-")
+            .output()
+            .await?;
+
+        if output.status.success() {
+            Ok((output.stdout, ImageFormat::Jpeg))
+        } else {
+            Err(anyhow!(
+                "error running ffmpeg: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    } else {
+        Ok((content(full_path).await?, ImageFormat::Jpeg))
+    }
+}
+
 async fn thumbnail(
-    conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
+    path: &str,
     thumbnail_dir: &str,
     size: ThumbnailSize,
-    path: &str,
-) -> Result<Vec<u8>> {
-    let filename = format!("{}/{}/{}.jpg", thumbnail_dir, size, path);
+    hash: &str,
+) -> Result<(Vec<u8>, &'static str)> {
+    let filename = format!("{}/{}/{}.jpg", thumbnail_dir, size, hash);
 
     let result = content(&filename).await;
 
-    if let Ok(result) = result {
-        Ok(result)
-    } else {
-        let image = full_size_image(conn.lock().await.deref_mut(), image_dir, path).await?;
+    let content_type = "image/jpeg";
 
-        let native_size = image::load_from_memory_with_format(&image, ImageFormat::Jpeg)?;
+    if let Ok(result) = result {
+        Ok((result, content_type))
+    } else {
+        let (image, format) = still_image(image_dir, path).await?;
+
+        let original = image::load_from_memory_with_format(&image, format)?;
 
         let resize = |bounds| {
-            let (width, height) = bound(native_size.dimensions(), bounds);
+            let (width, height) = bound(original.dimensions(), bounds);
 
             let mut encoded = Vec::new();
 
-            native_size
+            original
                 .resize(width, height, FilterType::Lanczos3)
                 .write_to(&mut encoded, ImageOutputFormat::Jpeg(JPEG_QUALITY))?;
 
-            let metadata = Metadata::new_from_buffer(&image)
+            let metadata = ExifMetadata::new_from_buffer(&image)
                 .map(|metadata| {
                     let orientation = metadata.get_orientation();
                     metadata.clear();
@@ -626,7 +687,7 @@ async fn thumbnail(
 
         write(&filename, &resized).await?;
 
-        Ok(resized)
+        Ok((resized, content_type))
     }
 }
 
@@ -634,18 +695,27 @@ async fn image(
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
     thumbnail_dir: &str,
-    path: &str,
+    hash: &str,
     query: &ImageQuery,
 ) -> Result<Response<Body>> {
-    let image = if let Some(size) = query.size {
-        thumbnail(conn, image_dir, thumbnail_dir, size, path).await
+    let path = path(conn.lock().await.deref_mut(), hash).await?;
+
+    let (image, content_type) = if let Some(size) = query.size {
+        thumbnail(image_dir, &path, thumbnail_dir, size, hash).await?
     } else {
-        full_size_image(conn.lock().await.deref_mut(), image_dir, path).await
-    }?;
+        (
+            content([image_dir, &path].iter().collect::<PathBuf>()).await?,
+            if path.to_lowercase().ends_with(".mp4") {
+                "video/mp4"
+            } else {
+                "image/jpeg"
+            },
+        )
+    };
 
     Ok(response()
         .header(header::CONTENT_LENGTH, image.len())
-        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CONTENT_TYPE, content_type)
         .body(Body::from(image))?)
 }
 
@@ -1283,7 +1353,7 @@ mod test {
             task::block_in_place(|| {
                 ImageBuffer::from_pixel(image_width, image_height, color).save(&path)?;
 
-                let metadata = Metadata::new_from_path(&path)?;
+                let metadata = ExifMetadata::new_from_path(&path)?;
                 metadata.set_tag_string(
                     "Exif.Image.DateTimeOriginal",
                     &format!("2021:{:02}:01 00:00:00", number),
