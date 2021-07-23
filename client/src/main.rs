@@ -945,6 +945,8 @@ fn main() -> Result<()> {
         let down_coordinates = down_coordinates.clone();
 
         move |event: Event| {
+            event.prevent_default();
+
             down_coordinates.set(event_coordinates(event));
         }
     };
@@ -954,6 +956,8 @@ fn main() -> Result<()> {
         let state = state.clone();
 
         move |event: Event| {
+            event.prevent_default();
+
             if let Some((down_x, down_y)) = down_coordinates.get() {
                 down_coordinates.set(None);
 
@@ -1242,9 +1246,9 @@ fn main() -> Result<()> {
                                     on:mousedown=mousedown.clone(),
                                     on:mouseup=mouseup.clone(),
                                     on:mouseleave=mouseup.clone(),
-                                    on:touchstart=mousedown.clone(),
+                                    on:touchstart=mousedown,
                                     on:touchend=mouseup.clone(),
-                                    on:touchcancel=mouseup.clone())
+                                    on:touchcancel=mouseup)
                             }
                         };
 

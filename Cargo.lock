@@ -1132,6 +1132,7 @@ dependencies = [
 [[package]]
 name = "mp4parse"
 version = "0.11.5"
+source = "git+https://github.com/dicej/mp4parse-rust?branch=creation_and_modification_times#ea703bb60d0178e177cb0bc6c0896dbe2bea1253"
 dependencies = [
  "bitreader",
  "byteorder",
@@ -2117,11 +2118,11 @@ dependencies = [
 [[package]]
 name = "sycamore"
 version = "0.5.2"
+source = "git+https://github.com/sycamore-rs/sycamore#011ae83f598ca324a8a471d845b33b46323d9998"
 dependencies = [
  "chrono",
  "indexmap",
  "js-sys",
- "log",
  "smallvec",
  "sycamore-macro",
  "wasm-bindgen",
@@ -2131,6 +2132,7 @@ dependencies = [
 [[package]]
 name = "sycamore-macro"
 version = "0.5.2"
+source = "git+https://github.com/sycamore-rs/sycamore#011ae83f598ca324a8a471d845b33b46323d9998"
 dependencies = [
  "proc-macro2",
  "quote",
