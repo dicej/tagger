@@ -17,7 +17,7 @@ use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation
 use lazy_static::lazy_static;
 use rand::Rng;
 use regex::Regex;
-use rexiv2::Metadata as ExifMetadata;
+use rexiv2::{Metadata as ExifMetadata, Orientation};
 use serde_derive::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -31,6 +31,7 @@ use std::{
     convert::{Infallible, TryFrom, TryInto},
     fmt::Write as _,
     io::{Read, Seek, SeekFrom, Write},
+    mem,
     net::SocketAddrV4,
     num::NonZeroU32,
     ops::DerefMut,
@@ -614,15 +615,32 @@ async fn file_data(conn: &mut SqliteConnection, path: &str) -> Result<FileData> 
     }
 }
 
+fn orthagonal(orientation: Orientation) -> bool {
+    matches!(
+        orientation,
+        Orientation::Rotate90HorizontalFlip
+            | Orientation::Rotate90
+            | Orientation::Rotate90VerticalFlip
+            | Orientation::Rotate270
+    )
+}
+
 fn bound(
     (native_width, native_height): (u32, u32),
-    (bound_width, bound_height): (u32, u32),
+    (mut bound_width, mut bound_height): (u32, u32),
+    orientation: Orientation,
 ) -> (u32, u32) {
-    if native_width * bound_height > bound_width * native_height {
+    if orthagonal(orientation) {
+        mem::swap(&mut bound_width, &mut bound_height);
+    }
+
+    let (w, h) = if native_width * bound_height > bound_width * native_height {
         (bound_width, (native_height * bound_width) / native_width)
     } else {
         ((native_width * bound_height) / native_height, bound_height)
-    }
+    };
+
+    (w, h)
 }
 
 async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
@@ -693,8 +711,8 @@ async fn get_variant(
     }
 }
 
-fn video_scale(path: &Path, (width_bound, height_bound): (u32, u32)) -> Result<String> {
-    let (mut width, mut height) = task::block_in_place(|| {
+fn video_scale(path: &Path, bounds: (u32, u32), orientation: Orientation) -> Result<String> {
+    let dimensions = task::block_in_place(|| {
         for track in mp4parse::read_mp4(&mut std::fs::File::open(&path)?)?.tracks {
             if let (mp4parse::TrackType::Video, Some(header)) = (track.track_type, track.tkhd) {
                 return Ok((header.width >> 16, header.height >> 16));
@@ -707,23 +725,21 @@ fn video_scale(path: &Path, (width_bound, height_bound): (u32, u32)) -> Result<S
         ))
     })?;
 
-    if width * height_bound > height * width_bound {
-        width = width_bound;
-        height = (width_bound * height) / width;
+    let (mut width, mut height) = bound(dimensions, bounds, orientation);
 
-        if height % 2 != 0 {
-            height -= 1;
-        }
-    } else {
-        width = (height_bound * width) / height;
-        height = height_bound;
-
-        if width % 2 != 0 {
-            width -= 1;
-        }
+    if width % 2 != 0 {
+        width -= 1;
     }
 
-    Ok(format!("scale={}x{}", width, height))
+    if height % 2 != 0 {
+        height -= 1;
+    }
+
+    if orthagonal(orientation) {
+        mem::swap(&mut width, &mut height);
+    }
+
+    Ok(format!("scale={}:{},setsar=1:1", width, height))
 }
 
 async fn video_preview(
@@ -755,18 +771,22 @@ async fn video_preview(
                 .arg("-to")
                 .arg(VIDEO_PREVIEW_LENGTH_HMS)
                 .arg("-vf")
-                .arg(&video_scale(&full_path, SMALL_BOUNDS)?)
+                .arg(&video_scale(&full_path, SMALL_BOUNDS, Orientation::Normal)?)
                 .arg("-an")
                 .arg(&filename)
                 .output()
                 .await
         } else {
-            let original = content_offset(offset.try_into().unwrap(), full_path).await?;
+            let original = content(full_path).await?;
+
+            let orientation = ExifMetadata::new_from_buffer(&original)
+                .map(|m| m.get_orientation())
+                .unwrap_or(Orientation::Normal);
 
             let original = task::block_in_place(|| {
                 let mut file = NamedTempFile::new()?;
 
-                file.write_all(&original)?;
+                file.write_all(&original[offset.try_into().unwrap()..])?;
 
                 Ok::<_, Error>(file)
             })?;
@@ -775,7 +795,7 @@ async fn video_preview(
                 .arg("-i")
                 .arg(original.path())
                 .arg("-vf")
-                .arg(&video_scale(original.path(), SMALL_BOUNDS)?)
+                .arg(&video_scale(original.path(), SMALL_BOUNDS, orientation)?)
                 .arg("-an")
                 .arg(&filename)
                 .output()
@@ -818,14 +838,6 @@ async fn thumbnail(
         let original = image::load_from_memory_with_format(&image, format)?;
 
         let resize = |bounds| {
-            let (width, height) = bound(original.dimensions(), bounds);
-
-            let mut encoded = Vec::new();
-
-            original
-                .resize(width, height, FilterType::Lanczos3)
-                .write_to(&mut encoded, ImageOutputFormat::Jpeg(JPEG_QUALITY))?;
-
             let metadata = ExifMetadata::new_from_buffer(&image)
                 .map(|metadata| {
                     let orientation = metadata.get_orientation();
@@ -834,6 +846,21 @@ async fn thumbnail(
                     metadata
                 })
                 .ok();
+
+            let (width, height) = bound(
+                original.dimensions(),
+                bounds,
+                metadata
+                    .as_ref()
+                    .map(|m| m.get_orientation())
+                    .unwrap_or(Orientation::Normal),
+            );
+
+            let mut encoded = Vec::new();
+
+            original
+                .resize(width, height, FilterType::Lanczos3)
+                .write_to(&mut encoded, ImageOutputFormat::Jpeg(JPEG_QUALITY))?;
 
             if let Some(metadata) = &metadata {
                 task::block_in_place(|| {
@@ -2744,8 +2771,8 @@ mod test {
                             .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
                             .unwrap(),
                         match size {
-                            Size::Small => "?variant=small",
-                            Size::Large => "?variant=large",
+                            Size::Small => "?size=small",
+                            Size::Large => "?size=large",
                             Size::Original => "",
                         }
                     ))

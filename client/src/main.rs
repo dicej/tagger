@@ -27,7 +27,7 @@ const SWIPE_THRESHOLD_PIXELS: i32 = 50;
 
 const MAX_CLICK_DISTANCE_PIXELS: f64 = 5.0;
 
-const MAX_IMAGES_PER_PAGE: u32 = 3;
+const MAX_IMAGES_PER_PAGE: u32 = 1000;
 
 #[derive(Clone, Debug)]
 enum List<T> {

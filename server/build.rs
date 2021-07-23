@@ -5,11 +5,14 @@ use tokio::fs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut db = env::current_dir()?;
-    db.push("target");
-    db.push("schema.dat");
+    let mut path = env::current_dir()?;
+    path.push("target");
 
-    let db = db.to_str().ok_or_else(|| anyhow!("invalid UTF-8"))?;
+    let _ = fs::create_dir(&path);
+
+    path.push("schema.dat");
+
+    let db = path.to_str().ok_or_else(|| anyhow!("invalid UTF-8"))?;
 
     let _ = fs::remove_file(db).await;
 
