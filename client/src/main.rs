@@ -18,10 +18,10 @@ use sycamore::prelude::{
 };
 use tagger_shared::{
     tag_expression::{Tag, TagExpression, TagTree},
-    Action, GrantType, ImagesResponse, Patch, TagsResponse, TokenRequest, TokenSuccess,
+    Action, GrantType, ImagesResponse, Medium, Patch, TagsResponse, TokenRequest, TokenSuccess,
 };
 use wasm_bindgen::{closure::Closure, JsCast};
-use web_sys::{Event, KeyboardEvent, MouseEvent, TouchEvent};
+use web_sys::{Event, HtmlVideoElement, KeyboardEvent, MouseEvent, TouchEvent};
 
 const SWIPE_THRESHOLD_PIXELS: i32 = 50;
 
@@ -359,9 +359,27 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
     }
 }
 
+fn play_video(event: Event) {
+    if let Some(video) = event.target() {
+        if let Ok(video) = video.dyn_into::<HtmlVideoElement>() {
+            let _ = video.play();
+        }
+    }
+}
+
+fn reset_video(event: Event) {
+    if let Some(video) = event.target() {
+        if let Ok(video) = video.dyn_into::<HtmlVideoElement>() {
+            let _ = video.pause();
+            video.set_current_time(0.0);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ImageState {
     datetime: DateTime<Utc>,
+    medium: Medium,
     selected: Signal<bool>,
     tags: Signal<HashSet<Tag>>,
 }
@@ -384,7 +402,7 @@ fn images(props: ImagesProps) -> Template<G> {
         iterable: sorted_images.clone(),
 
         template: move |hash| {
-            let src = format!("{}/image/{}?size=small", state.root, hash);
+            let url = format!("{}/image/{}?size=small", state.root, hash);
 
             if let Some(image) = image_states.get().get(&hash) {
                 let image = image.clone();
@@ -440,10 +458,28 @@ fn images(props: ImagesProps) -> Template<G> {
                     }
                 };
 
-                template! {
-                    img(src=src,
-                        class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
-                        on:click=click)
+                match image.medium {
+                    Medium::ImageWithVideo | Medium::Video => {
+                        let video_url = format!("{}&variant=video", url);
+
+                        template! {
+                            video(src=video_url,
+                                  poster=url,
+                                  muted="true",
+                                  playsinline="true",
+                                  class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
+                                  on:mouseenter=play_video,
+                                  on:mouseleave=reset_video,
+                                  on:ended=reset_video,
+                                  on:click=click)
+                        }
+                    }
+
+                    Medium::Image => template! {
+                        img(src=url,
+                            class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
+                            on:click=click)
+                    },
                 }
             } else {
                 template! {}
@@ -714,6 +750,7 @@ fn main() -> Result<()> {
                             } else {
                                 ImageState {
                                     datetime: data.datetime,
+                                    medium: data.medium,
                                     tags: Signal::new(data.tags.clone()),
                                     selected: Signal::new(false),
                                 }
@@ -908,8 +945,6 @@ fn main() -> Result<()> {
         let down_coordinates = down_coordinates.clone();
 
         move |event: Event| {
-            event.prevent_default();
-
             down_coordinates.set(event_coordinates(event));
         }
     };
@@ -919,8 +954,6 @@ fn main() -> Result<()> {
         let state = state.clone();
 
         move |event: Event| {
-            event.prevent_default();
-
             if let Some((down_x, down_y)) = down_coordinates.get() {
                 down_coordinates.set(None);
 
@@ -1110,11 +1143,30 @@ fn main() -> Result<()> {
 
     let page_forward_event = move |_| page_forward();
 
+    let playing = Signal::new(false);
+
+    let toggle_playing = {
+        let playing = playing.clone();
+
+        move |_| playing.set(!*playing.get())
+    };
+
+    syc::create_effect({
+        let full_size_image = full_size_image.clone();
+        let playing = playing.clone();
+
+        move || {
+            let _ = full_size_image.get();
+
+            playing.set(false)
+        }
+    });
+
     sycamore::render(move || {
         template! {
             div(class="overlay",
-                style=format!("height:{};", if *full_size_image_visible.get() { "100%" } else { "0" })) {
-
+                style=format!("height:{};", if *full_size_image_visible.get() { "100%" } else { "0" }))
+            {
                 span(class="close cursor", on:click=close_full_size) {
                     "×"
                 }
@@ -1124,16 +1176,15 @@ fn main() -> Result<()> {
 
                     if let Some(image) = image_states.get().get(image) {
                         let image = image.clone();
+                        let medium = image.medium;
 
                         let tags = KeyedProps {
-                            iterable: syc::create_selector({
-                                move || {
-                                    let mut vec = image.tags.get().iter().cloned().collect::<Vec<_>>();
+                            iterable: syc::create_selector(move || {
+                                let mut vec = image.tags.get().iter().cloned().collect::<Vec<_>>();
 
-                                    vec.sort();
+                                vec.sort();
 
-                                    vec
-                                }
+                                vec
                             }),
 
                             template: move |tag| {
@@ -1147,16 +1198,58 @@ fn main() -> Result<()> {
                             key: |tag| tag.clone(),
                         };
 
-                        template! {
-                            img(src=url,
-                                on:mousedown=mousedown.clone(),
-                                on:mouseup=mouseup.clone(),
-                                on:mouseleave=mouseup.clone(),
-                                on:touchstart=mousedown.clone(),
-                                on:touchend=mouseup.clone(),
-                                on:touchcancel=mouseup.clone()) {}
+                        let playing = *playing.get();
 
-                            span(class="tags") {
+                        let play_button = match medium {
+                            Medium::ImageWithVideo | Medium::Video => {
+                                template! {
+                                    span(class="play cursor", on:click=toggle_playing.clone()) {
+                                        (if playing {
+                                            template!{ i(class="fa fa-stop") }
+                                        } else {
+                                            template!{ i(class="fa fa-play") }
+                                        })
+                                    }
+                                }
+                            }
+                            Medium::Image => template! {}
+                        };
+
+                        let mousedown = mousedown.clone();
+                        let mouseup = mouseup.clone();
+
+                        let show_video = match medium {
+                            Medium::ImageWithVideo | Medium::Video => playing,
+                            Medium::Image => false
+                        };
+
+                        let image = if show_video {
+                            let video_url = format!("{}&variant=video", url);
+
+                            log::info!("showing video");
+
+                            template! {
+                                video(src=video_url,
+                                      poster=url,
+                                      autoplay="true",
+                                      controls="true")
+                            }
+                        } else {
+                            log::info!("showing image");
+
+                            template! {
+                                img(src=url,
+                                    on:mousedown=mousedown.clone(),
+                                    on:mouseup=mouseup.clone(),
+                                    on:mouseleave=mouseup.clone(),
+                                    on:touchstart=mousedown.clone(),
+                                    on:touchend=mouseup.clone(),
+                                    on:touchcancel=mouseup.clone())
+                            }
+                        };
+
+                        template! {
+                            (play_button) (image) span(class="tags") {
                                 Keyed(tags)
                             }
                         }
@@ -1207,15 +1300,15 @@ fn main() -> Result<()> {
                                              start + count,
                                              total))
 
-                                    a(href="javascript:void(0);",
-                                      class="icon",
-                                      on:click=page_forward_event.clone(),
-                                      style=format!("visibility:{};",
-                                                    if start + count < total {
-                                                        "visible"
-                                                    } else {
-                                                        "hidden"
-                                                    }))
+                                        a(href="javascript:void(0);",
+                                          class="icon",
+                                          on:click=page_forward_event.clone(),
+                                          style=format!("visibility:{};",
+                                                        if start + count < total {
+                                                            "visible"
+                                                        } else {
+                                                            "hidden"
+                                                        }))
                                     {
                                         i(class="fa fa-angle-right")
                                     }

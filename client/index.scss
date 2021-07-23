@@ -67,13 +67,13 @@ ul ul {
     margin-left: 0.5em;
 }
 
-img.thumbnail {
+.thumbnail {
     display: inline-block;
     margin: 0;
     border: 3px solid black;
 }
 
-img.selected {
+.selected {
     border: 3px solid #8ebf42;
 }
 
@@ -85,8 +85,8 @@ span.tag {
 
 span.tags {
     position: absolute;
-    bottom: 8px;
-    right: 16px;
+    top: 10px;
+    left: 16px;
 }
 
 div.overlay {
@@ -103,23 +103,33 @@ div.overlay {
     transition: 0.5s;
 }
 
-div.overlay img {
+div.overlay img,
+div.overlay video {
     max-width: 100%;
     max-height: 100%;
 }
 
-span.close {
+span.cursor {
     color: white;
-    position: absolute;
-    top: 10px;
-    right: 25px;
     font-size: 100px;
     font-weight: bold;
 }
 
-span.close:hover,
-span.close:focus {
+span.cursor:hover,
+span.cursor:focus {
     color: #8ebf42;
     text-decoration: none;
     cursor: pointer;
+}
+
+span.play {
+    position: absolute;
+    bottom: 10px;
+    left: 25px;
+}
+
+span.close {
+    position: absolute;
+    top: 10px;
+    right: 25px;
 }

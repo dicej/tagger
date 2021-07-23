@@ -73,9 +73,17 @@ pub struct ImagesQuery {
     pub filter: Option<TagExpression>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub enum Medium {
+    Image,
+    ImageWithVideo,
+    Video,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImageData {
     pub datetime: DateTime<Utc>,
+    pub medium: Medium,
     pub tags: HashSet<Tag>,
 }
 
@@ -87,24 +95,41 @@ pub struct ImagesResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "lowercase")]
-pub enum ThumbnailSize {
+#[serde(rename_all = "snake_case")]
+pub enum Size {
     Small,
     Large,
 }
 
-impl Display for ThumbnailSize {
+impl Display for Size {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ThumbnailSize::Small => write!(f, "small"),
-            ThumbnailSize::Large => write!(f, "large"),
+            Size::Small => write!(f, "small"),
+            Size::Large => write!(f, "large"),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum Variant {
+    Still,
+    Video,
+}
+
+impl Display for Variant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Variant::Still => write!(f, "still"),
+            Variant::Video => write!(f, "video"),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImageQuery {
-    pub size: Option<ThumbnailSize>,
+    pub size: Option<Size>,
+    pub variant: Option<Variant>,
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone)]

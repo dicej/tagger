@@ -28,7 +28,7 @@ use sqlx::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    convert::{Infallible, TryInto},
+    convert::{Infallible, TryFrom, TryInto},
     fmt::Write as _,
     io::{Read, Seek, SeekFrom, Write},
     net::SocketAddrV4,
@@ -43,13 +43,13 @@ use std::{
 use structopt::StructOpt;
 use tagger_shared::{
     tag_expression::{Tag, TagExpression},
-    Action, ImageData, ImageQuery, ImagesQuery, ImagesResponse, Patch, TagsQuery, TagsResponse,
-    ThumbnailSize, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
+    Action, ImageData, ImageQuery, ImagesQuery, ImagesResponse, Medium, Patch, Size, TagsQuery,
+    TagsResponse, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType, Variant,
 };
 use tempfile::NamedTempFile;
 use tokio::{
     fs::{self, File},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
     sync::Mutex as AsyncMutex,
     task, time,
@@ -72,6 +72,8 @@ const TOKEN_EXPIRATION_SECS: u64 = 24 * 60 * 60;
 
 const DEFAULT_LIMIT: u32 = 1000;
 
+const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
+
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
         .parse::<SqliteConnectOptions>()?
@@ -86,12 +88,20 @@ pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     Ok(conn)
 }
 
-async fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
+async fn content_offset<P: AsRef<Path>>(offset: u64, path: P) -> Result<Vec<u8>> {
+    let mut file = File::open(path).await?;
+
+    file.seek(SeekFrom::Start(offset)).await?;
+
     let mut buffer = Vec::new();
 
-    File::open(path).await?.read_to_end(&mut buffer).await?;
+    file.read_to_end(&mut buffer).await?;
 
     Ok(buffer)
+}
+
+async fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
+    content_offset(0, path).await
 }
 
 async fn write<P: AsRef<Path>>(path: P, buffer: &[u8]) -> Result<()> {
@@ -123,6 +133,8 @@ struct Metadata {
 }
 
 fn exif_metadata(path: &Path) -> Result<Metadata> {
+    let length = i64::try_from(std::fs::File::open(path)?.metadata()?.len()).unwrap();
+
     let metadata = ExifMetadata::new_from_path(path)?;
 
     let datetime = metadata
@@ -155,7 +167,8 @@ fn exif_metadata(path: &Path) -> Result<Metadata> {
             metadata
                 .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Length")
                 .ok()
-                .and_then(|offset| offset.parse().ok())
+                .and_then(|video_length| video_length.parse::<i64>().ok())
+                .map(|video_length| length - video_length)
         } else {
             None
         },
@@ -420,8 +433,11 @@ fn build_images_query<'a>(
                 "0, count(*)"
             }
         } else {
-            "hash, datetime, (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END)
-             FROM tags WHERE hash = i.hash)"
+            "hash, \
+             datetime, \
+             video_offset, \
+             (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END) \
+              FROM tags WHERE hash = i.hash)"
         },
         if let Some(filter) = &query.filter {
             let mut buffer = String::new();
@@ -475,8 +491,13 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
                 row.get(0),
                 ImageData {
                     datetime: row.get::<&str, _>(1).parse()?,
+                    medium: match row.get::<Option<i64>, _>(2) {
+                        Some(0) => Medium::Video,
+                        Some(_) => Medium::ImageWithVideo,
+                        None => Medium::Image,
+                    },
                     tags: row
-                        .get::<&str, _>(2)
+                        .get::<&str, _>(3)
                         .split(',')
                         .filter(|s| !s.is_empty())
                         .map(Tag::from_str)
@@ -539,6 +560,7 @@ async fn apply(
                 .execute(&mut *conn)
                 .await?;
             }
+
             Action::Remove => {
                 if let Some(category) = &patch.tag.category {
                     sqlx::query!(
@@ -565,12 +587,28 @@ async fn apply(
     Ok(response().body(Body::empty())?)
 }
 
-async fn path(conn: &mut SqliteConnection, path: &str) -> Result<String> {
-    if let Some(row) = sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
-        .fetch_optional(conn)
-        .await?
-    {
-        Ok(row.path)
+struct FileData {
+    path: String,
+    video_offset: Option<i64>,
+}
+
+#[allow(clippy::eval_order_dependence)]
+async fn file_data(conn: &mut SqliteConnection, path: &str) -> Result<FileData> {
+    if let (Some(path), Some(image)) = (
+        sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
+            .fetch_optional(&mut *conn)
+            .await?,
+        sqlx::query!(
+            "SELECT video_offset FROM images WHERE hash = ?1 LIMIT 1",
+            path
+        )
+        .fetch_optional(&mut *conn)
+        .await?,
+    ) {
+        Ok(FileData {
+            path: path.path,
+            video_offset: image.video_offset,
+        })
     } else {
         Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
     }
@@ -588,7 +626,7 @@ fn bound(
 }
 
 async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
-    let full_path = [image_dir, &path].iter().collect::<PathBuf>();
+    let full_path = [image_dir, path].iter().collect::<PathBuf>();
 
     if path.to_lowercase().ends_with(".mp4") {
         let output = Command::new("ffmpeg")
@@ -617,23 +655,165 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
     }
 }
 
-async fn thumbnail(
+async fn get_variant(
     image_dir: &str,
-    path: &str,
-    thumbnail_dir: &str,
-    size: ThumbnailSize,
+    file_data: &FileData,
+    cache_dir: &str,
+    size: Size,
+    variant: Variant,
     hash: &str,
 ) -> Result<(Vec<u8>, &'static str)> {
-    let filename = format!("{}/{}/{}.jpg", thumbnail_dir, size, hash);
+    match variant {
+        Variant::Still => Ok((
+            thumbnail(image_dir, file_data, cache_dir, size, hash).await?,
+            "image/jpeg",
+        )),
+
+        Variant::Video => {
+            if let Some(offset) = file_data.video_offset {
+                Ok(match size {
+                    Size::Small => (
+                        video_preview(image_dir, &file_data.path, offset, cache_dir, hash).await?,
+                        "video/mp4",
+                    ),
+
+                    Size::Large => (
+                        content_offset(
+                            offset.try_into().unwrap(),
+                            [image_dir, &file_data.path].iter().collect::<PathBuf>(),
+                        )
+                        .await?,
+                        "video/mp4",
+                    ),
+                })
+            } else {
+                Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
+            }
+        }
+    }
+}
+
+fn video_scale(path: &Path, (width_bound, height_bound): (u32, u32)) -> Result<String> {
+    let (mut width, mut height) = task::block_in_place(|| {
+        for track in mp4parse::read_mp4(&mut std::fs::File::open(&path)?)?.tracks {
+            if let (mp4parse::TrackType::Video, Some(header)) = (track.track_type, track.tkhd) {
+                return Ok((header.width >> 16, header.height >> 16));
+            }
+        }
+
+        Err(anyhow!(
+            "unable to determine video dimensions of {}",
+            path.to_string_lossy()
+        ))
+    })?;
+
+    if width * height_bound > height * width_bound {
+        width = width_bound;
+        height = (width_bound * height) / width;
+
+        if height % 2 != 0 {
+            height -= 1;
+        }
+    } else {
+        width = (height_bound * width) / height;
+        height = height_bound;
+
+        if width % 2 != 0 {
+            width -= 1;
+        }
+    }
+
+    Ok(format!("scale={}x{}", width, height))
+}
+
+async fn video_preview(
+    image_dir: &str,
+    path: &str,
+    offset: i64,
+    cache_dir: &str,
+    hash: &str,
+) -> Result<Vec<u8>> {
+    let filename = format!("{}/video_preview/{}.mp4", cache_dir, hash);
 
     let result = content(&filename).await;
 
-    let content_type = "image/jpeg";
-
     if let Ok(result) = result {
-        Ok((result, content_type))
+        Ok(result)
     } else {
-        let (image, format) = still_image(image_dir, path).await?;
+        if let Some(parent) = Path::new(&filename).parent() {
+            let _ = fs::create_dir(parent).await;
+        }
+
+        let full_path = [image_dir, path].iter().collect::<PathBuf>();
+
+        let output = if offset == 0 {
+            Command::new("ffmpeg")
+                .arg("-i")
+                .arg(&full_path)
+                .arg("-ss")
+                .arg("00:00:00")
+                .arg("-to")
+                .arg(VIDEO_PREVIEW_LENGTH_HMS)
+                .arg("-vf")
+                .arg(&video_scale(&full_path, SMALL_BOUNDS)?)
+                .arg("-an")
+                .arg(&filename)
+                .output()
+                .await
+        } else {
+            let original = content_offset(offset.try_into().unwrap(), full_path).await?;
+
+            let original = task::block_in_place(|| {
+                let mut file = NamedTempFile::new()?;
+
+                file.write_all(&original)?;
+
+                Ok::<_, Error>(file)
+            })?;
+
+            let output = Command::new("ffmpeg")
+                .arg("-i")
+                .arg(original.path())
+                .arg("-vf")
+                .arg(&video_scale(original.path(), SMALL_BOUNDS)?)
+                .arg("-an")
+                .arg(&filename)
+                .output()
+                .await;
+
+            task::block_in_place(move || drop(original));
+
+            output
+        }?;
+
+        if output.status.success() {
+            content(&filename).await
+        } else {
+            let _ = fs::remove_file(&filename).await;
+
+            Err(anyhow!(
+                "error running ffmpeg: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+}
+
+async fn thumbnail(
+    image_dir: &str,
+    file_data: &FileData,
+    cache_dir: &str,
+    size: Size,
+    hash: &str,
+) -> Result<Vec<u8>> {
+    let filename = format!("{}/{}/{}.jpg", cache_dir, size, hash);
+
+    let result = content(&filename).await;
+
+    Ok(if let Ok(result) = result {
+        result
+    } else {
+        let (image, format) = still_image(image_dir, &file_data.path).await?;
 
         let original = image::load_from_memory_with_format(&image, format)?;
 
@@ -677,8 +857,8 @@ async fn thumbnail(
         };
 
         let resized = resize(match size {
-            ThumbnailSize::Small => SMALL_BOUNDS,
-            ThumbnailSize::Large => LARGE_BOUNDS,
+            Size::Small => SMALL_BOUNDS,
+            Size::Large => LARGE_BOUNDS,
         })?;
 
         if let Some(parent) = Path::new(&filename).parent() {
@@ -687,25 +867,33 @@ async fn thumbnail(
 
         write(&filename, &resized).await?;
 
-        Ok((resized, content_type))
-    }
+        resized
+    })
 }
 
 async fn image(
     conn: &AsyncMutex<SqliteConnection>,
     image_dir: &str,
-    thumbnail_dir: &str,
+    cache_dir: &str,
     hash: &str,
     query: &ImageQuery,
 ) -> Result<Response<Body>> {
-    let path = path(conn.lock().await.deref_mut(), hash).await?;
+    let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
 
     let (image, content_type) = if let Some(size) = query.size {
-        thumbnail(image_dir, &path, thumbnail_dir, size, hash).await?
+        get_variant(
+            image_dir,
+            &file_data,
+            cache_dir,
+            size,
+            query.variant.unwrap_or(Variant::Still),
+            hash,
+        )
+        .await?
     } else {
         (
-            content([image_dir, &path].iter().collect::<PathBuf>()).await?,
-            if path.to_lowercase().ends_with(".mp4") {
+            content([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?,
+            if file_data.path.to_lowercase().ends_with(".mp4") {
                 "video/mp4"
             } else {
                 "image/jpeg"
@@ -1062,7 +1250,7 @@ fn routes(
                                         image(
                                             &conn,
                                             &options.image_directory,
-                                            &options.thumbnail_directory,
+                                            &options.cache_directory,
                                             &hash,
                                             &query,
                                         )
@@ -1166,13 +1354,13 @@ pub struct Options {
     #[structopt(long)]
     pub address: SocketAddrV4,
 
-    /// Directory containing image files
+    /// Directory containing source image and video files
     #[structopt(long)]
     pub image_directory: String,
 
-    /// Directory in which to cache generated thumbnail images
+    /// Directory in which to cache lazily generated image and video variants
     #[structopt(long)]
-    pub thumbnail_directory: String,
+    pub cache_directory: String,
 
     /// SQLite database to create or reuse
     #[structopt(long)]
@@ -1236,8 +1424,8 @@ mod test {
             .to_str()
             .ok_or_else(|| anyhow!("invalid UTF-8"))?;
 
-        let thumbnail_tmp_dir = TempDir::new()?;
-        let thumbnail_dir = thumbnail_tmp_dir
+        let cache_tmp_dir = TempDir::new()?;
+        let cache_dir = cache_tmp_dir
             .path()
             .to_str()
             .ok_or_else(|| anyhow!("invalid UTF-8"))?;
@@ -1247,7 +1435,7 @@ mod test {
             &Arc::new(Options {
                 address: "0.0.0.0:0".parse()?,
                 image_directory: image_dir.to_owned(),
-                thumbnail_directory: thumbnail_dir.to_owned(),
+                cache_directory: cache_dir.to_owned(),
                 state_file: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 public_directory: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 cert_file: None,
@@ -2556,8 +2744,8 @@ mod test {
                             .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
                             .unwrap(),
                         match size {
-                            Size::Small => "?size=small",
-                            Size::Large => "?size=large",
+                            Size::Small => "?variant=small",
+                            Size::Large => "?variant=large",
                             Size::Original => "",
                         }
                     ))

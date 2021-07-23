@@ -1,9 +1,6 @@
-video support
-  including motion photo
-  generate small video from motion photo
-  generate small, short video from video
-  tests
-performance (e.g. O(n) ops in FE)
+performance
+  O(n) ops in FE
+  stream files instead of loading them into memory in BE
 login/logout
   disallow selection when logged out
 clean up
@@ -13,7 +10,7 @@ clean up
   remove State from FE?
 minimize expensive clones
 break up tests
-stream files instead of loading them into memory in BE
+video tests
 document
 demo site?
   e.g. sandbox mode where database is copied to in memory db that is dropped on token expiration (e.g. 30 minutes)
