@@ -168,11 +168,11 @@ fn exif_metadata(path: &Path) -> Result<Metadata> {
             metadata
                 .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Length")
                 .ok()
-                .and_then(|video_length| video_length.parse::<i64>().ok())
-                .map(|video_length| length - video_length)
         } else {
-            None
-        },
+            metadata.get_tag_string("Xmp.GCamera.MicroVideoOffset").ok()
+        }
+        .and_then(|video_length| video_length.parse::<i64>().ok())
+        .map(|video_length| length - video_length),
     })
 }
 
@@ -200,7 +200,7 @@ fn mp4_metadata(path: &Path) -> Result<Metadata> {
 fn find_new<'a>(
     conn: &'a AsyncMutex<SqliteConnection>,
     root: &'a str,
-    result: &'a mut Vec<(String, Metadata)>,
+    result: &'a mut Vec<(String, Option<Metadata>)>,
     dir: impl AsRef<Path> + 'a + Send,
 ) -> BoxFuture<'a, Result<()>> {
     let dir_buf = dir.as_ref().to_path_buf();
@@ -218,6 +218,7 @@ fn find_new<'a>(
                     if lowercase.ends_with(".jpg")
                         || lowercase.ends_with(".jpeg")
                         || lowercase.ends_with(".mp4")
+                        || lowercase.ends_with(".mov")
                     {
                         let mut path = dir_buf.clone();
                         path.push(name);
@@ -234,19 +235,38 @@ fn find_new<'a>(
                                 .is_some();
 
                         if !found {
-                            let metadata = task::block_in_place(|| {
-                                if lowercase.ends_with(".mp4") {
-                                    mp4_metadata(&path)
-                                } else {
-                                    exif_metadata(&path)
-                                }
-                            });
+                            let found_bad = sqlx::query!(
+                                "SELECT 1 as x FROM bad_paths WHERE path = ?1",
+                                stripped
+                            )
+                            .fetch_optional(conn.lock().await.deref_mut())
+                            .await?
+                            .is_some();
 
-                            match metadata {
-                                Ok(data) => result.push((stripped.to_string(), data)),
-                                Err(e) => {
-                                    warn!("unable to get metadata for {}: {:?}", lowercase, e)
-                                }
+                            if !found_bad {
+                                let metadata = task::block_in_place(|| {
+                                    if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
+                                        mp4_metadata(&path)
+                                    } else {
+                                        exif_metadata(&path)
+                                    }
+                                });
+
+                                result.push((
+                                    stripped.to_string(),
+                                    match metadata {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            warn!(
+                                                "unable to get metadata for {}: {:?}",
+                                                path.to_string_lossy(),
+                                                e
+                                            );
+
+                                            None
+                                        }
+                                    },
+                                ));
                             }
                         }
                     }
@@ -291,12 +311,20 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
 
     let new_len = new.len();
 
-    for (path, data) in new {
-        let hash = hash(&content([image_dir, &path].iter().collect::<PathBuf>()).await?);
+    for (index, (path, data)) in new.into_iter().enumerate() {
+        if let Some(data) = data {
+            let hash = hash(&content([image_dir, &path].iter().collect::<PathBuf>()).await?);
 
-        info!("insert {} (hash {}; data {:?})", path, hash, data);
+            info!(
+                "({} of {}) insert {} (hash {}; data {:?})",
+                index + 1,
+                new_len,
+                path,
+                hash,
+                data
+            );
 
-        conn.lock()
+            conn.lock()
             .await
             .transaction(|conn| {
                 async move {
@@ -336,11 +364,18 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
                 }
                 .boxed()
             })
-            .await?;
+                .await?;
+        } else {
+            info!("({} of {}) insert bad path {}", index + 1, new_len, path);
+
+            sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
     }
 
-    for path in obsolete {
-        info!("delete {}", path);
+    for (index, path) in obsolete.into_iter().enumerate() {
+        info!("({} of {}) delete {}", index + 1, obsolete_len, path);
 
         conn.lock()
             .await
@@ -363,6 +398,10 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
                                 .execute(&mut *conn)
                                 .await?;
                         }
+                    } else {
+                        sqlx::query!("DELETE FROM bad_paths WHERE path = ?1", path)
+                            .execute(&mut *conn)
+                            .await?;
                     }
 
                     Ok::<_, Error>(())
@@ -389,6 +428,11 @@ fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
         } else {
             "EXISTS (SELECT * FROM tags WHERE hash = i.hash AND category IS NULL AND tag = ?)"
         }),
+        TagExpression::Not(a) => {
+            buffer.push_str("(NOT ");
+            append_filter_clause(buffer, a);
+            buffer.push(')');
+        }
         TagExpression::And(a, b) => {
             buffer.push('(');
             append_filter_clause(buffer, a);
@@ -646,7 +690,9 @@ fn bound(
 async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
     let full_path = [image_dir, path].iter().collect::<PathBuf>();
 
-    if path.to_lowercase().ends_with(".mp4") {
+    let lowercase = path.to_lowercase();
+
+    if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
         let output = Command::new("ffmpeg")
             .arg("-i")
             .arg(full_path)
@@ -683,7 +729,7 @@ async fn get_variant(
 ) -> Result<(Vec<u8>, &'static str)> {
     match variant {
         Variant::Still => Ok((
-            thumbnail(image_dir, file_data, cache_dir, size, hash).await?,
+            thumbnail(image_dir, &file_data.path, cache_dir, size, hash).await?,
             "image/jpeg",
         )),
 
@@ -711,21 +757,21 @@ async fn get_variant(
     }
 }
 
-fn video_scale(path: &Path, bounds: (u32, u32), orientation: Orientation) -> Result<String> {
-    let dimensions = task::block_in_place(|| {
-        for track in mp4parse::read_mp4(&mut std::fs::File::open(&path)?)?.tracks {
-            if let (mp4parse::TrackType::Video, Some(header)) = (track.track_type, track.tkhd) {
-                return Ok((header.width >> 16, header.height >> 16));
-            }
-        }
+async fn video_scale(
+    image_dir: &str,
+    path: &str,
+    cache_dir: &str,
+    size: Size,
+    hash: &str,
+) -> Result<String> {
+    let thumbnail = thumbnail(image_dir, path, cache_dir, size, hash).await?;
 
-        Err(anyhow!(
-            "unable to determine video dimensions of {}",
-            path.to_string_lossy()
-        ))
-    })?;
+    let orientation = ExifMetadata::new_from_buffer(&thumbnail)
+        .map(|metadata| metadata.get_orientation())
+        .unwrap_or(Orientation::Normal);
 
-    let (mut width, mut height) = bound(dimensions, bounds, orientation);
+    let (mut width, mut height) =
+        image::load_from_memory_with_format(&thumbnail, ImageFormat::Jpeg)?.dimensions();
 
     if width % 2 != 0 {
         width -= 1;
@@ -760,6 +806,8 @@ async fn video_preview(
             let _ = fs::create_dir(parent).await;
         }
 
+        let scale = video_scale(image_dir, path, cache_dir, Size::Small, hash).await?;
+
         let full_path = [image_dir, path].iter().collect::<PathBuf>();
 
         let output = if offset == 0 {
@@ -771,17 +819,13 @@ async fn video_preview(
                 .arg("-to")
                 .arg(VIDEO_PREVIEW_LENGTH_HMS)
                 .arg("-vf")
-                .arg(&video_scale(&full_path, SMALL_BOUNDS, Orientation::Normal)?)
+                .arg(&scale)
                 .arg("-an")
                 .arg(&filename)
                 .output()
                 .await
         } else {
             let original = content(full_path).await?;
-
-            let orientation = ExifMetadata::new_from_buffer(&original)
-                .map(|m| m.get_orientation())
-                .unwrap_or(Orientation::Normal);
 
             let original = task::block_in_place(|| {
                 let mut file = NamedTempFile::new()?;
@@ -794,8 +838,12 @@ async fn video_preview(
             let output = Command::new("ffmpeg")
                 .arg("-i")
                 .arg(original.path())
+                // TODO: this assumes stream 0 has the video we want, but we should use either mp4parse or ffprobe
+                // to find the video stream with the longest duration and use that.
+                .arg("-map")
+                .arg("0:0")
                 .arg("-vf")
-                .arg(&video_scale(original.path(), SMALL_BOUNDS, orientation)?)
+                .arg(&scale)
                 .arg("-an")
                 .arg(&filename)
                 .output()
@@ -821,7 +869,7 @@ async fn video_preview(
 
 async fn thumbnail(
     image_dir: &str,
-    file_data: &FileData,
+    path: &str,
     cache_dir: &str,
     size: Size,
     hash: &str,
@@ -833,7 +881,7 @@ async fn thumbnail(
     Ok(if let Ok(result) = result {
         result
     } else {
-        let (image, format) = still_image(image_dir, &file_data.path).await?;
+        let (image, format) = still_image(image_dir, path).await?;
 
         let original = image::load_from_memory_with_format(&image, format)?;
 
@@ -918,9 +966,11 @@ async fn image(
         )
         .await?
     } else {
+        let lowercase = file_data.path.to_lowercase();
+
         (
             content([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?,
-            if file_data.path.to_lowercase().ends_with(".mp4") {
+            if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
                 "video/mp4"
             } else {
                 "image/jpeg"

@@ -10,6 +10,7 @@ serde = "1"
 serde_derive = "1"
 lalrpop-util = "0.19"
 regex-syntax = "0.6"
+lazy_static = "1"
 chrono = { version = "0.4", features = [ "serde" ] }
 
 [dev-dependencies]

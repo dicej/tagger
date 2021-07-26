@@ -7,7 +7,7 @@ use tagger_server::Options;
 use tokio::{sync::Mutex as AsyncMutex, task, time};
 use tracing::error;
 
-const SYNC_INTERVAL_SECONDS: u64 = 10;
+const SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
         let conn = conn.clone();
 
         async move {
-            time::sleep(Duration::from_secs(SYNC_INTERVAL_SECONDS)).await;
+            time::sleep(SYNC_INTERVAL).await;
 
             if let Err(e) = tagger_server::sync(&conn, &options.image_directory).await {
                 error!("sync error: {:?}", e);

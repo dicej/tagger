@@ -5,6 +5,9 @@ pub static DDL_STATEMENTS: &[&str] = &[
        path          TEXT NOT NULL PRIMARY KEY,
        hash          TEXT NOT NULL
      )",
+    "CREATE TABLE IF NOT EXISTS bad_paths (
+       path          TEXT NOT NULL PRIMARY KEY
+     )",
     "CREATE TABLE IF NOT EXISTS images (
        hash          TEXT NOT NULL PRIMARY KEY,
        datetime      TEXT NOT NULL,

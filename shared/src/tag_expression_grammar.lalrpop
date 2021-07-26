@@ -8,7 +8,12 @@ pub TagExpression = {
 }
 
 And = {
-    <a:And> "and" <b:Term> => Box::new(TagExpression::And(a, b)),
+    <a:And> "and" <b:Not> => Box::new(TagExpression::And(a, b)),
+    Not
+}
+
+Not = {
+    "not" <a:Term> => Box::new(TagExpression::Not(a)),
     Term
 }
 
@@ -25,5 +30,5 @@ Term: Box<TagExpression> = {
 }
 
 Name = {
-    r"\w+"
+    r"[\w-]+"
 }

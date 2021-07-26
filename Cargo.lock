@@ -2213,6 +2213,7 @@ dependencies = [
  "chrono",
  "lalrpop",
  "lalrpop-util",
+ "lazy_static",
  "maplit",
  "regex-syntax",
  "serde",

@@ -1,5 +1,6 @@
 use crate::tag_expression_grammar::TagExpressionParser;
 use anyhow::{anyhow, Error, Result};
+use lazy_static::lazy_static;
 use serde::{Deserializer, Serializer};
 use std::{
     collections::BTreeMap,
@@ -13,34 +14,15 @@ pub struct Tag {
     pub value: String,
 }
 
-fn validate(s: &str) -> Result<()> {
-    if s.chars().all(regex_syntax::is_word_character) {
-        Ok(())
-    } else {
-        Err(anyhow!("found non-word character in {}", s))
-    }
-}
-
 impl FromStr for Tag {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(if let Some((a, b)) = s.split_once(':') {
-            validate(a)?;
-            validate(b)?;
-
-            Tag {
-                category: Some(a.into()),
-                value: b.into(),
-            }
+        if let TagExpression::Tag(tag) = s.parse::<TagExpression>()? {
+            Ok(tag)
         } else {
-            validate(s)?;
-
-            Tag {
-                category: None,
-                value: s.into(),
-            }
-        })
+            Err(anyhow!("expected tag, got {}", s))
+        }
     }
 }
 
@@ -78,6 +60,7 @@ impl serde::Serialize for Tag {
 pub enum TagExpression {
     Or(Box<TagExpression>, Box<TagExpression>),
     And(Box<TagExpression>, Box<TagExpression>),
+    Not(Box<TagExpression>),
     Tag(Tag),
 }
 
@@ -91,6 +74,7 @@ impl TagExpression {
             TagExpression::Or(a, b) | TagExpression::And(a, b) => {
                 b.fold_tags(a.fold_tags(value, fold), fold)
             }
+            TagExpression::Not(a) => a.fold_tags(value, fold),
             TagExpression::Tag(tag) => fold(value, tag.category.as_deref(), &tag.value),
         }
     }
@@ -100,7 +84,11 @@ impl FromStr for TagExpression {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        TagExpressionParser::new()
+        lazy_static! {
+            static ref PARSER: TagExpressionParser = TagExpressionParser::new();
+        }
+
+        PARSER
             .parse(s)
             .map(|tags| *tags)
             .map_err(|e| anyhow!("{}", e))
@@ -111,6 +99,7 @@ impl Display for TagExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TagExpression::Tag(tag) => write!(f, "{}", tag),
+            TagExpression::Not(a) => write!(f, "(not {})", a),
             TagExpression::And(a, b) => write!(f, "({} and {})", a, b),
             TagExpression::Or(a, b) => write!(f, "({} or {})", a, b),
         }
@@ -138,45 +127,29 @@ impl serde::Serialize for TagExpression {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
-pub struct TagTree(pub BTreeMap<Tag, TagTree>);
-
-fn insert(map: &mut BTreeMap<Tag, TagTree>, expression: &TagExpression, subtree: TagTree) {
-    match expression {
-        TagExpression::Or(a, b) => {
-            insert(map, &a, subtree.clone());
-            insert(map, &b, subtree);
-        }
-        TagExpression::And(a, b) => {
-            let mut submap = BTreeMap::new();
-            insert(&mut submap, &b, subtree);
-            insert(map, &a, TagTree(submap));
-        }
-        TagExpression::Tag(tag) => {
-            map.insert(tag.clone(), subtree);
-        }
-    }
+pub struct TagData {
+    pub not: bool,
+    pub subtree: TagTree,
 }
 
-impl From<Option<&TagExpression>> for TagTree {
-    fn from(expression: Option<&TagExpression>) -> Self {
-        let mut map = BTreeMap::new();
-        if let Some(expression) = expression {
-            insert(&mut map, expression, TagTree::default());
-        }
-        TagTree(map)
-    }
-}
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct TagTree(pub BTreeMap<Tag, TagData>);
 
 impl From<&TagTree> for Option<TagExpression> {
     fn from(tree: &TagTree) -> Self {
-        tree.0.iter().fold(None, |acc, (tag, subtree)| {
-            let tag = TagExpression::Tag(tag.clone());
+        tree.0.iter().fold(None, |acc, (tag, data)| {
+            let mut tag = TagExpression::Tag(tag.clone());
 
-            let subexpression = if let Some(subexpression) = subtree.into() {
-                TagExpression::And(Box::new(tag), Box::new(subexpression))
-            } else {
-                tag
-            };
+            if data.not {
+                tag = TagExpression::Not(Box::new(tag));
+            }
+
+            let subexpression =
+                if let Some(subexpression) = Option::<TagExpression>::from(&data.subtree) {
+                    TagExpression::And(Box::new(tag), Box::new(subexpression))
+                } else {
+                    tag
+                };
 
             Some(if let Some(acc) = acc {
                 TagExpression::Or(Box::new(acc), Box::new(subexpression))
@@ -227,13 +200,19 @@ mod test {
         TagExpression::Or(Box::new(a), Box::new(b))
     }
 
+    fn not(a: TagExpression) -> TagExpression {
+        TagExpression::Not(Box::new(a))
+    }
+
     #[test]
     fn parse() -> Result<()> {
         assert_eq!(tag("foo"), parse_te("foo")?);
+        assert_eq!(tag("foo-bar"), parse_te("foo-bar")?);
         assert_eq!(tag("foo"), parse_te("(foo)")?);
         assert_eq!(cat_tag("um", "foo"), parse_te("um:foo")?);
         assert_eq!(and(tag("foo"), tag("bar")), parse_te("foo and bar")?);
         assert_eq!(or(tag("foo"), tag("bar")), parse_te("foo or bar")?);
+        assert_eq!(not(tag("foo")), parse_te("not foo")?);
         assert_eq!(
             or(tag("foo"), and(tag("bar"), tag("baz"))),
             parse_te("foo or (bar and baz)")?
@@ -250,88 +229,151 @@ mod test {
             and(or(tag("foo"), tag("bar")), tag("baz")),
             parse_te("((foo or bar) and baz)")?
         );
+        assert_eq!(
+            not(and(or(tag("foo"), tag("bar")), tag("baz"))),
+            parse_te("not ((foo or bar) and baz)")?
+        );
+        assert_eq!(
+            and(or(tag("foo"), tag("bar")), not(tag("baz"))),
+            parse_te("((foo or bar) and not baz)")?
+        );
+        assert_eq!(
+            and(not(or(tag("foo"), tag("bar"))), tag("baz")),
+            parse_te("(not (foo or bar) and baz)")?
+        );
+        assert_eq!(
+            and(or(not(tag("foo")), tag("bar")), tag("baz")),
+            parse_te("((not foo or bar) and baz)")?
+        );
 
         Ok(())
     }
 
-    fn assert_into(tree: TagTree, expression: Option<TagExpression>) {
-        let tree_from_expression = TagTree::from(expression.as_ref());
-        assert_eq!(tree, tree_from_expression);
-        assert_eq!(
-            Option::<TagExpression>::from(&tree),
-            Option::<TagExpression>::from(&tree_from_expression)
-        );
-    }
-
     #[test]
     fn trees() {
-        assert_into(TagTree::default(), None::<TagExpression>);
-        assert_into(
-            TagTree(btreemap![
-                raw_tag("foo") => TagTree::default()
-            ]),
+        assert_eq!(
+            None::<TagExpression>,
+            Option::<TagExpression>::from(&TagTree::default())
+        );
+        assert_eq!(
             Some(tag("foo")),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData::default()
+            ]))
         );
-        assert_into(
-            TagTree(btreemap![
-                raw_tag("foo") => TagTree(btreemap![
-                    raw_tag("bar") => TagTree::default()
-                ])
-            ]),
+        assert_eq!(
+            Some(not(tag("foo"))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: true,
+                    subtree: TagTree::default(),
+                }
+            ])),
+        );
+        assert_eq!(
             Some(and(tag("foo"), tag("bar"))),
-        );
-        assert_into(
-            TagTree(btreemap![
-                raw_tag("foo") => TagTree(btreemap![
-                    raw_tag("bar") => TagTree::default()
-                ]),
-                raw_tag("baz") => TagTree::default()
-            ]),
-            Some(or(and(tag("foo"), tag("bar")), tag("baz"))),
-        );
-        assert_into(
-            TagTree(btreemap![
-                raw_tag("foo") => TagTree(btreemap![
-                    raw_tag("bar") => TagTree::default()
-                ]),
-                raw_tag("baz") => TagTree(btreemap![
-                    raw_tag("wat") => TagTree::default()
-                ])
-            ]),
-            Some(or(and(tag("foo"), tag("bar")), and(tag("baz"), tag("wat")))),
-        );
-        assert_into(
-            TagTree(btreemap![
-                raw_tag("foo") => TagTree(btreemap![
-                    raw_tag("baz") => TagTree::default(),
-                    raw_tag("wat") => TagTree::default()
-                ]),
-                raw_tag("bar") => TagTree(btreemap![
-                    raw_tag("baz") => TagTree::default(),
-                    raw_tag("wat") => TagTree::default()
-                ])
-            ]),
-            Some(and(or(tag("foo"), tag("bar")), or(tag("baz"), tag("wat")))),
-        );
-        assert_into(
-            TagTree(btreemap![
-                raw_tag("foo") => TagTree(btreemap![
-                    raw_tag("baz") => TagTree::default(),
-                    raw_tag("wat") => TagTree(btreemap![
-                        raw_tag("umm") => TagTree::default()
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("bar") => TagData::default()
                     ])
-                ]),
-                raw_tag("bar") => TagTree(btreemap![
-                    raw_tag("baz") => TagTree::default(),
-                    raw_tag("wat") => TagTree(btreemap![
-                        raw_tag("umm") => TagTree::default()
+                }
+            ])),
+        );
+        assert_eq!(
+            Some(and(not(tag("foo")), tag("bar"))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: true,
+                    subtree: TagTree(btreemap![
+                        raw_tag("bar") => TagData::default()
                     ])
-                ])
-            ]),
-            Some(and(
-                or(tag("foo"), tag("bar")),
-                or(tag("baz"), and(tag("wat"), tag("umm"))),
+                }
+            ]))
+        );
+        assert_eq!(
+            Some(or(tag("baz"), and(tag("foo"), tag("bar")))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("bar") => TagData::default()
+                    ])
+                },
+                raw_tag("baz") => TagData::default()
+            ])),
+        );
+        assert_eq!(
+            Some(or(and(tag("baz"), tag("wat")), and(tag("foo"), tag("bar")))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("bar") => TagData::default()
+                    ])
+                },
+                raw_tag("baz") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("wat") => TagData::default()
+                    ])
+                }
+            ])),
+        );
+        assert_eq!(
+            Some(or(
+                and(tag("bar"), or(tag("baz"), tag("wat"))),
+                and(tag("foo"), or(tag("baz"), tag("wat")))
             )),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("baz") => TagData::default(),
+                        raw_tag("wat") => TagData::default()
+                    ])
+                },
+                raw_tag("bar") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("baz") => TagData::default(),
+                        raw_tag("wat") => TagData::default()
+                    ])
+                }
+            ])),
+        );
+        assert_eq!(
+            Some(or(
+                and(tag("bar"), or(tag("baz"), and(tag("wat"), tag("umm")))),
+                and(tag("foo"), or(tag("baz"), and(tag("wat"), tag("umm"))))
+            )),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("baz") => TagData::default(),
+                        raw_tag("wat") => TagData {
+                            not: false,
+                            subtree: TagTree(btreemap![
+                                raw_tag("umm") => TagData::default()
+                            ])
+                        }
+                    ])
+                },
+                raw_tag("bar") => TagData {
+                    not: false,
+                    subtree: TagTree(btreemap![
+                        raw_tag("baz") => TagData::default(),
+                        raw_tag("wat") => TagData {
+                            not: false,
+                            subtree: TagTree(btreemap![
+                                raw_tag("umm") => TagData::default()
+                            ])
+                        }
+                    ])
+                }
+            ]))
         );
     }
 }

@@ -17,7 +17,7 @@ use sycamore::prelude::{
     self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
 };
 use tagger_shared::{
-    tag_expression::{Tag, TagExpression, TagTree},
+    tag_expression::{Tag, TagData, TagExpression, TagTree},
     Action, GrantType, ImagesResponse, Medium, Patch, TagsResponse, TokenRequest, TokenSuccess,
 };
 use wasm_bindgen::{closure::Closure, JsCast};
@@ -27,7 +27,7 @@ const SWIPE_THRESHOLD_PIXELS: i32 = 50;
 
 const MAX_CLICK_DISTANCE_PIXELS: f64 = 5.0;
 
-const MAX_IMAGES_PER_PAGE: u32 = 1000;
+const MAX_IMAGES_PER_PAGE: u32 = 100;
 
 #[derive(Clone, Debug)]
 enum List<T> {
@@ -51,19 +51,33 @@ fn find_categories<'a>(
     }
 }
 
-fn to_tree(filter_chain: &List<Tag>) -> TagTree {
-    fn recurse(filter_chain: &List<Tag>, tree: TagTree) -> TagTree {
+fn to_tree(filter_chain: &List<Tag>, filter: &TagTree) -> TagTree {
+    fn recurse<'a>(
+        filter_chain: &List<Tag>,
+        filter: &'a TagTree,
+        tree: TagTree,
+    ) -> (Option<&'a TagTree>, TagTree) {
         match filter_chain {
-            List::Nil => tree,
+            List::Nil => (Some(filter), tree),
             List::Cons(cons) => {
+                let (filter, subtree) = recurse(&cons.1, filter, tree);
+                let data = filter.and_then(|filter| filter.0.get(&cons.0));
+
                 let mut parent = TagTree::default();
-                parent.0.insert(cons.0.clone(), recurse(&cons.1, tree));
-                parent
+                parent.0.insert(
+                    cons.0.clone(),
+                    TagData {
+                        not: data.map(|data| data.not).unwrap_or(false),
+                        subtree,
+                    },
+                );
+
+                (data.map(|data| &data.subtree), parent)
             }
         }
     }
 
-    recurse(filter_chain, TagTree::default())
+    recurse(filter_chain, filter, TagTree::default()).1
 }
 
 fn find_tag<'a>(
@@ -88,14 +102,17 @@ fn find_tag<'a>(
 fn resolve<'a>(filter_chain: &List<Tag>, filter: &'a TagTree) -> Option<&'a TagTree> {
     match filter_chain {
         List::Nil => Some(filter),
-        List::Cons(cons) => resolve(&cons.1, filter).and_then(|tree| tree.0.get(&cons.0)),
+        List::Cons(cons) => {
+            resolve(&cons.1, filter).and_then(|tree| tree.0.get(&cons.0).map(|data| &data.subtree))
+        }
     }
 }
 
 fn resolve_mut<'a>(filter_chain: &List<Tag>, filter: &'a mut TagTree) -> Option<&'a mut TagTree> {
     match filter_chain {
         List::Nil => Some(filter),
-        List::Cons(cons) => resolve_mut(&cons.1, filter).and_then(|tree| tree.0.get_mut(&cons.0)),
+        List::Cons(cons) => resolve_mut(&cons.1, filter)
+            .and_then(|tree| tree.0.get_mut(&cons.0).map(|data| &mut data.subtree)),
     }
 }
 
@@ -103,6 +120,78 @@ fn is_filtered(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> bool {
     resolve(filter_chain, filter)
         .map(|tree| tree.0.contains_key(tag))
         .unwrap_or(false)
+}
+
+#[derive(Clone)]
+struct PaginationProps {
+    images: StateHandle<ImagesResponse>,
+    page_starts: StateHandle<Vec<DateTime<Utc>>>,
+    page_back: Rc<dyn Fn()>,
+    page_forward: Rc<dyn Fn()>,
+}
+
+#[component(Pagination<G>)]
+fn pagination(props: PaginationProps) -> Template<G> {
+    let PaginationProps {
+        images,
+        page_starts,
+        page_back,
+        page_forward,
+    } = props;
+
+    template! {
+        span(class="pagination") {
+            ({
+                let images = images.get();
+                let count = u32::try_from(images.images.len()).unwrap();
+                let ImagesResponse { start, total, .. } = *images.deref();
+                let page_starts = page_starts.clone();
+                let page_back = page_back.clone();
+                let page_forward = page_forward.clone();
+
+                if total == 0 {
+                    template! {
+                        em {
+                            "No images match current filter"
+                        }
+                    }
+                } else {
+                    template! {
+                        a(href="javascript:void(0);",
+                          class="icon",
+                          on:click=move |_| page_back(),
+                          style=format!("visibility:{};",
+                                        if page_starts.get().len() > 1 {
+                                            "visible"
+                                        } else {
+                                            "hidden"
+                                        }))
+                        {
+                            i(class="fa fa-angle-left")
+                        }
+
+                        (format!(" {}-{} of {} ",
+                                 start + 1,
+                                 start + count,
+                                 total))
+
+                            a(href="javascript:void(0);",
+                              class="icon",
+                              on:click=move |_| page_forward(),
+                              style=format!("visibility:{};",
+                                            if start + count < total {
+                                                "visible"
+                                            } else {
+                                                "hidden"
+                                            }))
+                        {
+                            i(class="fa fa-angle-right")
+                        }
+                    }
+                }
+            })
+        }
+    }
 }
 
 struct TagSubMenuProps {
@@ -136,7 +225,7 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
                 tags: watch::<TagsResponse>(
                     Signal::new("tags".into()).into_handle(),
                     state.clone(),
-                    Signal::new(to_tree(&filter_chain)).into_handle(),
+                    Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
                 ),
                 category: None,
             }
@@ -316,7 +405,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                         if *is_filtered.get() {
                             tree.0.remove(&tag);
                         } else {
-                            tree.0.insert(tag.clone(), TagTree::default());
+                            tree.0.insert(tag.clone(), TagData::default());
                         }
 
                         filter.set(new_filter);
@@ -1143,16 +1232,19 @@ fn main() -> Result<()> {
         }
     });
 
-    let page_back_event = move |_| page_back();
-
-    let page_forward_event = move |_| page_forward();
-
     let playing = Signal::new(false);
 
     let toggle_playing = {
         let playing = playing.clone();
 
         move |_| playing.set(!*playing.get())
+    };
+
+    let pagination = PaginationProps {
+        images: images.clone(),
+        page_starts: page_starts.handle(),
+        page_back: Rc::new(page_back.clone()),
+        page_forward: Rc::new(page_forward.clone()),
     };
 
     syc::create_effect({
@@ -1271,54 +1363,7 @@ fn main() -> Result<()> {
                         i(class="fa fa-bars")
                     }
 
-                    span(class="pagination") {
-                        ({
-                            let images = images.get();
-                            let count = u32::try_from(images.images.len()).unwrap();
-                            let ImagesResponse { start, total, .. } = *images.deref();
-                            let page_starts = page_starts.clone();
-
-                            if total == 0 {
-                                template! {
-                                    em {
-                                        "No images match current filter"
-                                    }
-                                }
-                            } else {
-                                template! {
-                                    a(href="javascript:void(0);",
-                                      class="icon",
-                                      on:click=page_back_event.clone(),
-                                      style=format!("visibility:{};",
-                                                    if page_starts.get().len() > 1 {
-                                                        "visible"
-                                                    } else {
-                                                        "hidden"
-                                                    }))
-                                    {
-                                        i(class="fa fa-angle-left")
-                                    }
-
-                                    (format!(" {}-{} of {} ",
-                                             start + 1,
-                                             start + count,
-                                             total))
-
-                                        a(href="javascript:void(0);",
-                                          class="icon",
-                                          on:click=page_forward_event.clone(),
-                                          style=format!("visibility:{};",
-                                                        if start + count < total {
-                                                            "visible"
-                                                        } else {
-                                                            "hidden"
-                                                        }))
-                                    {
-                                        i(class="fa fa-angle-right")
-                                    }
-                                }
-                            }})
-                    }
+                    Pagination(pagination.clone())
 
                     a(href="javascript:void(0);",
                       class=format!("icon select {}", if *selecting.get() { " enabled" } else { "" }),
@@ -1360,6 +1405,10 @@ fn main() -> Result<()> {
             }
 
             Images(images_props)
+
+                div(class="nav") {
+                    Pagination(pagination)
+                }
         }
     });
 
