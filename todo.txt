@@ -1,12 +1,10 @@
-add "not" support to tagexpression
-  and to UI
-  server tests
-HEAD and range requests?
-remember and skip known bad files when syncing
+# routing
+  full_screen_image
+  filter
+pcm audio transcoding?
 performance
   O(n) ops in FE
   stream files instead of loading them into memory in BE
-  TagExpressionParser lazy_static?
 login/logout
   disallow selection when logged out
 clean up

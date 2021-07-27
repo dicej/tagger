@@ -5,8 +5,69 @@ body {
     font-size: 35px;
 }
 
+a {
+    color: white;
+    text-decoration: none;
+}
+
+i {
+    color: white;
+}
+
+i.included {
+    background-color: #8ebf42;
+}
+
+i.excluded {
+    background-color: #f54;
+}
+
+i.remove {
+    color: #f54;
+}
+
+i.filter {
+    position: absolute;
+    top: 0px;
+    left: 10px;
+}
+
+i.select {
+    position: absolute;
+    top: 0px;
+    right: 10px;
+}
+
+i.play {
+    position: absolute;
+    bottom: 10px;
+    left: 25px;
+}
+
+i.close {
+    position: absolute;
+    top: 10px;
+    right: 25px;
+}
+
+i.left {
+    position: absolute;
+    left: 25px;
+}
+
+i.right {
+    position: absolute;
+    right: 25px;
+}
+
+.big {
+    font-size: 70px;
+}
+
 input {
     font-size: 35px;
+    background-color: black;
+    color: #ccf;
 }
 
 div.nav {
@@ -17,43 +78,11 @@ div.nav {
     height: 72px;
 }
 
-a.icon {
-    font-size: 70px;
-}
-
-a.filter {
-    position: absolute;
-    top: 0px;
-    left: 10px;
-}
-
-a.select {
-    position: absolute;
-    top: 0px;
-    right: 10px;
-}
-
 span.selected-tag {
     display: inline-block;
     padding: 0.2em;
     margin: 0.2em;
     border: 1px solid white;
-}
-
-a.enabled:link {
-    color: #8ebf42;
-}
-
-a {
-    text-decoration: none;
-}
-
-a:link {
-    color: white;
-}
-
-a.remove:link {
-    color: #f54;
 }
 
 ul {
@@ -89,6 +118,12 @@ span.tags {
     left: 16px;
 }
 
+a.original {
+    position: absolute;
+    bottom: 10px;
+    right: 16px;
+}
+
 div.overlay {
     display: flex;
     justify-content: center;
@@ -107,29 +142,4 @@ div.overlay img,
 div.overlay video {
     max-width: 100%;
     max-height: 100%;
-}
-
-span.cursor {
-    color: white;
-    font-size: 100px;
-    font-weight: bold;
-}
-
-span.cursor:hover,
-span.cursor:focus {
-    color: #8ebf42;
-    text-decoration: none;
-    cursor: pointer;
-}
-
-span.play {
-    position: absolute;
-    bottom: 10px;
-    left: 25px;
-}
-
-span.close {
-    position: absolute;
-    top: 10px;
-    right: 25px;
 }

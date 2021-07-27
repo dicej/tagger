@@ -126,37 +126,67 @@ impl serde::Serialize for TagExpression {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Default)]
-pub struct TagData {
-    pub not: bool,
-    pub subtree: TagTree,
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TagState {
+    Excluded,
+    Included(TagTree),
+}
+
+impl Default for TagState {
+    fn default() -> Self {
+        Self::Included(TagTree::default())
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
-pub struct TagTree(pub BTreeMap<Tag, TagData>);
+pub struct TagTree(pub BTreeMap<Tag, TagState>);
 
 impl From<&TagTree> for Option<TagExpression> {
     fn from(tree: &TagTree) -> Self {
-        tree.0.iter().fold(None, |acc, (tag, data)| {
-            let mut tag = TagExpression::Tag(tag.clone());
+        let included = tree
+            .0
+            .iter()
+            .filter_map(|(tag, state)| {
+                if let TagState::Included(subtree) = state {
+                    let tag = TagExpression::Tag(tag.clone());
 
-            if data.not {
-                tag = TagExpression::Not(Box::new(tag));
-            }
-
-            let subexpression =
-                if let Some(subexpression) = Option::<TagExpression>::from(&data.subtree) {
-                    TagExpression::And(Box::new(tag), Box::new(subexpression))
+                    Some(
+                        if let Some(expression) = Option::<TagExpression>::from(subtree) {
+                            TagExpression::And(Box::new(tag), Box::new(expression))
+                        } else {
+                            tag
+                        },
+                    )
                 } else {
-                    tag
-                };
-
-            Some(if let Some(acc) = acc {
-                TagExpression::Or(Box::new(acc), Box::new(subexpression))
-            } else {
-                subexpression
+                    None
+                }
             })
-        })
+            .fold(None, |acc, expression| {
+                Some(if let Some(acc) = acc {
+                    TagExpression::Or(Box::new(acc), Box::new(expression))
+                } else {
+                    expression
+                })
+            });
+
+        tree.0
+            .iter()
+            .filter_map(|(tag, state)| {
+                if let TagState::Excluded = state {
+                    Some(TagExpression::Not(Box::new(TagExpression::Tag(
+                        tag.clone(),
+                    ))))
+                } else {
+                    None
+                }
+            })
+            .fold(included, |acc, expression| {
+                Some(if let Some(acc) = acc {
+                    TagExpression::And(Box::new(acc), Box::new(expression))
+                } else {
+                    expression
+                })
+            })
     }
 }
 
@@ -258,67 +288,65 @@ mod test {
         assert_eq!(
             Some(tag("foo")),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData::default()
+                raw_tag("foo") => TagState::default()
             ]))
         );
         assert_eq!(
             Some(not(tag("foo"))),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: true,
-                    subtree: TagTree::default(),
-                }
-            ])),
-        );
-        assert_eq!(
-            Some(and(tag("foo"), tag("bar"))),
-            Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("bar") => TagData::default()
-                    ])
-                }
+                raw_tag("foo") => TagState::Excluded,
             ])),
         );
         assert_eq!(
             Some(and(not(tag("foo")), tag("bar"))),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: true,
-                    subtree: TagTree(btreemap![
-                        raw_tag("bar") => TagData::default()
-                    ])
-                }
-            ]))
+                raw_tag("foo") => TagState::Excluded,
+                raw_tag("bar") => TagState::default(),
+            ])),
+        );
+        assert_eq!(
+            Some(and(not(tag("foo")), or(tag("bar"), tag("baz")))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagState::Excluded,
+                raw_tag("bar") => TagState::default(),
+                raw_tag("baz") => TagState::default(),
+            ])),
+        );
+        assert_eq!(
+            Some(and(not(tag("foo")), and(tag("bar"), tag("baz")))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagState::Excluded,
+                raw_tag("bar") => TagState::Included(TagTree(btreemap![
+                    raw_tag("baz") => TagState::default(),
+                ]))
+            ])),
+        );
+        assert_eq!(
+            Some(and(tag("foo"), tag("bar"))),
+            Option::<TagExpression>::from(&TagTree(btreemap![
+                raw_tag("foo") => TagState::Included(TagTree(btreemap![
+                    raw_tag("bar") => TagState::default()
+                ]))
+            ])),
         );
         assert_eq!(
             Some(or(tag("baz"), and(tag("foo"), tag("bar")))),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("bar") => TagData::default()
-                    ])
-                },
-                raw_tag("baz") => TagData::default()
+                raw_tag("foo") => TagState::Included(TagTree(btreemap![
+                    raw_tag("bar") => TagState::default()
+                ])),
+                raw_tag("baz") => TagState::default()
             ])),
         );
         assert_eq!(
             Some(or(and(tag("baz"), tag("wat")), and(tag("foo"), tag("bar")))),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("bar") => TagData::default()
-                    ])
-                },
-                raw_tag("baz") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("wat") => TagData::default()
-                    ])
-                }
+                raw_tag("foo") => TagState::Included(TagTree(btreemap![
+                    raw_tag("bar") => TagState::default()
+                ])),
+                raw_tag("baz") => TagState::Included(TagTree(btreemap![
+                    raw_tag("wat") => TagState::default()
+                ]))
             ])),
         );
         assert_eq!(
@@ -327,20 +355,14 @@ mod test {
                 and(tag("foo"), or(tag("baz"), tag("wat")))
             )),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("baz") => TagData::default(),
-                        raw_tag("wat") => TagData::default()
-                    ])
-                },
-                raw_tag("bar") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("baz") => TagData::default(),
-                        raw_tag("wat") => TagData::default()
-                    ])
-                }
+                raw_tag("foo") => TagState::Included(TagTree(btreemap![
+                    raw_tag("baz") => TagState::default(),
+                    raw_tag("wat") => TagState::default()
+                ])),
+                raw_tag("bar") => TagState::Included(TagTree(btreemap![
+                    raw_tag("baz") => TagState::default(),
+                    raw_tag("wat") => TagState::default()
+                ]))
             ])),
         );
         assert_eq!(
@@ -349,30 +371,18 @@ mod test {
                 and(tag("foo"), or(tag("baz"), and(tag("wat"), tag("umm"))))
             )),
             Option::<TagExpression>::from(&TagTree(btreemap![
-                raw_tag("foo") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("baz") => TagData::default(),
-                        raw_tag("wat") => TagData {
-                            not: false,
-                            subtree: TagTree(btreemap![
-                                raw_tag("umm") => TagData::default()
-                            ])
-                        }
-                    ])
-                },
-                raw_tag("bar") => TagData {
-                    not: false,
-                    subtree: TagTree(btreemap![
-                        raw_tag("baz") => TagData::default(),
-                        raw_tag("wat") => TagData {
-                            not: false,
-                            subtree: TagTree(btreemap![
-                                raw_tag("umm") => TagData::default()
-                            ])
-                        }
-                    ])
-                }
+                raw_tag("foo") => TagState::Included(TagTree(btreemap![
+                    raw_tag("baz") => TagState::default(),
+                    raw_tag("wat") => TagState::Included(TagTree(btreemap![
+                        raw_tag("umm") => TagState::default()
+                    ]))
+                ])),
+                raw_tag("bar") => TagState::Included(TagTree(btreemap![
+                    raw_tag("baz") => TagState::default(),
+                    raw_tag("wat") => TagState::Included(TagTree(btreemap![
+                        raw_tag("umm") => TagState::default()
+                    ]))
+                ]))
             ]))
         );
     }
