@@ -5,3 +5,6 @@ members = [
     "client",
     "server"
 ]
+
+[profile.release]
+debug=true

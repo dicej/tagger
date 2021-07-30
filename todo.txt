@@ -1,16 +1,15 @@
-# routing
-  full_screen_image
-  filter
-pcm audio transcoding?
+improved pagination
+  items per page
+  into future
+  skip to start or end
 performance
   O(n) ops in FE
   stream files instead of loading them into memory in BE
 login/logout
   disallow selection when logged out
 clean up
-  remove javascript:void() usage
   modularize FE and BE
-  componentize FE
+  componentize FE and minimize main
   reduce inline template code in FE
   remove State from FE?
 minimize expensive clones
@@ -21,3 +20,16 @@ demo site?
   e.g. sandbox mode where database is copied to in memory db that is dropped on token expiration (e.g. 30 minutes)
   run it in a docker container for isolation
 announce
+
+
+
+future improvements
+  more auto-tags
+    video vs. image vs. motion photo
+    gps
+    face recognition?
+  routing
+    full_screen_image
+    filter
+    pagination start date
+    items per page

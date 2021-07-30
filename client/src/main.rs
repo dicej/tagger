@@ -108,7 +108,7 @@ fn tags_for_category<'a>(
     &if let Some(category) = category {
         find_categories(filter_chain, &tags.categories)
             .and_then(|categories| categories.get(category.deref()))
-            .unwrap_or(&empty)
+            .unwrap_or(empty)
     } else {
         tags
     }
@@ -1411,11 +1411,6 @@ fn main() -> Result<()> {
                       on:click=toggle_selecting)
                 }
 
-                div(style=format!("display:{};", if filter.get().is_some() { "block" } else { "none" })) {
-                    (filter2.get().deref().as_ref().map(|expression|
-                                                       expression.to_string()).unwrap_or_else(String::new))
-                }
-
                 div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
                     TagMenu(tag_menu)
                 }
@@ -1444,6 +1439,11 @@ fn main() -> Result<()> {
                             }
                         }
                     })
+                }
+
+                div(style=format!("display:{};", if filter.get().is_some() { "block" } else { "none" })) {
+                    (filter2.get().deref().as_ref().map(|expression|
+                                                       expression.to_string()).unwrap_or_else(String::new))
                 }
             }
 

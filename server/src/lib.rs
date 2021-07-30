@@ -1,10 +1,11 @@
 #![deny(warnings)]
 
 use anyhow::{anyhow, Error, Result};
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use futures::{
     future::{BoxFuture, FutureExt, TryFutureExt},
-    stream::TryStreamExt,
+    stream::{Stream, TryStreamExt},
 };
 use http::{
     header,
@@ -15,6 +16,7 @@ use hyper::Body;
 use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
 use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use lazy_static::lazy_static;
+use mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType};
 use rand::Rng;
 use regex::Regex;
 use rexiv2::{Metadata as ExifMetadata, Orientation};
@@ -30,7 +32,7 @@ use std::{
     collections::{HashMap, HashSet},
     convert::{Infallible, TryFrom, TryInto},
     fmt::Write as _,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufReader, Seek, SeekFrom, Write},
     mem,
     net::SocketAddrV4,
     num::NonZeroU32,
@@ -50,11 +52,12 @@ use tagger_shared::{
 use tempfile::NamedTempFile;
 use tokio::{
     fs::{self, File},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
     process::Command,
     sync::Mutex as AsyncMutex,
     task, time,
 };
+use tokio_util::codec::{BytesCodec, FramedRead};
 use tracing::{info, warn};
 use warp::{Filter, Rejection, Reply};
 use warp_util::HttpError;
@@ -75,6 +78,8 @@ const DEFAULT_LIMIT: u32 = 1000;
 
 const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
 
+const BUFFER_SIZE: usize = 16 * 1024;
+
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
         .parse::<SqliteConnectOptions>()?
@@ -89,42 +94,26 @@ pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     Ok(conn)
 }
 
-async fn content_offset<P: AsRef<Path>>(offset: u64, path: P) -> Result<Vec<u8>> {
-    let mut file = File::open(path).await?;
-
-    file.seek(SeekFrom::Start(offset)).await?;
-
-    let mut buffer = Vec::new();
-
-    file.read_to_end(&mut buffer).await?;
-
-    Ok(buffer)
-}
-
-async fn content<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
-    content_offset(0, path).await
-}
-
-async fn write<P: AsRef<Path>>(path: P, buffer: &[u8]) -> Result<()> {
-    File::create(path.as_ref())
-        .await?
-        .write_all(&buffer)
-        .await?;
-
-    Ok(())
-}
-
-fn hash(data: &[u8]) -> String {
+async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<String> {
     let mut hasher = Sha256::default();
 
-    hasher.update(data);
+    let mut buffer = vec![0; BUFFER_SIZE];
 
-    hasher
+    loop {
+        let count = input.read(&mut buffer[..]).await?;
+        if count == 0 {
+            break;
+        } else {
+            hasher.update(&buffer[0..count]);
+        }
+    }
+
+    Ok(hasher
         .finalize()
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
-        .concat()
+        .concat())
 }
 
 #[derive(Debug)]
@@ -281,7 +270,14 @@ fn find_new<'a>(
     .boxed()
 }
 
-pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Result<()> {
+pub async fn sync(
+    conn: &AsyncMutex<SqliteConnection>,
+    image_dir: &str,
+    cache_dir: &str,
+    preload: bool,
+) -> Result<()> {
+    info!("starting sync");
+
     let then = Instant::now();
 
     let obsolete = {
@@ -313,7 +309,8 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
 
     for (index, (path, data)) in new.into_iter().enumerate() {
         if let Some(data) = data {
-            let hash = hash(&content([image_dir, &path].iter().collect::<PathBuf>()).await?);
+            let hash = hash(&mut File::open([image_dir, &path].iter().collect::<PathBuf>()).await?)
+                .await?;
 
             info!(
                 "({} of {}) insert {} (hash {}; data {:?})",
@@ -327,15 +324,17 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
             conn.lock()
             .await
             .transaction(|conn| {
+                let path = path.clone();
+                let hash = hash.clone();
+                let year = data.datetime.year();
+                let month = data.datetime.month();
+                let datetime = data.datetime.to_string();
+                let video_offset = data.video_offset;
+
                 async move {
                     sqlx::query!("INSERT INTO paths (path, hash) VALUES (?1, ?2)", path, hash)
                         .execute(&mut *conn)
                         .await?;
-
-                    let year = data.datetime.year();
-                    let month = data.datetime.month();
-                    let datetime = data.datetime.to_string();
-                    let video_offset = data.video_offset;
 
                     sqlx::query!(
                         "INSERT OR IGNORE INTO images (hash, datetime, video_offset) VALUES (?1, ?2, ?3)",
@@ -365,6 +364,22 @@ pub async fn sync(conn: &AsyncMutex<SqliteConnection>, image_dir: &str) -> Resul
                 .boxed()
             })
                 .await?;
+
+            if preload {
+                if let Err(e) = preload_cache(
+                    image_dir,
+                    &FileData {
+                        path,
+                        video_offset: data.video_offset,
+                    },
+                    cache_dir,
+                    &hash,
+                )
+                .await
+                {
+                    warn!("error preloading cache for {}: {:?}", hash, e);
+                }
+            }
         } else {
             info!("({} of {}) insert bad path {}", index + 1, new_len, path);
 
@@ -632,9 +647,9 @@ async fn apply(
     Ok(response().body(Body::empty())?)
 }
 
-struct FileData {
-    path: String,
-    video_offset: Option<i64>,
+pub struct FileData {
+    pub path: String,
+    pub video_offset: Option<i64>,
 }
 
 #[allow(clippy::eval_order_dependence)]
@@ -715,8 +730,31 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
             ))
         }
     } else {
-        Ok((content(full_path).await?, ImageFormat::Jpeg))
+        let mut file = File::open(full_path).await?;
+
+        let mut buffer = Vec::new();
+
+        file.read_to_end(&mut buffer).await?;
+
+        Ok((buffer, ImageFormat::Jpeg))
     }
+}
+
+pub async fn preload_cache(
+    image_dir: &str,
+    file_data: &FileData,
+    cache_dir: &str,
+    hash: &str,
+) -> Result<()> {
+    for size in &[Size::Small, Size::Large] {
+        get_variant(image_dir, file_data, cache_dir, *size, Variant::Still, hash).await?;
+
+        if file_data.video_offset.is_some() {
+            get_variant(image_dir, file_data, cache_dir, *size, Variant::Video, hash).await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn get_variant(
@@ -726,30 +764,26 @@ async fn get_variant(
     size: Size,
     variant: Variant,
     hash: &str,
-) -> Result<(Vec<u8>, &'static str)> {
+) -> Result<(
+    Box<dyn AsyncRead + Unpin + Send + 'static>,
+    &'static str,
+    u64,
+)> {
     match variant {
-        Variant::Still => Ok((
-            thumbnail(image_dir, &file_data.path, cache_dir, size, hash).await?,
-            "image/jpeg",
-        )),
+        Variant::Still => {
+            let (thumbnail, length, _) =
+                thumbnail(image_dir, &file_data.path, cache_dir, size, hash).await?;
+
+            Ok((thumbnail, "image/jpeg", length))
+        }
 
         Variant::Video => {
             if let Some(offset) = file_data.video_offset {
-                Ok(match size {
-                    Size::Small => (
-                        video_preview(image_dir, &file_data.path, offset, cache_dir, hash).await?,
-                        "video/mp4",
-                    ),
+                let (preview, length) =
+                    video_preview(image_dir, &file_data.path, offset, cache_dir, size, hash)
+                        .await?;
 
-                    Size::Large => (
-                        content_offset(
-                            offset.try_into().unwrap(),
-                            [image_dir, &file_data.path].iter().collect::<PathBuf>(),
-                        )
-                        .await?,
-                        "video/mp4",
-                    ),
-                })
+                Ok((preview, "video/mp4", length))
             } else {
                 Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
             }
@@ -764,14 +798,22 @@ async fn video_scale(
     size: Size,
     hash: &str,
 ) -> Result<String> {
-    let thumbnail = thumbnail(image_dir, path, cache_dir, size, hash).await?;
+    let thumbnail = thumbnail(image_dir, path, cache_dir, size, hash).await?.2;
 
-    let orientation = ExifMetadata::new_from_buffer(&thumbnail)
-        .map(|metadata| metadata.get_orientation())
-        .unwrap_or(Orientation::Normal);
+    let orientation = task::block_in_place(|| {
+        ExifMetadata::new_from_path(&thumbnail)
+            .map(|metadata| metadata.get_orientation())
+            .unwrap_or(Orientation::Normal)
+    });
 
-    let (mut width, mut height) =
-        image::load_from_memory_with_format(&thumbnail, ImageFormat::Jpeg)?.dimensions();
+    let (mut width, mut height) = task::block_in_place(|| {
+        image::load(
+            BufReader::new(std::fs::File::open(&thumbnail)?),
+            ImageFormat::Jpeg,
+        )
+        .map_err(Error::from)
+    })?
+    .dimensions();
 
     if width % 2 != 0 {
         width -= 1;
@@ -788,74 +830,243 @@ async fn video_scale(
     Ok(format!("scale={}:{},setsar=1:1", width, height))
 }
 
+fn audio_supported(entry: &SampleEntry) -> bool {
+    static SUPPORTED_AUDIO_CODECS: &[CodecType] = &[CodecType::AAC, CodecType::MP3];
+
+    if let SampleEntry::Audio(entry) = entry {
+        SUPPORTED_AUDIO_CODECS
+            .iter()
+            .any(|&codec| codec == entry.codec_type)
+    } else {
+        false
+    }
+}
+
+struct VideoData {
+    need_audio_transcode: bool,
+    pick_video_stream: Option<usize>,
+}
+
+fn get_video_data(context: MediaContext) -> VideoData {
+    let mut audio = None;
+    let mut video = None;
+    let mut video_track_count = 0;
+
+    for track in context.tracks {
+        match track.track_type {
+            TrackType::Audio => {
+                audio = audio
+                    .and_then(|audio: Track| {
+                        if let Some(audio_descriptions) = &audio.stsd {
+                            if audio_descriptions.descriptions.iter().any(audio_supported)
+                                || track.stsd.is_none()
+                            {
+                                Some(audio)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .or(Some(track))
+            }
+
+            TrackType::Video => {
+                video_track_count += 1;
+
+                video = video
+                    .and_then(|video: Track| {
+                        if let Some(video_duration) = &video.duration {
+                            if let Some(track_duration) = &track.duration {
+                                if video_duration.0 >= track_duration.0 {
+                                    Some(video)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                Some(video)
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .or(Some(track))
+            }
+            _ => (),
+        }
+    }
+
+    VideoData {
+        need_audio_transcode: if let Some(audio) = audio {
+            if let Some(audio_descriptions) = &audio.stsd {
+                !audio_descriptions.descriptions.iter().any(audio_supported)
+            } else {
+                false
+            }
+        } else {
+            false
+        },
+
+        pick_video_stream: if video_track_count > 1 {
+            video.map(|video| video.id)
+        } else {
+            None
+        },
+    }
+}
+
+struct TempFile(Option<NamedTempFile>);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        task::block_in_place(|| drop(self.0.take()))
+    }
+}
+
+async fn copy_from_offset(path: &Path, offset: i64) -> Result<TempFile> {
+    let mut original = File::open(path).await?;
+
+    original
+        .seek(SeekFrom::Start(offset.try_into().unwrap()))
+        .await?;
+
+    let mut tmp = TempFile(Some(task::block_in_place(NamedTempFile::new)?));
+
+    let mut buffer = vec![0; BUFFER_SIZE];
+
+    loop {
+        let count = original.read(&mut buffer[..]).await?;
+        if count == 0 {
+            break;
+        } else {
+            task::block_in_place(|| tmp.0.as_mut().unwrap().write_all(&buffer[0..count]))?;
+        }
+    }
+
+    Ok(tmp)
+}
+
 async fn video_preview(
     image_dir: &str,
     path: &str,
     offset: i64,
     cache_dir: &str,
+    size: Size,
     hash: &str,
-) -> Result<Vec<u8>> {
-    let filename = format!("{}/video_preview/{}.mp4", cache_dir, hash);
+) -> Result<(Box<dyn AsyncRead + Unpin + Send + 'static>, u64)> {
+    let filename = format!("{}/video/{}/{}.mp4", cache_dir, size, hash);
 
-    let result = content(&filename).await;
+    let result = File::open(&filename).await;
 
-    if let Ok(result) = result {
-        Ok(result)
+    if let Ok(file) = result {
+        let length = file.metadata().await?.len();
+
+        Ok((Box::new(file), length))
     } else {
         if let Some(parent) = Path::new(&filename).parent() {
             let _ = fs::create_dir(parent).await;
         }
 
-        let scale = video_scale(image_dir, path, cache_dir, Size::Small, hash).await?;
-
         let full_path = [image_dir, path].iter().collect::<PathBuf>();
 
-        let output = if offset == 0 {
-            Command::new("ffmpeg")
-                .arg("-i")
-                .arg(&full_path)
-                .arg("-ss")
-                .arg("00:00:00")
-                .arg("-to")
-                .arg(VIDEO_PREVIEW_LENGTH_HMS)
-                .arg("-vf")
-                .arg(&scale)
-                .arg("-an")
-                .arg(&filename)
-                .output()
-                .await
-        } else {
-            let original = content(full_path).await?;
+        let video_data = get_video_data(task::block_in_place(|| {
+            let mut file = std::fs::File::open(&full_path)?;
 
-            let original = task::block_in_place(|| {
-                let mut file = NamedTempFile::new()?;
+            file.seek(SeekFrom::Start(offset.try_into().unwrap()))?;
 
-                file.write_all(&original[offset.try_into().unwrap()..])?;
+            mp4parse::read_mp4(&mut file).map_err(Error::from)
+        })?);
 
-                Ok::<_, Error>(file)
-            })?;
+        let output = match size {
+            Size::Small => {
+                let scale = video_scale(image_dir, path, cache_dir, Size::Small, hash).await?;
 
-            let output = Command::new("ffmpeg")
-                .arg("-i")
-                .arg(original.path())
-                // TODO: this assumes stream 0 has the video we want, but we should use either mp4parse or ffprobe
-                // to find the video stream with the longest duration and use that.
-                .arg("-map")
-                .arg("0:0")
-                .arg("-vf")
-                .arg(&scale)
-                .arg("-an")
-                .arg(&filename)
-                .output()
-                .await;
+                if offset == 0 {
+                    Command::new("ffmpeg")
+                        .arg("-i")
+                        .arg(&full_path)
+                        .arg("-ss")
+                        .arg("00:00:00")
+                        .arg("-to")
+                        .arg(VIDEO_PREVIEW_LENGTH_HMS)
+                        .arg("-vf")
+                        .arg(&scale)
+                        .arg("-an")
+                        .arg(&filename)
+                        .output()
+                        .await
+                } else {
+                    let tmp = copy_from_offset(&full_path, offset).await?;
 
-            task::block_in_place(move || drop(original));
+                    let mut command = Command::new("ffmpeg");
 
-            output
+                    command.arg("-i").arg(tmp.0.as_ref().unwrap().path());
+
+                    if let Some(id) = video_data.pick_video_stream {
+                        command.arg("-map").arg(format!("0:{}", id));
+                    }
+
+                    command
+                        .arg("-vf")
+                        .arg(&scale)
+                        .arg("-an")
+                        .arg(&filename)
+                        .output()
+                        .await
+                }
+            }
+
+            Size::Large => {
+                if offset == 0 {
+                    if video_data.need_audio_transcode {
+                        Command::new("ffmpeg")
+                            .arg("-i")
+                            .arg(&full_path)
+                            .arg("-vcodec")
+                            .arg("copy")
+                            .arg("-acodec")
+                            .arg("mp3")
+                            .arg(&filename)
+                            .output()
+                            .await
+                    } else {
+                        let file = File::open(&full_path).await?;
+                        let length = file.metadata().await?.len();
+
+                        return Ok((Box::new(file), length));
+                    }
+                } else if let Some(id) = video_data.pick_video_stream {
+                    let tmp = copy_from_offset(&full_path, offset).await?;
+
+                    Command::new("ffmpeg")
+                        .arg("-i")
+                        .arg(tmp.0.as_ref().unwrap().path())
+                        .arg("-map")
+                        .arg(format!("0:{}", id))
+                        .arg("-vcodec")
+                        .arg("copy")
+                        .arg("-an")
+                        .arg(&filename)
+                        .output()
+                        .await
+                } else {
+                    let mut file = File::open(&full_path).await?;
+                    let offset = offset.try_into().unwrap();
+                    let length = file.metadata().await?.len() - offset;
+
+                    file.seek(SeekFrom::Start(offset)).await?;
+
+                    return Ok((Box::new(file), length));
+                }
+            }
         }?;
 
         if output.status.success() {
-            content(&filename).await
+            let file = File::open(&filename).await?;
+            let length = file.metadata().await?.len();
+
+            Ok((Box::new(file), length))
         } else {
             let _ = fs::remove_file(&filename).await;
 
@@ -873,19 +1084,25 @@ async fn thumbnail(
     cache_dir: &str,
     size: Size,
     hash: &str,
-) -> Result<Vec<u8>> {
+) -> Result<(Box<dyn AsyncRead + Unpin + Send + 'static>, u64, PathBuf)> {
     let filename = format!("{}/{}/{}.jpg", cache_dir, size, hash);
 
-    let result = content(&filename).await;
+    let result = File::open(&filename).await;
 
-    Ok(if let Ok(result) = result {
-        result
+    Ok(if let Ok(file) = result {
+        let length = file.metadata().await?.len();
+
+        (Box::new(file), length, filename.into())
     } else {
         let (image, format) = still_image(image_dir, path).await?;
 
         let original = image::load_from_memory_with_format(&image, format)?;
 
-        let resize = |bounds| {
+        if let Some(parent) = Path::new(&filename).parent() {
+            let _ = fs::create_dir(parent).await;
+        }
+
+        {
             let metadata = ExifMetadata::new_from_buffer(&image)
                 .map(|metadata| {
                     let orientation = metadata.get_orientation();
@@ -897,57 +1114,50 @@ async fn thumbnail(
 
             let (width, height) = bound(
                 original.dimensions(),
-                bounds,
+                match size {
+                    Size::Small => SMALL_BOUNDS,
+                    Size::Large => LARGE_BOUNDS,
+                },
                 metadata
                     .as_ref()
                     .map(|m| m.get_orientation())
                     .unwrap_or(Orientation::Normal),
             );
 
-            let mut encoded = Vec::new();
+            task::block_in_place(|| {
+                original
+                    .resize(width, height, FilterType::Lanczos3)
+                    .write_to(
+                        &mut std::fs::File::create(&filename)?,
+                        ImageOutputFormat::Jpeg(JPEG_QUALITY),
+                    )?;
 
-            original
-                .resize(width, height, FilterType::Lanczos3)
-                .write_to(&mut encoded, ImageOutputFormat::Jpeg(JPEG_QUALITY))?;
+                if let Some(metadata) = &metadata {
+                    metadata.save_to_file(&filename)?;
+                }
 
-            if let Some(metadata) = &metadata {
-                task::block_in_place(|| {
-                    let mut file = NamedTempFile::new()?;
-
-                    file.write_all(&encoded)?;
-
-                    metadata.save_to_file(file.path())?;
-
-                    file.seek(SeekFrom::Start(0))?;
-
-                    encoded.clear();
-
-                    file.read_to_end(&mut encoded)?;
-
-                    Ok::<_, Error>(())
-                })?;
-            }
-
-            Ok::<_, Error>(encoded)
-        };
-
-        let resized = resize(match size {
-            Size::Small => SMALL_BOUNDS,
-            Size::Large => LARGE_BOUNDS,
-        })?;
-
-        if let Some(parent) = Path::new(&filename).parent() {
-            let _ = fs::create_dir(parent).await;
+                Ok::<_, Error>(())
+            })?;
         }
 
-        write(&filename, &resized).await?;
+        let file = File::open(&filename).await?;
+        let length = file.metadata().await?.len();
 
-        resized
+        (Box::new(file), length, filename.into())
     })
+}
+
+fn as_stream(
+    input: Box<dyn AsyncRead + Unpin + Send + 'static>,
+) -> impl Stream<Item = Result<Bytes>> + Send {
+    FramedRead::new(input, BytesCodec::new())
+        .map_ok(BytesMut::freeze)
+        .map_err(Error::from)
 }
 
 async fn image(
     conn: &AsyncMutex<SqliteConnection>,
+    image_mutex: &AsyncMutex<()>,
     image_dir: &str,
     cache_dir: &str,
     hash: &str,
@@ -955,7 +1165,12 @@ async fn image(
 ) -> Result<Response<Body>> {
     let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
 
-    let (image, content_type) = if let Some(size) = query.size {
+    let (image, content_type, length) = if let Some(size) = query.size {
+        // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
+        // concurrently.  However, it's way too conservative since it prevents more than one task from accessing
+        // any cache files concurrently -- even unrelated ones.  We should use separate locks per hash.
+        let _lock = image_mutex.lock().await;
+
         get_variant(
             image_dir,
             &file_data,
@@ -968,20 +1183,24 @@ async fn image(
     } else {
         let lowercase = file_data.path.to_lowercase();
 
+        let file = File::open([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?;
+        let length = file.metadata().await?.len();
+
         (
-            content([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?,
+            Box::new(file) as Box<dyn AsyncRead + Unpin + Send + 'static>,
             if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
                 "video/mp4"
             } else {
                 "image/jpeg"
             },
+            length,
         )
     };
 
     Ok(response()
-        .header(header::CONTENT_LENGTH, image.len())
+        .header(header::CONTENT_LENGTH, length)
         .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from(image))?)
+        .body(Body::wrap_stream(as_stream(image)))?)
 }
 
 fn entry<'a>(
@@ -1171,7 +1390,7 @@ impl FromStr for Bearer {
 fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpError> {
     Ok(Arc::new(
         jsonwebtoken::decode::<Authorization>(
-            &token,
+            token,
             &DecodingKey::from_secret(key),
             &Validation::new(Algorithm::HS256),
         )
@@ -1212,6 +1431,7 @@ fn routes(
     rand::thread_rng().fill(&mut auth_key);
 
     let auth_mutex = Arc::new(AsyncMutex::new(()));
+    let image_mutex = Arc::new(AsyncMutex::new(()));
 
     let auth = warp::header::optional::<Bearer>("authorization").and_then(
         move |header: Option<Bearer>| async move {
@@ -1314,6 +1534,7 @@ fn routes(
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
+                            let image_mutex = image_mutex.clone();
 
                             move |hash: String, auth: Option<Arc<_>>, query| {
                                 let hash = Arc::<str>::from(hash);
@@ -1322,10 +1543,12 @@ fn routes(
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
+                                    let image_mutex = image_mutex.clone();
 
                                     async move {
                                         image(
                                             &conn,
+                                            &image_mutex,
                                             &options.image_directory,
                                             &options.cache_directory,
                                             &hash,
@@ -1454,6 +1677,10 @@ pub struct Options {
     /// File containing TLS key to use
     #[structopt(long)]
     pub key_file: Option<String>,
+
+    /// If set, pre-generate thumnail cache files for newly-discovered images and videos when syncing
+    #[structopt(long)]
+    pub preload_cache: bool,
 }
 
 #[cfg(test)]
@@ -1517,6 +1744,7 @@ mod test {
                 public_directory: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 cert_file: None,
                 key_file: None,
+                preload_cache: false,
             }),
             Duration::from_secs(0),
         );
@@ -1629,7 +1857,7 @@ mod test {
             })?;
         }
 
-        sync(&conn, image_dir).await?;
+        sync(&conn, image_dir, cache_dir, false).await?;
 
         // GET /images with no authorization header should yield `OK` with an empty body since no images have been
         // tagged "public" yet.
