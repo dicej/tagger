@@ -1,17 +1,20 @@
-use crate::tag_expression_grammar::TagExpressionParser;
-use anyhow::{anyhow, Error, Result};
-use lazy_static::lazy_static;
-use serde::{Deserializer, Serializer};
-use std::{
-    collections::BTreeMap,
-    fmt::{self, Display},
-    str::FromStr,
+use {
+    crate::tag_expression_grammar::TagExpressionParser,
+    anyhow::{anyhow, Error, Result},
+    lazy_static::lazy_static,
+    serde::{Deserializer, Serializer},
+    std::{
+        collections::BTreeMap,
+        fmt::{self, Display},
+        str::FromStr,
+        sync::Arc,
+    },
 };
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Hash)]
 pub struct Tag {
-    pub category: Option<String>,
-    pub value: String,
+    pub category: Option<Arc<str>>,
+    pub value: Arc<str>,
 }
 
 impl FromStr for Tag {
@@ -192,9 +195,11 @@ impl From<&TagTree> for Option<TagExpression> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use anyhow::{anyhow, Result};
-    use maplit::btreemap;
+    use {
+        super::*,
+        anyhow::{anyhow, Result},
+        maplit::btreemap,
+    };
 
     fn parse_te(s: &str) -> Result<TagExpression> {
         s.parse().map_err(|e| anyhow!("{:?}", e))

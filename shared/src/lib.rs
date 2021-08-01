@@ -1,13 +1,16 @@
 #![deny(warnings)]
 
-use chrono::{DateTime, Utc};
-use lalrpop_util::lalrpop_mod;
-use serde_derive::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::{self, Display},
+use {
+    chrono::{DateTime, Utc},
+    lalrpop_util::lalrpop_mod,
+    serde_derive::{Deserialize, Serialize},
+    std::{
+        collections::{HashMap, HashSet},
+        fmt::{self, Display},
+        sync::Arc,
+    },
+    tag_expression::{Tag, TagExpression},
 };
-use tag_expression::{Tag, TagExpression};
 
 pub mod tag_expression;
 
@@ -62,8 +65,8 @@ pub struct TagsQuery {
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Default, Clone)]
 pub struct TagsResponse {
     pub immutable: Option<bool>,
-    pub categories: HashMap<String, TagsResponse>,
-    pub tags: HashMap<String, u32>,
+    pub categories: HashMap<Arc<str>, TagsResponse>,
+    pub tags: HashMap<Arc<str>, u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -82,6 +85,7 @@ pub enum Medium {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImageData {
+    pub hash: Arc<str>,
     pub datetime: DateTime<Utc>,
     pub medium: Medium,
     pub tags: HashSet<Tag>,
@@ -91,7 +95,9 @@ pub struct ImageData {
 pub struct ImagesResponse {
     pub start: u32,
     pub total: u32,
-    pub images: HashMap<String, ImageData>,
+    pub later_start: Option<DateTime<Utc>>,
+    pub earliest_start: Option<DateTime<Utc>>,
+    pub images: Vec<ImageData>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone)]

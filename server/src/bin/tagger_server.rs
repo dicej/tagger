@@ -19,22 +19,12 @@ async fn main() -> Result<()> {
         tagger_server::open(&options.state_file).await?,
     ));
 
-    tagger_server::sync(
-        &conn,
-        &options.image_directory,
-        &options.cache_directory,
-        options.preload_cache,
-    )
-    .await?;
-
     task::spawn({
         let options = options.clone();
         let conn = conn.clone();
 
         async move {
             loop {
-                time::sleep(SYNC_INTERVAL).await;
-
                 if let Err(e) = tagger_server::sync(
                     &conn,
                     &options.image_directory,
@@ -46,6 +36,8 @@ async fn main() -> Result<()> {
                     error!("sync error: {:?}", e);
                     process::exit(-1)
                 }
+
+                time::sleep(SYNC_INTERVAL).await;
             }
         }
     });

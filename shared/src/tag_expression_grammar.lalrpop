@@ -1,4 +1,7 @@
-use crate::tag_expression::{TagExpression, Tag};
+use {
+    crate::tag_expression::{TagExpression, Tag},
+    std::sync::Arc
+};
 
 grammar;
 
@@ -19,12 +22,12 @@ Not = {
 
 Term: Box<TagExpression> = {
     <category:Name> ":" <tag:Name> => Box::new(TagExpression::Tag(Tag {
-      category: Some(category.to_owned()),
-      value: tag.to_owned()
+      category: Some(Arc::from(category)),
+      value: Arc::from(tag)
     })),
      <tag:Name> => Box::new(TagExpression::Tag(Tag {
        category: None,
-       value: tag.to_owned()
+       value: Arc::from(tag)
     })),
     "(" <s:TagExpression> ")" => s
 }

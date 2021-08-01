@@ -1,28 +1,32 @@
 #![deny(warnings)]
 
-use anyhow::{anyhow, Error, Result};
-use chrono::{DateTime, Utc};
-use futures::future::TryFutureExt;
-use reqwest::Client;
-use serde::Deserialize;
-use std::{
-    cell::Cell,
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    convert::TryFrom,
-    ops::Deref,
-    panic,
-    rc::Rc,
+use {
+    anyhow::{anyhow, Error, Result},
+    chrono::{DateTime, Utc},
+    futures::future::TryFutureExt,
+    reqwest::Client,
+    serde::Deserialize,
+    std::{
+        cell::Cell,
+        cmp::Ordering,
+        collections::{HashMap, HashSet},
+        convert::TryFrom,
+        ops::Deref,
+        panic,
+        rc::Rc,
+        sync::Arc,
+    },
+    sycamore::prelude::{
+        self as syc, component, template, Indexed, IndexedProps, Keyed, KeyedProps, Signal,
+        StateHandle, Template,
+    },
+    tagger_shared::{
+        tag_expression::{Tag, TagExpression, TagState, TagTree},
+        Action, GrantType, ImagesResponse, Medium, Patch, TagsResponse, TokenRequest, TokenSuccess,
+    },
+    wasm_bindgen::{closure::Closure, JsCast},
+    web_sys::{Event, HtmlVideoElement, KeyboardEvent, MouseEvent},
 };
-use sycamore::prelude::{
-    self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
-};
-use tagger_shared::{
-    tag_expression::{Tag, TagExpression, TagState, TagTree},
-    Action, GrantType, ImagesResponse, Medium, Patch, TagsResponse, TokenRequest, TokenSuccess,
-};
-use wasm_bindgen::{closure::Closure, JsCast};
-use web_sys::{Event, HtmlVideoElement, KeyboardEvent, MouseEvent};
 
 const MAX_IMAGES_PER_PAGE: u32 = 100;
 
@@ -34,11 +38,11 @@ enum List<T> {
 
 fn find_categories<'a>(
     filter_chain: &List<Tag>,
-    categories: &'a HashMap<String, TagsResponse>,
-) -> Option<&'a HashMap<String, TagsResponse>> {
+    categories: &'a HashMap<Arc<str>, TagsResponse>,
+) -> Option<&'a HashMap<Arc<str>, TagsResponse>> {
     if let List::Cons(cons) = filter_chain {
         let next = find_categories(&cons.1, categories);
-        if let Some(category) = cons.0.category.as_ref() {
+        if let Some(category) = cons.0.category.as_deref() {
             next.and_then(|next| next.get(category).map(|tags| &tags.categories))
         } else {
             next
@@ -100,11 +104,11 @@ fn to_tree(filter_chain: &List<Tag>, filter: &TagTree) -> TagTree {
 }
 
 fn tags_for_category<'a>(
-    category: &Option<Rc<str>>,
+    category: &Option<Arc<str>>,
     filter_chain: &List<Tag>,
     empty: &'a TagsResponse,
     tags: &'a TagsResponse,
-) -> &'a HashMap<String, u32> {
+) -> &'a HashMap<Arc<str>, u32> {
     &if let Some(category) = category {
         find_categories(filter_chain, &tags.categories)
             .and_then(|categories| categories.get(category.deref()))
@@ -172,32 +176,45 @@ fn filter_state(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> Filter
         .unwrap_or(FilterState::None)
 }
 
+fn page_start(props: &PaginationProps) {
+    props.start.set(None);
+}
+
+fn page_back(props: &PaginationProps) {
+    props.start.set(props.images.get().later_start);
+}
+
+fn page_forward(props: &PaginationProps) {
+    let images = props.images.get();
+    let ImagesResponse { start, total, .. } = *images.deref();
+    let count = u32::try_from(images.images.len()).unwrap();
+
+    if start + count < total {
+        props
+            .start
+            .set(images.images.last().map(|data| data.datetime));
+    }
+}
+
+fn page_end(props: &PaginationProps) {
+    if let Some(earliest_start) = props.images.get().earliest_start {
+        props.start.set(Some(earliest_start));
+    }
+}
+
 #[derive(Clone)]
 struct PaginationProps {
     images: StateHandle<ImagesResponse>,
-    page_starts: StateHandle<Vec<DateTime<Utc>>>,
-    page_back: Rc<dyn Fn()>,
-    page_forward: Rc<dyn Fn()>,
+    start: Signal<Option<DateTime<Utc>>>,
 }
 
 #[component(Pagination<G>)]
 fn pagination(props: PaginationProps) -> Template<G> {
-    let PaginationProps {
-        images,
-        page_starts,
-        page_back,
-        page_forward,
-    } = props;
-
     template! {
         span(class="pagination") {
             ({
-                let images = images.get();
-                let count = u32::try_from(images.images.len()).unwrap();
+                let images = props.images.get();
                 let ImagesResponse { start, total, .. } = *images.deref();
-                let page_starts = page_starts.clone();
-                let page_back = page_back.clone();
-                let page_forward = page_forward.clone();
 
                 if total == 0 {
                     template! {
@@ -206,15 +223,33 @@ fn pagination(props: PaginationProps) -> Template<G> {
                         }
                     }
                 } else {
+                    let count = u32::try_from(images.images.len()).unwrap();
+
+                    let left_style = if start > 0 {
+                        "visibility:visible;"
+                    } else {
+                        "visibility:hidden;"
+                    };
+
+                    let right_style = if start + count < total {
+                        "visibility:visible;"
+                    } else {
+                        "visibility:hidden;"
+                    };
+
+                    let props1 = props.clone();
+                    let props2 = props.clone();
+                    let props3 = props.clone();
+                    let props4 = props.clone();
+
                     template! {
+                        i(class="fa fa-angle-double-left big",
+                          on:click=move |_| page_start(&props1),
+                          style=left_style) " "
+
                         i(class="fa fa-angle-left big",
-                          on:click=move |_| page_back(),
-                          style=format!("visibility:{};",
-                                        if page_starts.get().len() > 1 {
-                                            "visible"
-                                        } else {
-                                            "hidden"
-                                        }))
+                          on:click=move |_| page_back(&props2),
+                          style=left_style)
 
                         (format!(" {}-{} of {} ",
                                  start + 1,
@@ -222,13 +257,12 @@ fn pagination(props: PaginationProps) -> Template<G> {
                                  total))
 
                         i(class="fa fa-angle-right big",
-                          on:click=move |_| page_forward(),
-                          style=format!("visibility:{};",
-                                        if start + count < total {
-                                            "visible"
-                                        } else {
-                                            "hidden"
-                                        }))
+                          on:click=move |_| page_forward(&props3),
+                          style=right_style) " "
+
+                        i(class="fa fa-angle-double-right big",
+                          on:click=move |_| page_end(&props4),
+                          style=right_style)
                     }
                 }
             })
@@ -237,7 +271,9 @@ fn pagination(props: PaginationProps) -> Template<G> {
 }
 
 struct TagSubMenuProps {
-    state: Rc<State>,
+    client: Client,
+    token: StateHandle<Option<String>>,
+    root: Rc<str>,
     tag: Tag,
     filter: Signal<TagTree>,
     filter_chain: List<Tag>,
@@ -247,7 +283,9 @@ struct TagSubMenuProps {
 #[component(TagSubMenu<G>)]
 fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
     let TagSubMenuProps {
-        state,
+        client,
+        token,
+        root,
         tag,
         filter,
         filter_chain,
@@ -263,13 +301,17 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
             let filter_chain = List::Cons(Rc::new((tag.clone(), filter_chain.clone())));
 
             TagMenuProps {
-                state: state.clone(),
+                client: client.clone(),
+                token: token.clone(),
+                root: root.clone(),
                 filter: filter.clone(),
                 filter_chain: filter_chain.clone(),
                 unfiltered_tags: unfiltered_tags.clone(),
                 filtered_tags: watch::<TagsResponse>(
                     Signal::new("tags".into()).into_handle(),
-                    state.clone(),
+                    client.clone(),
+                    token.clone(),
+                    root.clone(),
                     Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
                 ),
                 category: None,
@@ -277,14 +319,13 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
         }
     };
 
-    tag_menu();
-
     let filter_state =
         syc::create_selector(move || filter_state(&filter_chain, filter.get().deref(), &tag));
 
     template! {
         (if let FilterState::Include = *filter_state.get() {
             let tag_menu = tag_menu();
+
             template! {
                 ul {
                     TagMenu(tag_menu)
@@ -306,24 +347,29 @@ fn compare_numeric(a: &str, b: &str) -> Ordering {
 }
 
 struct TagMenuProps {
-    state: Rc<State>,
+    client: Client,
+    token: StateHandle<Option<String>>,
+    root: Rc<str>,
     filter: Signal<TagTree>,
     filter_chain: List<Tag>,
     unfiltered_tags: StateHandle<TagsResponse>,
     filtered_tags: StateHandle<TagsResponse>,
-    category: Option<Rc<str>>,
+    category: Option<Arc<str>>,
 }
 
 #[component(TagMenu<G>)]
 fn tag_menu(props: TagMenuProps) -> Template<G> {
     let TagMenuProps {
-        state,
+        client,
+        token,
+        root,
         filter,
         filter_chain,
         unfiltered_tags,
         filtered_tags,
         category,
     } = props;
+
     let categories = if category.is_none() {
         let categories = KeyedProps {
             iterable: syc::create_selector({
@@ -351,17 +397,21 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                 let filter_chain = filter_chain.clone();
                 let unfiltered_tags = unfiltered_tags.clone();
                 let filtered_tags = filtered_tags.clone();
-                let state = state.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let root = root.clone();
                 let filter = filter.clone();
 
                 move |category| {
                     let tag_menu = TagMenuProps {
-                        state: state.clone(),
+                        client: client.clone(),
+                        token: token.clone(),
+                        root: root.clone(),
                         filter: filter.clone(),
                         filter_chain: filter_chain.clone(),
                         unfiltered_tags: unfiltered_tags.clone(),
                         filtered_tags: filtered_tags.clone(),
-                        category: Some(Rc::from(category.clone())),
+                        category: Some(category.clone()),
                     };
 
                     template! {
@@ -417,12 +467,14 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
 
         template: move |tag_value| {
             let tag = Tag {
-                category: category.as_deref().map(String::from),
+                category: category.clone(),
                 value: tag_value.clone(),
             };
 
             let sub_menu = TagSubMenuProps {
-                state: state.clone(),
+                client: client.clone(),
+                token: token.clone(),
+                root: root.clone(),
                 tag: tag.clone(),
                 filter: filter.clone(),
                 filter_chain: filter_chain.clone(),
@@ -533,87 +585,97 @@ fn reset_video(event: Event) {
 
 #[derive(Clone)]
 struct ImageState {
-    datetime: DateTime<Utc>,
-    medium: Medium,
     selected: Signal<bool>,
-    tags: Signal<HashSet<Tag>>,
 }
 
 struct ImagesProps {
-    state: Rc<State>,
-    image_states: StateHandle<Rc<HashMap<Rc<str>, ImageState>>>,
-    sorted_images: StateHandle<Vec<Rc<str>>>,
+    root: Rc<str>,
+    selecting: StateHandle<bool>,
+    images: StateHandle<ImagesResponse>,
+    image_states: StateHandle<Vec<ImageState>>,
+    overlay_image: Signal<Option<usize>>,
 }
 
 #[component(Images<G>)]
 fn images(props: ImagesProps) -> Template<G> {
     let ImagesProps {
-        state,
+        root,
+        selecting,
+        images,
         image_states,
-        sorted_images,
+        overlay_image,
     } = props;
 
-    let images = KeyedProps {
-        iterable: sorted_images.clone(),
+    let images = IndexedProps {
+        iterable: syc::create_selector({
+            let images = images.clone();
 
-        template: move |hash| {
-            let url = format!("{}/image/{}?size=small", state.root, hash);
+            move || {
+                images
+                    .get()
+                    .images
+                    .iter()
+                    .map(|data| data.hash.clone())
+                    .enumerate()
+                    .collect()
+            }
+        }),
 
-            if let Some(image) = image_states.get().get(&hash) {
-                let image = image.clone();
+        template: move |(index, hash)| {
+            let url = format!("{}/image/{}?size=small", root, hash);
 
+            let images = images.get();
+            let image_states = image_states.get();
+
+            if let (Some(data), Some(state)) = (images.images.get(index), image_states.get(index)) {
                 let click = {
                     let image_states = image_states.clone();
-                    let sorted_images = sorted_images.clone();
-                    let state = state.clone();
+                    let selecting = selecting.clone();
+                    let overlay_image = overlay_image.clone();
 
                     move |event: Event| {
-                        if *state.selecting.get() {
-                            let image_states = image_states.get();
+                        if *selecting.get() {
+                            if let Some(state) = image_states.get(index) {
+                                if let Ok(event) = event.dyn_into::<MouseEvent>() {
+                                    if event.get_modifier_state("Shift") {
+                                        if let (Some(first_selected), Some(last_selected)) = (
+                                            image_states
+                                                .iter()
+                                                .position(|state| *state.selected.get()),
+                                            image_states
+                                                .iter()
+                                                .rposition(|state| *state.selected.get()),
+                                        ) {
+                                            let range = if index < first_selected {
+                                                index..first_selected
+                                            } else if last_selected < index {
+                                                (last_selected + 1)..(index + 1)
+                                            } else {
+                                                index..(index + 1)
+                                            };
 
-                            if let Ok(event) = event.dyn_into::<MouseEvent>() {
-                                if event.get_modifier_state("Shift") {
-                                    let sorted_images = sorted_images.get();
+                                            for state in &image_states[range] {
+                                                let selected = &state.selected;
+                                                selected.set(!*selected.get());
+                                            }
 
-                                    if let (Some(first_selected), Some(last_selected), Some(me)) = (
-                                        sorted_images.iter().position(|hash| {
-                                            *image_states.get(hash.deref()).unwrap().selected.get()
-                                        }),
-                                        sorted_images.iter().rposition(|hash| {
-                                            *image_states.get(hash.deref()).unwrap().selected.get()
-                                        }),
-                                        sorted_images.iter().position(|other| other == &hash),
-                                    ) {
-                                        let range = if me < first_selected {
-                                            me..first_selected
-                                        } else if last_selected < me {
-                                            (last_selected + 1)..(me + 1)
-                                        } else {
-                                            me..(me + 1)
-                                        };
-
-                                        for hash in &sorted_images[range] {
-                                            let selected =
-                                                &image_states.get(hash).unwrap().selected;
-                                            selected.set(!*selected.get());
+                                            return;
                                         }
-
-                                        return;
                                     }
                                 }
-                            }
 
-                            if let Some(state) = image_states.get(&hash) {
                                 let selected = &state.selected;
                                 selected.set(!*selected.get());
                             }
                         } else {
-                            state.full_size_image.set(Some(hash.clone()));
+                            overlay_image.set(Some(index));
                         }
                     }
                 };
 
-                match image.medium {
+                let selected = state.selected.clone();
+
+                match data.medium {
                     Medium::ImageWithVideo | Medium::Video => {
                         let video_url = format!("{}&variant=video", url);
 
@@ -622,7 +684,7 @@ fn images(props: ImagesProps) -> Template<G> {
                                   poster=url,
                                   muted="true",
                                   playsinline="true",
-                                  class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
+                                  class=if *selected.get() { "thumbnail selected" } else { "thumbnail" },
                                   on:mouseenter=play_video,
                                   on:mouseleave=reset_video,
                                   on:ended=reset_video,
@@ -632,7 +694,7 @@ fn images(props: ImagesProps) -> Template<G> {
 
                     Medium::Image => template! {
                         img(src=url,
-                            class=if *image.selected.get() { "thumbnail selected" } else { "thumbnail" },
+                            class=if *selected.get() { "thumbnail selected" } else { "thumbnail" },
                             on:click=click)
                     },
                 }
@@ -640,20 +702,20 @@ fn images(props: ImagesProps) -> Template<G> {
                 template! {}
             }
         },
-
-        key: |hash| hash.clone(),
     };
 
     template! {
         div {
-            Keyed(images)
+            Indexed(images)
         }
     }
 }
 
 fn watch<T: Default + for<'de> Deserialize<'de>>(
     uri: StateHandle<String>,
-    state: Rc<State>,
+    client: Client,
+    token: StateHandle<Option<String>>,
+    root: Rc<str>,
     filter: StateHandle<TagTree>,
 ) -> StateHandle<T> {
     let signal = Signal::new(T::default());
@@ -662,10 +724,11 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
         let signal = signal.clone();
 
         move || {
-            let token = state.token.get();
+            let client = client.clone();
+            let token = token.get();
             let filter = filter.get();
             let uri = uri.get();
-            let state = state.clone();
+            let root = root.clone();
             let signal = signal.clone();
 
             wasm_bindgen_futures::spawn_local(
@@ -673,9 +736,9 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
                     let uri = uri.clone();
 
                     async move {
-                        let mut request = state.client.get(format!(
+                        let mut request = client.get(format!(
                             "{}/{}{}",
-                            state.root,
+                            root,
                             uri,
                             if let Some(filter) = Option::<TagExpression>::from(filter.deref()) {
                                 format!(
@@ -707,13 +770,13 @@ fn watch<T: Default + for<'de> Deserialize<'de>>(
     signal.into_handle()
 }
 
-fn patch_tags(state: Rc<State>, patches: Vec<Patch>) {
+fn patch_tags(client: Client, token: Signal<Option<String>>, root: Rc<str>, patches: Vec<Patch>) {
     wasm_bindgen_futures::spawn_local(
         {
             async move {
-                let mut request = state.client.patch(format!("{}/tags", state.root));
+                let mut request = client.patch(format!("{}/tags", root));
 
-                if let Some(token) = state.token.get().deref() {
+                if let Some(token) = token.get().deref() {
                     request = request.header("authorization", &format!("Bearer {}", token));
                 }
 
@@ -723,7 +786,7 @@ fn patch_tags(state: Rc<State>, patches: Vec<Patch>) {
                     return Err(anyhow!("unexpected status code: {}", status));
                 }
 
-                state.token.trigger_subscribers();
+                token.trigger_subscribers();
 
                 Ok::<_, Error>(())
             }
@@ -737,7 +800,7 @@ fn patch_tags(state: Rc<State>, patches: Vec<Patch>) {
 fn is_immutable_category(tags: &TagsResponse, category: Option<&str>) -> bool {
     fn recurse(tags: &TagsResponse, category: &str) -> Option<bool> {
         for (cat, tags) in &tags.categories {
-            if cat == category {
+            if cat.deref() == category {
                 return Some(tags.immutable.unwrap_or(false));
             } else if let Some(answer) = recurse(tags, category) {
                 return Some(answer);
@@ -766,14 +829,6 @@ enum Select {
     Last,
 }
 
-struct State {
-    token: Signal<Option<String>>,
-    root: String,
-    client: Client,
-    full_size_image: Signal<Option<Rc<str>>>,
-    selecting: Signal<bool>,
-}
-
 fn main() -> Result<()> {
     panic::set_hook(Box::new(console_error_panic_hook::hook));
 
@@ -785,76 +840,82 @@ fn main() -> Result<()> {
 
     let location = window.location();
 
-    let state = Rc::new(State {
-        token: Signal::new(None),
-        root: format!(
-            "{}//{}",
-            location.protocol().map_err(|e| anyhow!("{:?}", e))?,
-            location.host().map_err(|e| anyhow!("{:?}", e))?
-        ),
-        client: Client::new(),
-        full_size_image: Signal::new(None),
-        selecting: Signal::new(false),
-    });
+    let token = Signal::new(None);
 
-    let now = Utc::now();
+    let root = Rc::<str>::from(format!(
+        "{}//{}",
+        location.protocol().map_err(|e| anyhow!("{:?}", e))?,
+        location.host().map_err(|e| anyhow!("{:?}", e))?
+    ));
 
-    let page_starts = Signal::new(vec![now]);
+    let client = Client::new();
+
+    let overlay_image = Signal::new(None);
+
+    let selecting = Signal::new(false);
+
+    let start = Signal::new(Some(Utc::now()));
 
     let filter = Signal::new(TagTree::default());
 
     syc::create_effect({
         let filter = filter.clone();
-        let page_starts = page_starts.clone();
+        let start = start.clone();
 
         move || {
-            log::info!(
-                "filter changed to {:#?} {:#?}",
-                filter.get().deref(),
-                Option::<TagExpression>::from(filter.get().deref())
-            );
             let _ = filter.get();
 
-            page_starts.set(vec![now]);
+            start.set(Some(Utc::now()));
         }
     });
 
     let unfiltered_tags = watch::<TagsResponse>(
         Signal::new("tags".into()).into_handle(),
-        state.clone(),
+        client.clone(),
+        token.handle(),
+        root.clone(),
         Signal::new(TagTree::default()).into_handle(),
     );
 
     let filtered_tags = watch::<TagsResponse>(
         Signal::new("tags".into()).into_handle(),
-        state.clone(),
+        client.clone(),
+        token.handle(),
+        root.clone(),
         filter.handle(),
     );
 
     let images = watch::<ImagesResponse>(
         syc::create_selector({
-            let page_starts = page_starts.clone();
+            let start = start.clone();
 
             move || {
                 format!(
-                    "images?start={}&limit={}",
-                    page_starts.get().last().unwrap_or(&now),
-                    MAX_IMAGES_PER_PAGE
+                    "images?limit={}{}",
+                    MAX_IMAGES_PER_PAGE,
+                    if let Some(start) = start.get().deref() {
+                        format!("&start={}", start)
+                    } else {
+                        String::new()
+                    }
                 )
             }
         }),
-        state.clone(),
+        client.clone(),
+        token.handle(),
+        root.clone(),
         filter.handle(),
     );
 
     wasm_bindgen_futures::spawn_local({
-        let state = state.clone();
+        let client = client.clone();
+        let token = token.clone();
+        let root = root.clone();
 
         async move {
-            state.token.set(Some(
-                state
-                    .client
-                    .post(format!("{}/token", state.root))
+            token.set(Some(
+                client
+                    .post(format!("{}/token", root))
                     .form(&TokenRequest {
                         grant_type: GrantType::Password,
                         username: "Jabberwocky".into(),
@@ -876,105 +937,75 @@ fn main() -> Result<()> {
 
     let show_menu = Signal::new(false);
 
-    let mut image_states = Rc::new(HashMap::<Rc<str>, ImageState>::new());
-
     let image_states = syc::create_memo({
         let images = images.clone();
 
         move || {
-            image_states = Rc::new(
-                images
-                    .get()
-                    .images
-                    .iter()
-                    .map(|(hash, data)| {
-                        (
-                            Rc::from(hash.deref()),
-                            if let Some(state) = image_states.get(hash.deref()) {
-                                state.tags.set(data.tags.clone());
-                                state.clone()
-                            } else {
-                                ImageState {
-                                    datetime: data.datetime,
-                                    medium: data.medium,
-                                    tags: Signal::new(data.tags.clone()),
-                                    selected: Signal::new(false),
-                                }
-                            },
-                        )
-                    })
-                    .collect::<HashMap<_, _>>(),
+            let images = images.get();
+            log::info!(
+                "dicej images start {} total {} later_start {:?} earliest_start {:?}",
+                images.start,
+                images.total,
+                images.later_start,
+                images.earliest_start
             );
 
-            image_states.clone()
+            (0..images.images.len())
+                .map(|_| ImageState {
+                    selected: Signal::new(false),
+                })
+                .collect::<Vec<_>>()
         }
     });
 
-    let full_size_image = state.full_size_image.clone();
-    let full_size_image_visible = syc::create_selector({
-        let full_size_image = full_size_image.clone();
+    let overlay_image_visible = syc::create_selector({
+        let overlay_image = overlay_image.clone();
 
-        move || full_size_image.get().is_some()
-    });
-
-    let sorted_images = syc::create_selector({
-        let image_states = image_states.clone();
-
-        move || {
-            let image_states = image_states.get();
-
-            let mut vec = image_states.keys().cloned().collect::<Vec<_>>();
-
-            vec.sort_by(|a, b| {
-                image_states
-                    .get(b.deref())
-                    .unwrap()
-                    .datetime
-                    .cmp(&image_states.get(a.deref()).unwrap().datetime)
-            });
-
-            vec
-        }
+        move || overlay_image.get().is_some()
     });
 
     let images_props = ImagesProps {
-        state: state.clone(),
+        root: root.clone(),
+        selecting: selecting.handle(),
+        images: images.clone(),
         image_states: image_states.clone(),
-        sorted_images: sorted_images.clone(),
+        overlay_image: overlay_image.clone(),
     };
 
-    let full_size_image_select = Rc::new(Cell::new(Select::None));
+    let overlay_image_select = Rc::new(Cell::new(Select::None));
 
     syc::create_effect({
-        let full_size_image = full_size_image.clone();
-        let full_size_image_select = full_size_image_select.clone();
-        let sorted_images = sorted_images.clone();
+        let overlay_image = overlay_image.clone();
+        let overlay_image_select = overlay_image_select.clone();
+        let images = images.clone();
 
         move || {
-            let sorted_images = sorted_images.get();
+            let images = images.get();
 
-            match full_size_image_select.get() {
-                Select::None => full_size_image.set(None),
+            match overlay_image_select.get() {
+                Select::None => overlay_image.set(None),
 
                 Select::First => {
-                    if let Some(first) = sorted_images.first() {
-                        full_size_image.set(Some(first.clone()));
+                    if !images.images.is_empty() {
+                        overlay_image.set(Some(0));
                     }
                 }
 
                 Select::Last => {
-                    if let Some(last) = sorted_images.last() {
-                        full_size_image.set(Some(last.clone()));
+                    if !images.images.is_empty() {
+                        overlay_image.set(Some(images.images.len() - 1));
                     }
                 }
             }
 
-            full_size_image_select.set(Select::None);
+            overlay_image_select.set(Select::None);
         }
     });
 
     let tag_menu = TagMenuProps {
-        state: state.clone(),
+        client: client.clone(),
+        token: token.handle(),
+        root: root.clone(),
         filter: filter.clone(),
         filter_chain: List::Nil,
         unfiltered_tags: unfiltered_tags.clone(),
@@ -989,12 +1020,12 @@ fn main() -> Result<()> {
     };
 
     let toggle_selecting = {
-        let selecting = state.selecting.clone();
+        let selecting = selecting.clone();
         let image_states = image_states.clone();
 
         move |_| {
             if *selecting.get() {
-                for state in image_states.get().values() {
+                for state in image_states.get().deref() {
                     state.selected.set(false);
                 }
             }
@@ -1004,71 +1035,44 @@ fn main() -> Result<()> {
     };
 
     let close_full_size = {
-        let full_size_image = full_size_image.clone();
+        let overlay_image = overlay_image.clone();
 
-        move |_| full_size_image.set(None)
-    };
-
-    let page_back = {
-        let page_starts = page_starts.clone();
-
-        move || {
-            let mut new_page_starts = page_starts.get().deref().clone();
-            if new_page_starts.len() > 1 {
-                new_page_starts.pop();
-                page_starts.set(new_page_starts);
-            }
-        }
-    };
-
-    let page_forward = {
-        let page_starts = page_starts.clone();
-        let images = images.clone();
-
-        move || {
-            if let Some(min) = images.get().images.values().map(|data| data.datetime).min() {
-                let mut new_page_starts = page_starts.get().deref().clone();
-                new_page_starts.push(min);
-                page_starts.set(new_page_starts);
-            }
-        }
+        move |_| overlay_image.set(None)
     };
 
     let next = {
-        let page_starts = page_starts.clone();
-        let page_back = page_back.clone();
-        let page_forward = page_forward.clone();
-        let full_size_image = full_size_image.clone();
+        let start = start.clone();
+        let overlay_image = overlay_image.clone();
         let images = images.clone();
-        let sorted_images = sorted_images.clone();
+        let props = PaginationProps {
+            images: images.clone(),
+            start,
+        };
 
         move |direction| {
-            if let Some(image) = full_size_image.get().deref() {
-                let sorted_images = sorted_images.get();
+            if let Some(index) = *overlay_image.get().deref() {
+                let images = images.get();
 
-                if let Some(index) = sorted_images.iter().position(|hash| hash == image) {
-                    match direction {
-                        Direction::Left => {
-                            if index > 0 {
-                                full_size_image.set(Some(sorted_images[index - 1].clone()))
-                            } else if page_starts.get().len() > 1 {
-                                full_size_image_select.set(Select::Last);
-                                page_back();
-                            }
+                match direction {
+                    Direction::Left => {
+                        if index > 0 {
+                            overlay_image.set(Some(index - 1))
+                        } else if images.start > 0 {
+                            overlay_image_select.set(Select::Last);
+                            page_back(&props);
                         }
+                    }
 
-                        Direction::Right => {
-                            if index + 1 < sorted_images.len() {
-                                full_size_image.set(Some(sorted_images[index + 1].clone()))
-                            } else {
-                                let images = images.get();
-                                let count = u32::try_from(images.images.len()).unwrap();
-                                let ImagesResponse { start, total, .. } = *images.deref();
+                    Direction::Right => {
+                        if index + 1 < images.images.len() {
+                            overlay_image.set(Some(index + 1))
+                        } else {
+                            let count = u32::try_from(images.images.len()).unwrap();
+                            let ImagesResponse { start, total, .. } = *images.deref();
 
-                                if start + count < total {
-                                    full_size_image_select.set(Select::First);
-                                    page_forward();
-                                }
+                            if start + count < total {
+                                overlay_image_select.set(Select::First);
+                                page_forward(&props);
                             }
                         }
                     }
@@ -1079,12 +1083,12 @@ fn main() -> Result<()> {
 
     let keydown = Closure::wrap(Box::new({
         let next = next.clone();
-        let full_size_image = full_size_image.clone();
+        let overlay_image = overlay_image.clone();
 
         move |event: KeyboardEvent| match event.key().deref() {
             "ArrowLeft" => next(Direction::Left),
             "ArrowRight" => next(Direction::Right),
-            "Escape" => full_size_image.set(None),
+            "Escape" => overlay_image.set(None),
             _ => (),
         }
     }) as Box<dyn Fn(KeyboardEvent)>);
@@ -1098,14 +1102,19 @@ fn main() -> Result<()> {
 
     let selected_tags = KeyedProps {
         iterable: syc::create_selector({
+            let images = images.clone();
             let image_states = image_states.clone();
 
             move || {
+                let images = images.get();
+
                 let mut vec = image_states
                     .get()
-                    .values()
-                    .filter(|state| *state.selected.get())
-                    .flat_map(|state| state.tags.get().deref().clone())
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, state)| *state.selected.get())
+                    .flat_map(|(index, _)| &images.images[index].tags)
+                    .cloned()
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect::<Vec<_>>();
@@ -1117,15 +1126,21 @@ fn main() -> Result<()> {
         }),
 
         template: {
-            let state = state.clone();
+            let client = client.clone();
+            let token = token.clone();
+            let root = root.clone();
+            let images = images.clone();
             let image_states = image_states.clone();
             let unfiltered_tags = unfiltered_tags.clone();
 
             move |tag| {
                 let remove = {
+                    let client = client.clone();
+                    let token = token.clone();
+                    let root = root.clone();
                     let tag = tag.clone();
                     let unfiltered_tags = unfiltered_tags.clone();
-                    let state = state.clone();
+                    let images = images.clone();
                     let image_states = image_states.clone();
 
                     move |_| {
@@ -1133,16 +1148,24 @@ fn main() -> Result<()> {
                             unfiltered_tags.get().deref(),
                             tag.category.as_deref(),
                         ) {
+                            let images = images.get();
+
                             patch_tags(
-                                state.clone(),
+                                client.clone(),
+                                token.clone(),
+                                root.clone(),
                                 image_states
                                     .get()
                                     .iter()
-                                    .filter_map(|(hash, state)| {
-                                        if *state.selected.get() && state.tags.get().contains(&tag)
+                                    .enumerate()
+                                    .filter_map(|(index, state)| {
+                                        if *state.selected.get()
+                                            && images.images[index].tags.contains(&tag)
                                         {
                                             Some(Patch {
-                                                hash: String::from(hash.deref()),
+                                                hash: String::from(
+                                                    images.images[index].hash.deref(),
+                                                ),
                                                 tag: tag.clone(),
                                                 action: Action::Remove,
                                             })
@@ -1188,8 +1211,9 @@ fn main() -> Result<()> {
     let input_value = Signal::new(String::new());
 
     let inputkey = {
-        let state = state.clone();
+        let root = root.clone();
         let input_value = input_value.clone();
+        let images = images.clone();
         let image_states = image_states.clone();
 
         move |event: Event| {
@@ -1206,17 +1230,24 @@ fn main() -> Result<()> {
                                     tag
                                 )
                             } else {
+                                let images = images.get();
+
                                 patch_tags(
-                                    state.clone(),
+                                    client.clone(),
+                                    token.clone(),
+                                    root.clone(),
                                     image_states
                                         .get()
                                         .iter()
-                                        .filter_map(|(hash, state)| {
+                                        .enumerate()
+                                        .filter_map(|(index, state)| {
                                             if *state.selected.get()
-                                                && !state.tags.get().contains(&tag)
+                                                && !images.images[index].tags.contains(&tag)
                                             {
                                                 Some(Patch {
-                                                    hash: String::from(hash.deref()),
+                                                    hash: String::from(
+                                                        images.images[index].hash.deref(),
+                                                    ),
                                                     tag: tag.clone(),
                                                     action: Action::Add,
                                                 })
@@ -1238,19 +1269,10 @@ fn main() -> Result<()> {
         }
     };
 
-    let selecting = state.selecting.clone();
-    let selecting2 = state.selecting.clone();
+    let selecting2 = selecting.clone();
 
-    let selected = syc::create_selector({
-        let image_states = image_states.clone();
-
-        move || {
-            image_states
-                .get()
-                .values()
-                .any(|state| *state.selected.get())
-        }
-    });
+    let selected =
+        syc::create_selector(move || image_states.get().iter().any(|state| *state.selected.get()));
 
     let playing = Signal::new(false);
 
@@ -1262,17 +1284,15 @@ fn main() -> Result<()> {
 
     let pagination = PaginationProps {
         images: images.clone(),
-        page_starts: page_starts.handle(),
-        page_back: Rc::new(page_back),
-        page_forward: Rc::new(page_forward),
+        start,
     };
 
     syc::create_effect({
-        let full_size_image = full_size_image.clone();
+        let overlay_image = overlay_image.clone();
         let playing = playing.clone();
 
         move || {
-            let _ = full_size_image.get();
+            let _ = overlay_image.get();
 
             playing.set(false)
         }
@@ -1284,35 +1304,32 @@ fn main() -> Result<()> {
     sycamore::render(move || {
         template! {
             div(class="overlay",
-                style=format!("height:{};", if *full_size_image_visible.get() { "100%" } else { "0" }))
+                style=format!("height:{};", if *overlay_image_visible.get() { "100%" } else { "0" }))
             {
                 i(class="fa fa-times big close cursor", on:click=close_full_size)
 
-                (if let Some(image) = full_size_image.get().deref() {
-                    let url = format!("{}/image/{}?size=large", state.root, image);
+                (if let Some(index) = *overlay_image.get().deref() {
+                    let images = images.get();
 
-                    if let Some(image_state) = image_states.get().get(image) {
-                        let image_state = image_state.clone();
-                        let medium = image_state.medium;
+                    if let Some(image) = images.images.get(index) {
+                        let url = format!("{}/image/{}?size=large", root, image.hash);
 
-                        let tags = KeyedProps {
-                            iterable: syc::create_selector(move || {
-                                let mut vec = image_state.tags.get().iter().cloned().collect::<Vec<_>>();
+                        let medium = image.medium;
 
-                                vec.sort();
+                        let mut vec = image.tags.iter().cloned().collect::<Vec<_>>();
 
-                                vec
-                            }),
+                        vec.sort();
 
-                            template: move |tag| {
+                        let tags = IndexedProps {
+                            iterable: Signal::new(vec).into_handle(),
+
+                            template: |tag| {
                                 template! {
                                     span(class="tag") {
                                         (tag)
                                     }
                                 }
-                            },
-
-                            key: |tag| tag.clone(),
+                            }
                         };
 
                         let playing = *playing.get();
@@ -1327,18 +1344,11 @@ fn main() -> Result<()> {
                             Medium::Image | Medium::Video => template! {}
                         };
 
-                        let mut have_left = false;
-                        let mut have_right = false;
-                        let sorted_images = sorted_images.get();
+                        let count = u32::try_from(images.images.len()).unwrap();
+                        let ImagesResponse { start, total, .. } = *images.deref();
 
-                        if let Some(index) = sorted_images.iter().position(|hash| hash == image) {
-                            let images = images.get();
-                            let count = u32::try_from(images.images.len()).unwrap();
-                            let ImagesResponse { start, total, .. } = *images.deref();
-
-                            have_left = index > 0 || page_starts.get().len() > 1;
-                            have_right = index + 1 < sorted_images.len() || start + count < total;
-                        }
+                        let have_left = index > 0 || start > 0;
+                        let have_right = index + 1 < images.images.len() || start + count < total;
 
                         let left = if have_left {
                             let next = next.clone();
@@ -1362,7 +1372,7 @@ fn main() -> Result<()> {
                             template! {}
                         };
 
-                        let original_url = format!("{}/image/{}", state.root, image);
+                        let original_url = format!("{}/image/{}", root, image.hash);
 
                         let show_video = match medium {
                             Medium::ImageWithVideo => playing,
@@ -1386,10 +1396,10 @@ fn main() -> Result<()> {
 
                         template! {
                             (left) (right) (play_button) (image) span(class="tags") {
-                                Keyed(tags)
+                                Indexed(tags)
                             }
 
-                            a(href=original_url, class="original") {
+                            a(href=original_url, class="original", target="_blank") {
                                 "original"
                             }
                         }
@@ -1443,7 +1453,7 @@ fn main() -> Result<()> {
 
                 div(style=format!("display:{};", if filter.get().is_some() { "block" } else { "none" })) {
                     (filter2.get().deref().as_ref().map(|expression|
-                                                       expression.to_string()).unwrap_or_else(String::new))
+                                                        expression.to_string()).unwrap_or_else(String::new))
                 }
             }
 

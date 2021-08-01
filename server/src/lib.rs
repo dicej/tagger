@@ -1,66 +1,68 @@
 #![deny(warnings)]
 
-use anyhow::{anyhow, Error, Result};
-use bytes::{Bytes, BytesMut};
-use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
-use futures::{
-    future::{BoxFuture, FutureExt, TryFutureExt},
-    stream::{Stream, TryStreamExt},
+use {
+    anyhow::{anyhow, Error, Result},
+    bytes::{Bytes, BytesMut},
+    chrono::{DateTime, Datelike, NaiveDateTime, Utc},
+    futures::{
+        future::{BoxFuture, FutureExt, TryFutureExt},
+        stream::{Stream, TryStreamExt},
+    },
+    http::{
+        header,
+        response::{self, Response},
+        status::StatusCode,
+    },
+    hyper::Body,
+    image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat},
+    jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation},
+    lazy_static::lazy_static,
+    mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType},
+    rand::Rng,
+    regex::Regex,
+    rexiv2::{Metadata as ExifMetadata, Orientation},
+    serde_derive::Deserialize,
+    serde_json::json,
+    sha2::{Digest, Sha256},
+    sqlx::{
+        query::Query,
+        sqlite::{SqliteArguments, SqliteConnectOptions},
+        ConnectOptions, Connection, Row, Sqlite, SqliteConnection,
+    },
+    std::{
+        collections::{HashMap, HashSet, VecDeque},
+        convert::{Infallible, TryFrom, TryInto},
+        fmt::Write as _,
+        io::{BufReader, Seek, SeekFrom, Write},
+        mem,
+        net::SocketAddrV4,
+        num::NonZeroU32,
+        ops::{Deref, DerefMut},
+        panic::{self, AssertUnwindSafe},
+        path::{Path, PathBuf},
+        str::FromStr,
+        sync::Arc,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    },
+    structopt::StructOpt,
+    tagger_shared::{
+        tag_expression::{Tag, TagExpression},
+        Action, ImageData, ImageQuery, ImagesQuery, ImagesResponse, Medium, Patch, Size, TagsQuery,
+        TagsResponse, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType, Variant,
+    },
+    tempfile::NamedTempFile,
+    tokio::{
+        fs::{self, File},
+        io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
+        process::Command,
+        sync::Mutex as AsyncMutex,
+        task, time,
+    },
+    tokio_util::codec::{BytesCodec, FramedRead},
+    tracing::{info, warn},
+    warp::{Filter, Rejection, Reply},
+    warp_util::HttpError,
 };
-use http::{
-    header,
-    response::{self, Response},
-    status::StatusCode,
-};
-use hyper::Body;
-use image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat};
-use jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use lazy_static::lazy_static;
-use mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType};
-use rand::Rng;
-use regex::Regex;
-use rexiv2::{Metadata as ExifMetadata, Orientation};
-use serde_derive::Deserialize;
-use serde_json::json;
-use sha2::{Digest, Sha256};
-use sqlx::{
-    query::Query,
-    sqlite::{SqliteArguments, SqliteConnectOptions},
-    ConnectOptions, Connection, Row, Sqlite, SqliteConnection,
-};
-use std::{
-    collections::{HashMap, HashSet},
-    convert::{Infallible, TryFrom, TryInto},
-    fmt::Write as _,
-    io::{BufReader, Seek, SeekFrom, Write},
-    mem,
-    net::SocketAddrV4,
-    num::NonZeroU32,
-    ops::DerefMut,
-    panic::{self, AssertUnwindSafe},
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use structopt::StructOpt;
-use tagger_shared::{
-    tag_expression::{Tag, TagExpression},
-    Action, ImageData, ImageQuery, ImagesQuery, ImagesResponse, Medium, Patch, Size, TagsQuery,
-    TagsResponse, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType, Variant,
-};
-use tempfile::NamedTempFile;
-use tokio::{
-    fs::{self, File},
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
-    process::Command,
-    sync::Mutex as AsyncMutex,
-    task, time,
-};
-use tokio_util::codec::{BytesCodec, FramedRead};
-use tracing::{info, warn};
-use warp::{Filter, Rejection, Reply};
-use warp_util::HttpError;
 
 mod warp_util;
 
@@ -479,78 +481,60 @@ fn bind_filter_clause<'a>(
 
 fn build_images_query<'a>(
     buffer: &'a mut String,
-    count: bool,
-    query: &ImagesQuery,
-    limit: u32,
+    filter: Option<&TagExpression>,
 ) -> Query<'a, Sqlite, SqliteArguments<'a>> {
     write!(
         buffer,
-        "SELECT {} FROM images i WHERE {}{}{}",
-        if count {
-            if query.start.is_some() {
-                "sum(CASE WHEN datetime >= ? THEN 1 ELSE 0 END), count(*)"
-            } else {
-                "0, count(*)"
-            }
-        } else {
-            "hash, \
-             datetime, \
-             video_offset, \
-             (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END) \
-              FROM tags WHERE hash = i.hash)"
-        },
-        if let Some(filter) = &query.filter {
+        "SELECT \
+         hash, \
+         datetime, \
+         video_offset, \
+         (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END) \
+          FROM tags WHERE hash = i.hash) \
+         FROM images i WHERE {} ORDER BY datetime DESC",
+        if let Some(filter) = filter {
             let mut buffer = String::new();
             append_filter_clause(&mut buffer, filter);
             buffer
         } else {
             "1".into()
-        },
-        if query.start.is_some() && !count {
-            " AND datetime < ?"
-        } else {
-            ""
-        },
-        if count { "" } else { " ORDER BY datetime DESC LIMIT ?" }
+        }
     )
     .unwrap();
 
     let mut select = sqlx::query(buffer);
 
-    if count {
-        if let Some(start) = &query.start {
-            select = select.bind(start.to_string());
-        }
-    }
-
-    if let Some(filter) = &query.filter {
+    if let Some(filter) = filter {
         select = bind_filter_clause(filter, select);
     }
 
-    if count {
-        select
-    } else {
-        if let Some(start) = &query.start {
-            select = select.bind(start.to_string());
-        }
-        select.bind(limit)
-    }
+    select
 }
 
 async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<ImagesResponse> {
-    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    let limit = usize::try_from(query.limit.unwrap_or(DEFAULT_LIMIT)).unwrap();
 
-    let mut images = HashMap::new();
+    let mut buffer = String::new();
+    let mut rows = build_images_query(&mut buffer, query.filter.as_ref()).fetch(&mut *conn);
 
-    {
-        let mut buffer = String::new();
-        let mut rows = build_images_query(&mut buffer, false, query, limit).fetch(&mut *conn);
+    let mut images = Vec::with_capacity(limit);
+    let mut later = VecDeque::with_capacity(limit + 1);
+    let mut total = 0;
+    let mut start = 0;
+    let mut previous = None;
+    let mut earliest_start = None;
+    let mut earlier_count = 0;
 
-        while let Some(row) = rows.try_next().await? {
-            images.insert(
-                row.get(0),
-                ImageData {
-                    datetime: row.get::<&str, _>(1).parse()?,
+    while let Some(row) = rows.try_next().await? {
+        total += 1;
+
+        let datetime = row.get::<&str, _>(1).parse()?;
+
+        if query.start.map(|start| datetime < start).unwrap_or(true) {
+            if images.len() < limit {
+                images.push(ImageData {
+                    hash: Arc::from(row.get::<&str, _>(0)),
+                    datetime,
                     medium: match row.get::<Option<i64>, _>(2) {
                         Some(0) => Medium::Video,
                         Some(_) => Medium::ImageWithVideo,
@@ -562,23 +546,36 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
                         .filter(|s| !s.is_empty())
                         .map(Tag::from_str)
                         .collect::<Result<HashSet<_>>>()?,
-                },
-            );
+                });
+            } else {
+                if earlier_count == 0 {
+                    earliest_start = previous;
+                }
+
+                earlier_count = (earlier_count + 1) % limit;
+            }
+        } else {
+            start += 1;
+
+            if later.len() > limit {
+                later.pop_front();
+            }
+
+            later.push_back(datetime);
         }
+
+        previous = Some(datetime);
     }
-
-    let (start, total) = {
-        let mut buffer = String::new();
-        let row = build_images_query(&mut buffer, true, query, limit)
-            .fetch_one(conn)
-            .await?;
-
-        (row.get::<u32, _>(0), row.get::<u32, _>(1))
-    };
 
     Ok(ImagesResponse {
         start,
         total,
+        later_start: if later.len() > limit {
+            later.front().copied()
+        } else {
+            None
+        },
+        earliest_start,
         images,
     })
 }
@@ -596,6 +593,8 @@ async fn apply(
 
     for patch in patches {
         if let Some(category) = &patch.tag.category {
+            let category = category.deref();
+
             if let Some(row) =
                 sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
                     .fetch_optional(&mut *conn)
@@ -609,13 +608,17 @@ async fn apply(
             }
         }
 
+        let value = patch.tag.value.deref();
+
         match patch.action {
             Action::Add => {
+                let category = patch.tag.category.as_deref();
+
                 sqlx::query!(
                     "INSERT INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
                     patch.hash,
-                    patch.tag.value,
-                    patch.tag.category
+                    value,
+                    category
                 )
                 .execute(&mut *conn)
                 .await?;
@@ -623,10 +626,12 @@ async fn apply(
 
             Action::Remove => {
                 if let Some(category) = &patch.tag.category {
+                    let category = category.deref();
+
                     sqlx::query!(
                         "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category = ?3",
                         patch.hash,
-                        patch.tag.value,
+                        value,
                         category
                     )
                     .execute(&mut *conn)
@@ -635,7 +640,7 @@ async fn apply(
                     sqlx::query!(
                         "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category IS NULL",
                         patch.hash,
-                        patch.tag.value
+                        value
                     )
                     .execute(&mut *conn)
                     .await?;
@@ -1205,8 +1210,8 @@ async fn image(
 
 fn entry<'a>(
     response: &'a mut TagsResponse,
-    parents: &HashMap<String, String>,
-    category: &str,
+    parents: &HashMap<Arc<str>, Arc<str>>,
+    category: &Arc<str>,
 ) -> &'a mut TagsResponse {
     if let Some(parent) = parents.get(category) {
         entry(response, parents, parent)
@@ -1214,7 +1219,7 @@ fn entry<'a>(
         response
     }
     .categories
-    .entry(category.to_owned())
+    .entry(category.clone())
     .or_insert_with(TagsResponse::default)
 }
 
@@ -1253,16 +1258,18 @@ async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResp
     let mut rows = select.fetch(&mut *conn);
 
     while let Some(row) = rows.try_next().await? {
-        let tag = row.get(3);
+        let tag = Arc::from(row.get::<&str, _>(3));
         let count = row.get(4);
 
-        if let Some(category) = row.get::<Option<String>, _>(2) {
+        if let Some(category) = row.get::<Option<&str>, _>(2) {
+            let category = Arc::<str>::from(category);
+
             if let Some(immutable) = row.get::<Option<bool>, _>(1) {
                 category_immutable.insert(category.clone(), immutable);
             }
 
-            if let Some(parent) = row.get::<Option<String>, _>(0) {
-                parents.insert(category.clone(), parent);
+            if let Some(parent) = row.get::<Option<&str>, _>(0) {
+                parents.insert(category.clone(), Arc::from(parent));
             }
 
             category_tags
@@ -1534,7 +1541,6 @@ fn routes(
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
-                            let image_mutex = image_mutex.clone();
 
                             move |hash: String, auth: Option<Arc<_>>, query| {
                                 let hash = Arc::<str>::from(hash);
@@ -1685,12 +1691,14 @@ pub struct Options {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use image::{ImageBuffer, Rgb};
-    use maplit::{hashmap, hashset};
-    use rand::{rngs::StdRng, SeedableRng};
-    use std::iter;
-    use tempfile::TempDir;
+    use {
+        super::*,
+        image::{ImageBuffer, Rgb},
+        maplit::{hashmap, hashset},
+        rand::{rngs::StdRng, SeedableRng},
+        std::iter,
+        tempfile::TempDir,
+    };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_works() -> Result<()> {
@@ -1822,6 +1830,8 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 0);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert!(response.images.is_empty());
 
         // Let's add some images to `image_tmp_dir` and call `sync` to add them to the database.
@@ -1874,6 +1884,8 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 0);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(response.images.len(), 0);
 
         // GET /images with no query parameters should yield all the images.
@@ -1891,18 +1903,20 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, image_count);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
 
         let hashes = response
             .images
             .iter()
-            .map(|(hash, state)| (state.datetime, hash.clone()))
+            .map(|data| (data.datetime, data.hash.clone()))
             .collect::<HashMap<_, _>>();
 
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=image_count)
                 .map(|number| Ok((
@@ -1927,11 +1941,16 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, image_count);
+        assert_eq!(response.later_start, None);
+        assert_eq!(
+            response.earliest_start,
+            Some("2021-03-01T00:00:00Z".parse()?)
+        );
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             ((image_count - 1)..=image_count)
                 .map(|number| Ok((
@@ -1956,11 +1975,16 @@ mod test {
 
         assert_eq!(response.start, 7);
         assert_eq!(response.total, image_count);
+        assert_eq!(response.later_start, Some("2021-06-01T00:00:00Z".parse()?));
+        assert_eq!(
+            response.earliest_start,
+            Some("2021-02-01T00:00:00Z".parse()?)
+        );
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=3)
                 .map(|number| Ok((
@@ -1976,7 +2000,7 @@ mod test {
             hash: hashes
                 .get(&"2021-03-01T00:00:00Z".parse()?)
                 .unwrap()
-                .clone(),
+                .to_string(),
             tag: "foo".parse()?,
             action: Action::Add,
         }];
@@ -2020,7 +2044,7 @@ mod test {
                     hash: hashes
                         .get(&"2021-03-01T00:00:00Z".parse()?)
                         .unwrap()
-                        .clone(),
+                        .to_string(),
                     tag: Tag {
                         value: tag.into(),
                         category: Some(category.into()),
@@ -2060,11 +2084,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, image_count);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=image_count)
                 .map(|number| Ok((
@@ -2118,7 +2144,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (1..=image_count).map(|n| (format!("{}", n), 1)).collect()
+                                tags: (1..=image_count).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2147,11 +2173,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 1);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
@@ -2171,7 +2199,7 @@ mod test {
             hash: hashes
                 .get(&"2021-02-01T00:00:00Z".parse()?)
                 .unwrap()
-                .clone(),
+                .to_string(),
             tag: "foo".parse()?,
             action: Action::Add,
         }];
@@ -2199,7 +2227,7 @@ mod test {
                             hash: hashes
                                 .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
                                 .unwrap()
-                                .clone(),
+                                .to_string(),
                             tag: "bar".parse()?,
                             action: Action::Add,
                         })
@@ -2232,7 +2260,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (1..=image_count).map(|n| (format!("{}", n), 1)).collect()
+                                tags: (1..=image_count).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2262,11 +2290,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 2);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=3)
                 .map(|number| Ok((
@@ -2310,7 +2340,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (2..=3).map(|n| (format!("{}", n), 1)).collect()
+                                tags: (2..=3).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2340,11 +2370,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 2);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (3..=4)
                 .map(|number| Ok((
@@ -2388,7 +2420,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (3..=4).map(|n| (format!("{}", n), 1)).collect()
+                                tags: (3..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2418,11 +2450,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 1);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
@@ -2490,11 +2524,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 3);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=4)
                 .map(|number| Ok((
@@ -2543,7 +2579,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (2..=4).map(|n| (format!("{}", n), 1)).collect()
+                                tags: (2..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2574,11 +2610,16 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, image_count);
+        assert_eq!(response.later_start, None);
+        assert_eq!(
+            response.earliest_start,
+            Some("2021-02-01T00:00:00Z".parse()?)
+        );
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=image_count)
                 .map(|number| Ok((
@@ -2612,7 +2653,7 @@ mod test {
             hash: hashes
                 .get(&"2021-04-01T00:00:00Z".parse()?)
                 .unwrap()
-                .clone(),
+                .to_string(),
             tag: "baz".parse()?,
             action: Action::Add,
         }];
@@ -2642,11 +2683,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 2);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (3..=4)
                 .map(|number| Ok((
@@ -2692,7 +2735,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (3..=4).map(|n| (format!("{}", n), 1)).collect()
+                                tags: (3..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2723,11 +2766,16 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 2);
+        assert_eq!(response.later_start, None);
+        assert_eq!(
+            response.earliest_start,
+            Some("2021-04-01T00:00:00Z".parse()?)
+        );
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
@@ -2757,11 +2805,16 @@ mod test {
 
         assert_eq!(response.start, 1);
         assert_eq!(response.total, 3);
+        assert_eq!(response.later_start, None);
+        assert_eq!(
+            response.earliest_start,
+            Some("2021-03-01T00:00:00Z".parse()?)
+        );
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
@@ -2782,7 +2835,7 @@ mod test {
             hash: hashes
                 .get(&"2021-03-01T00:00:00Z".parse()?)
                 .unwrap()
-                .clone(),
+                .to_string(),
             tag: "bar".parse()?,
 
             action: Action::Remove,
@@ -2813,11 +2866,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 1);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
@@ -2847,11 +2902,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, image_count);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=image_count)
                 .map(|number| Ok((
@@ -2889,11 +2946,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 1);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(7)
                 .map(|number| Ok((
@@ -2915,7 +2974,7 @@ mod test {
                         hash: hashes
                             .get(&"2021-04-01T00:00:00Z".parse()?)
                             .unwrap()
-                            .clone(),
+                            .to_string(),
                         tag: Tag {
                             value: "baz".into(),
                             category: Some(category.into()),
@@ -2935,7 +2994,7 @@ mod test {
             hash: hashes
                 .get(&"2021-04-01T00:00:00Z".parse()?)
                 .unwrap()
-                .clone(),
+                .to_string(),
             tag: "public".parse()?,
             action: Action::Add,
         }];
@@ -2964,11 +3023,13 @@ mod test {
 
         assert_eq!(response.start, 0);
         assert_eq!(response.total, 1);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
         assert_eq!(
             response
                 .images
                 .into_iter()
-                .map(|(_, state)| (state.datetime, state.tags))
+                .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((

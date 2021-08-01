@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1"
-serde = "1"
+serde = { version = "1", features = [ "rc" ] }
 serde_derive = "1"
 lalrpop-util = "0.19"
 regex-syntax = "0.6"

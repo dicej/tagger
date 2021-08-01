@@ -1,17 +1,18 @@
-improved pagination
+routing
+  overlay_image
+  filter
+  pagination start date
   items per page
-  into future
-  skip to start or end
+show unfiltered counts when appropriate
 performance
   O(n) ops in FE
-  stream files instead of loading them into memory in BE
 login/logout
   disallow selection when logged out
 clean up
   modularize FE and BE
   componentize FE and minimize main
   reduce inline template code in FE
-  remove State from FE?
+  use statements
 minimize expensive clones
 break up tests
 video tests
@@ -28,8 +29,3 @@ future improvements
     video vs. image vs. motion photo
     gps
     face recognition?
-  routing
-    full_screen_image
-    filter
-    pagination start date
-    items per page
