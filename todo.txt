@@ -3,7 +3,6 @@ routing
   filter
   pagination start date
   items per page
-show unfiltered counts when appropriate
 performance
   O(n) ops in FE
 login/logout

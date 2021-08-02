@@ -884,14 +884,6 @@ fn main() -> Result<()> {
         Signal::new(TagTree::default()).into_handle(),
     );
 
-    let filtered_tags = watch::<TagsResponse>(
-        Signal::new("tags".into()).into_handle(),
-        client.clone(),
-        token.handle(),
-        root.clone(),
-        filter.handle(),
-    );
-
     let images = watch::<ImagesResponse>(
         syc::create_selector({
             let start = start.clone();
@@ -1007,7 +999,7 @@ fn main() -> Result<()> {
         filter: filter.clone(),
         filter_chain: List::Nil,
         unfiltered_tags: unfiltered_tags.clone(),
-        filtered_tags,
+        filtered_tags: unfiltered_tags.clone(),
         category: None,
     };
 
