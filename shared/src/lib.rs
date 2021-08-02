@@ -1,7 +1,7 @@
 #![deny(warnings)]
 
 use {
-    anyhow::{anyhow, Error},
+    anyhow::Error,
     chrono::{DateTime, SecondsFormat, Utc},
     lalrpop_util::lalrpop_mod,
     serde::{Deserializer, Serializer},
@@ -20,6 +20,11 @@ pub mod tag_expression;
 lalrpop_mod!(
     #[allow(clippy::all)]
     tag_expression_grammar
+);
+
+lalrpop_mod!(
+    #[allow(clippy::all)]
+    tag_tree_grammar
 );
 
 #[derive(Serialize, Deserialize)]
@@ -75,7 +80,7 @@ pub struct TagsResponse {
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct ImageKey {
     pub datetime: DateTime<Utc>,
-    pub hash: Arc<str>,
+    pub hash: Option<Arc<str>>,
 }
 
 impl FromStr for ImageKey {
@@ -83,14 +88,18 @@ impl FromStr for ImageKey {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut split = s.split_inclusive('Z');
-        if let (Some(a), Some(b)) = (split.next(), split.next()) {
-            Ok(ImageKey {
+
+        Ok(if let (Some(a), Some(b)) = (split.next(), split.next()) {
+            ImageKey {
                 datetime: a.parse()?,
-                hash: Arc::from(b),
-            })
+                hash: Some(Arc::from(b)),
+            }
         } else {
-            Err(anyhow!("unable to parse {} as ImageKey", s))
-        }
+            ImageKey {
+                datetime: s.parse()?,
+                hash: None,
+            }
+        })
     }
 }
 
@@ -100,7 +109,11 @@ impl Display for ImageKey {
             f,
             "{}{}",
             self.datetime.to_rfc3339_opts(SecondsFormat::Secs, true),
-            self.hash
+            if let Some(hash) = &self.hash {
+                hash
+            } else {
+                ""
+            }
         )
     }
 }
@@ -151,7 +164,7 @@ impl ImageData {
     pub fn key(&self) -> ImageKey {
         ImageKey {
             datetime: self.datetime,
-            hash: self.hash.clone(),
+            hash: Some(self.hash.clone()),
         }
     }
 }

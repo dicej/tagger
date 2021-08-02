@@ -1,0 +1,40 @@
+use {
+    crate::tag_expression::{TagTree, TagState, TagList, TagAndState, Tag},
+    std::sync::Arc
+};
+
+grammar;
+
+pub TagTree: TagTree = {
+    "(" <a:List> ")" => TagTree::from(a),
+    "()" => TagTree::default()
+}
+
+List: TagList = {
+    <a:TagAndState> "," <b:List> => TagList::Cons(Box::new((a, b))),
+    <a:TagAndState> => TagList::Cons(Box::new((a, TagList::Nil)))
+}
+
+TagAndState: TagAndState = {
+    <a:Tag> "=>" <b:State> => TagAndState { tag: a, state: b }
+}
+
+Tag: Tag = {
+    <category:Name> ":" <tag:Name> => Tag {
+      category: Some(Arc::from(category)),
+      value: Arc::from(tag)
+    },
+    <tag:Name> => Tag {
+       category: None,
+       value: Arc::from(tag)
+    }
+}
+
+State: TagState = {
+    "excluded" => TagState::Excluded,
+    <a:TagTree> => TagState::Included(a),
+}
+
+Name = {
+    r"[\w-]+"
+}

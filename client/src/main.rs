@@ -5,7 +5,7 @@ use {
     chrono::Utc,
     futures::future::TryFutureExt,
     reqwest::Client,
-    serde::Deserialize,
+    serde_derive::{Deserialize, Serialize},
     std::{
         cell::Cell,
         cmp::Ordering,
@@ -26,12 +26,10 @@ use {
         TokenRequest, TokenSuccess,
     },
     wasm_bindgen::{closure::Closure, JsCast},
-    web_sys::{Event, HtmlVideoElement, KeyboardEvent, MouseEvent},
+    web_sys::{Event, HtmlSelectElement, HtmlVideoElement, KeyboardEvent, MouseEvent},
 };
 
-const MAX_IMAGES_PER_PAGE: u32 = 100;
-
-const NULL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const DEFAULT_ITEMS_PER_PAGE: u32 = 100;
 
 #[derive(Clone, Debug)]
 enum List<T> {
@@ -189,7 +187,7 @@ fn page_back(props: &PaginationProps) {
 
 fn page_forward(props: &PaginationProps) {
     let images = props.images.get();
-    let ImagesResponse { start, total, .. } = *images.deref();
+    let ImagesResponse { start, total, .. } = *images;
     let count = u32::try_from(images.images.len()).unwrap();
 
     if start + count < total {
@@ -215,7 +213,7 @@ fn pagination(props: PaginationProps) -> Template<G> {
         span(class="pagination") {
             ({
                 let images = props.images.get();
-                let ImagesResponse { start, total, .. } = *images.deref();
+                let ImagesResponse { start, total, .. } = *images;
 
                 if total == 0 {
                     template! {
@@ -712,7 +710,7 @@ fn images(props: ImagesProps) -> Template<G> {
     }
 }
 
-fn watch<T: Default + for<'de> Deserialize<'de>>(
+fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
     uri: StateHandle<String>,
     client: Client,
     token: StateHandle<Option<String>>,
@@ -830,6 +828,21 @@ enum Select {
     Last,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct State {
+    #[serde(rename = "oi")]
+    overlay_image: Option<usize>,
+
+    #[serde(rename = "f")]
+    filter: Option<TagTree>,
+
+    #[serde(rename = "s")]
+    start: Option<ImageKey>,
+
+    #[serde(rename = "ipp")]
+    items_per_page: Option<u32>,
+}
+
 fn main() -> Result<()> {
     panic::set_hook(Box::new(console_error_panic_hook::hook));
 
@@ -857,22 +870,84 @@ fn main() -> Result<()> {
 
     let start = Signal::new(Some(ImageKey {
         datetime: Utc::now(),
-        hash: Arc::from(NULL_HASH),
+        hash: None,
     }));
 
     let filter = Signal::new(TagTree::default());
 
+    let items_per_page = Signal::new(DEFAULT_ITEMS_PER_PAGE);
+
+    if let Ok(hash) = location.hash() {
+        match serde_urlencoded::from_str::<State>(&hash[1..]) {
+            Ok(state) => {
+                log::info!("state for {} is {:#?}", hash, state);
+
+                overlay_image.set(state.overlay_image);
+                filter.set(state.filter.unwrap_or_default());
+
+                if let Some(state_start) = state.start {
+                    start.set(Some(state_start));
+                }
+
+                if let Some(state_items_per_page) = state.items_per_page {
+                    items_per_page.set(state_items_per_page);
+                }
+            }
+            Err(e) => {
+                log::warn!("unable to decode state: {:?}", e);
+            }
+        }
+    }
+
     syc::create_effect({
-        let filter = filter.clone();
+        let overlay_image = overlay_image.handle();
+        let filter = filter.handle();
+        let start = start.handle();
+        let items_per_page = items_per_page.handle();
+
+        move || {
+            let filter = filter.get();
+            let items_per_page = items_per_page.get();
+
+            match serde_urlencoded::to_string(&State {
+                overlay_image: *overlay_image.get(),
+                filter: if filter.0.is_empty() {
+                    None
+                } else {
+                    Some(filter.deref().clone())
+                },
+                start: start.get().deref().clone(),
+                items_per_page: if *items_per_page == DEFAULT_ITEMS_PER_PAGE {
+                    None
+                } else {
+                    Some(*items_per_page)
+                },
+            }) {
+                Ok(hash) => {
+                    let _ = location.set_hash(&hash);
+                }
+                Err(e) => {
+                    log::warn!("unable to encode state: {:?}", e);
+                }
+            }
+        }
+    });
+
+    syc::create_effect({
+        let mut old_filter = filter.get();
+        let filter = filter.handle();
         let start = start.clone();
 
         move || {
-            let _ = filter.get();
+            let new_filter = filter.get();
+            if new_filter != old_filter {
+                old_filter = new_filter;
 
-            start.set(Some(ImageKey {
-                datetime: Utc::now(),
-                hash: Arc::from(NULL_HASH),
-            }));
+                start.set(Some(ImageKey {
+                    datetime: Utc::now(),
+                    hash: None,
+                }));
+            }
         }
     });
 
@@ -887,13 +962,14 @@ fn main() -> Result<()> {
     let images = watch::<ImagesResponse>(
         syc::create_selector({
             let start = start.clone();
+            let items_per_page = items_per_page.clone();
 
             move || {
                 format!(
                     "images?{}",
                     serde_urlencoded::to_string(ImagesQuery {
                         start: start.get().deref().clone(),
-                        limit: Some(MAX_IMAGES_PER_PAGE),
+                        limit: Some(*items_per_page.get()),
                         filter: None // will be added by `watch`
                     })
                     .unwrap()
@@ -973,7 +1049,7 @@ fn main() -> Result<()> {
             let images = images.get();
 
             match overlay_image_select.get() {
-                Select::None => overlay_image.set(None),
+                Select::None => (),
 
                 Select::First => {
                     if !images.images.is_empty() {
@@ -1040,7 +1116,7 @@ fn main() -> Result<()> {
         };
 
         move |direction| {
-            if let Some(index) = *overlay_image.get().deref() {
+            if let Some(index) = *overlay_image.get() {
                 let images = images.get();
 
                 match direction {
@@ -1058,7 +1134,7 @@ fn main() -> Result<()> {
                             overlay_image.set(Some(index + 1))
                         } else {
                             let count = u32::try_from(images.images.len()).unwrap();
-                            let ImagesResponse { start, total, .. } = *images.deref();
+                            let ImagesResponse { start, total, .. } = *images;
 
                             if start + count < total {
                                 overlay_image_select.set(Select::First);
@@ -1288,6 +1364,20 @@ fn main() -> Result<()> {
         }
     });
 
+    let set_items_per_page = {
+        let items_per_page = items_per_page.clone();
+
+        move |event: Event| {
+            if let Some(items) = event
+                .target()
+                .and_then(|target| target.dyn_into::<HtmlSelectElement>().ok())
+                .and_then(|target| target.value().parse().ok())
+            {
+                items_per_page.set(items)
+            }
+        }
+    };
+
     let filter = syc::create_selector(move || Option::<TagExpression>::from(filter.get().deref()));
     let filter2 = filter.clone();
 
@@ -1298,7 +1388,7 @@ fn main() -> Result<()> {
             {
                 i(class="fa fa-times big close cursor", on:click=close_full_size)
 
-                (if let Some(index) = *overlay_image.get().deref() {
+                (if let Some(index) = *overlay_image.get() {
                     let images = images.get();
 
                     if let Some(image) = images.images.get(index) {
@@ -1335,7 +1425,7 @@ fn main() -> Result<()> {
                         };
 
                         let count = u32::try_from(images.images.len()).unwrap();
-                        let ImagesResponse { start, total, .. } = *images.deref();
+                        let ImagesResponse { start, total, .. } = *images;
 
                         let have_left = index > 0 || start > 0;
                         let have_right = index + 1 < images.images.len() || start + count < total;
@@ -1412,6 +1502,24 @@ fn main() -> Result<()> {
                 }
 
                 div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
+                    label(for="items_per_page") { "items per page: " }
+
+                    select(name="items_per_page",
+                           id="items_per_page",
+                           on:change=set_items_per_page)
+                    {
+                        (match *items_per_page.get() {
+                            1000 => template! {
+                                option(value="100") { "100" }
+                                option(value="1000", selected=true) { "1000" }
+                            },
+                            _ => template! {
+                                option(value="100", selected=true) { "100" }
+                                option(value="1000") { "1000" }
+                            },
+                        })
+                    }
+
                     TagMenu(tag_menu)
                 }
 

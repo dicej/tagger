@@ -1,18 +1,9 @@
-routing
-  overlay_image
-  filter
-  pagination start date
-  items per page
-performance
-  O(n) ops in FE
 login/logout
   disallow selection when logged out
 clean up
   modularize FE and BE
   componentize FE and minimize main
   reduce inline template code in FE
-  use statements
-minimize expensive clones
 break up tests
 video tests
 document

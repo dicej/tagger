@@ -524,7 +524,7 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
         sorted.push((
             ImageKey {
                 datetime: row.get::<&str, _>(1).parse()?,
-                hash: Arc::from(row.get::<&str, _>(0)),
+                hash: Some(Arc::from(row.get::<&str, _>(0))),
             },
             row,
         ));
@@ -551,7 +551,7 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
         {
             if images.len() < limit {
                 images.push(ImageData {
-                    hash: key.hash.clone(),
+                    hash: key.hash.clone().unwrap(),
                     datetime: key.datetime,
                     medium: match row.get::<Option<i64>, _>(2) {
                         Some(0) => Medium::Video,
@@ -1961,7 +1961,7 @@ mod test {
         assert_eq!(response.total, image_count);
         assert_eq!(response.later_start, None);
         assert_eq!(
-            response.earliest_start,
+            response.earliest_start.map(|key| key.datetime),
             Some("2021-03-01T00:00:00Z".parse()?)
         );
         assert_eq!(
@@ -1993,9 +1993,12 @@ mod test {
 
         assert_eq!(response.start, 7);
         assert_eq!(response.total, image_count);
-        assert_eq!(response.later_start, Some("2021-06-01T00:00:00Z".parse()?));
         assert_eq!(
-            response.earliest_start,
+            response.later_start.map(|key| key.datetime),
+            Some("2021-06-01T00:00:00Z".parse()?)
+        );
+        assert_eq!(
+            response.earliest_start.map(|key| key.datetime),
             Some("2021-02-01T00:00:00Z".parse()?)
         );
         assert_eq!(
@@ -2630,7 +2633,7 @@ mod test {
         assert_eq!(response.total, image_count);
         assert_eq!(response.later_start, None);
         assert_eq!(
-            response.earliest_start,
+            response.earliest_start.map(|key| key.datetime),
             Some("2021-02-01T00:00:00Z".parse()?)
         );
         assert_eq!(
@@ -2786,7 +2789,7 @@ mod test {
         assert_eq!(response.total, 2);
         assert_eq!(response.later_start, None);
         assert_eq!(
-            response.earliest_start,
+            response.earliest_start.map(|key| key.datetime),
             Some("2021-04-01T00:00:00Z".parse()?)
         );
         assert_eq!(
@@ -2825,7 +2828,7 @@ mod test {
         assert_eq!(response.total, 3);
         assert_eq!(response.later_start, None);
         assert_eq!(
-            response.earliest_start,
+            response.earliest_start.map(|key| key.datetime),
             Some("2021-03-01T00:00:00Z".parse()?)
         );
         assert_eq!(
