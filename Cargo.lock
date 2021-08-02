@@ -2170,6 +2170,7 @@ dependencies = [
  "log",
  "reqwest",
  "serde",
+ "serde_urlencoded",
  "sycamore",
  "tagger-shared",
  "wasm-bindgen",

@@ -1,12 +1,14 @@
 #![deny(warnings)]
 
-use anyhow::Error;
-use hyper::StatusCode;
-use serde_derive::Serialize;
-use std::{borrow::Cow, convert::Infallible};
-use warp::{
-    reject::{MethodNotAllowed, Reject},
-    reply, Rejection, Reply,
+use {
+    anyhow::Error,
+    hyper::StatusCode,
+    serde_derive::Serialize,
+    std::{borrow::Cow, convert::Infallible},
+    warp::{
+        reject::{MethodNotAllowed, Reject},
+        reply, Rejection, Reply,
+    },
 };
 
 #[derive(Serialize)]

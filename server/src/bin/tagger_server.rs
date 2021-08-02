@@ -1,11 +1,13 @@
 #![deny(warnings)]
 
-use anyhow::Result;
-use std::{process, sync::Arc, time::Duration};
-use structopt::StructOpt;
-use tagger_server::Options;
-use tokio::{sync::Mutex as AsyncMutex, task, time};
-use tracing::error;
+use {
+    anyhow::Result,
+    std::{process, sync::Arc, time::Duration},
+    structopt::StructOpt,
+    tagger_server::Options,
+    tokio::{sync::Mutex as AsyncMutex, task, time},
+    tracing::error,
+};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 

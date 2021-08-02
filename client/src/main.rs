@@ -2,7 +2,7 @@
 
 use {
     anyhow::{anyhow, Error, Result},
-    chrono::{DateTime, Utc},
+    chrono::Utc,
     futures::future::TryFutureExt,
     reqwest::Client,
     serde::Deserialize,
@@ -22,13 +22,16 @@ use {
     },
     tagger_shared::{
         tag_expression::{Tag, TagExpression, TagState, TagTree},
-        Action, GrantType, ImagesResponse, Medium, Patch, TagsResponse, TokenRequest, TokenSuccess,
+        Action, GrantType, ImageKey, ImagesQuery, ImagesResponse, Medium, Patch, TagsResponse,
+        TokenRequest, TokenSuccess,
     },
     wasm_bindgen::{closure::Closure, JsCast},
     web_sys::{Event, HtmlVideoElement, KeyboardEvent, MouseEvent},
 };
 
 const MAX_IMAGES_PER_PAGE: u32 = 100;
+
+const NULL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Clone, Debug)]
 enum List<T> {
@@ -181,7 +184,7 @@ fn page_start(props: &PaginationProps) {
 }
 
 fn page_back(props: &PaginationProps) {
-    props.start.set(props.images.get().later_start);
+    props.start.set(props.images.get().later_start.clone());
 }
 
 fn page_forward(props: &PaginationProps) {
@@ -190,22 +193,20 @@ fn page_forward(props: &PaginationProps) {
     let count = u32::try_from(images.images.len()).unwrap();
 
     if start + count < total {
-        props
-            .start
-            .set(images.images.last().map(|data| data.datetime));
+        props.start.set(images.images.last().map(|data| data.key()));
     }
 }
 
 fn page_end(props: &PaginationProps) {
-    if let Some(earliest_start) = props.images.get().earliest_start {
-        props.start.set(Some(earliest_start));
+    if let Some(earliest_start) = &props.images.get().earliest_start {
+        props.start.set(Some(earliest_start.clone()));
     }
 }
 
 #[derive(Clone)]
 struct PaginationProps {
     images: StateHandle<ImagesResponse>,
-    start: Signal<Option<DateTime<Utc>>>,
+    start: Signal<Option<ImageKey>>,
 }
 
 #[component(Pagination<G>)]
@@ -854,7 +855,10 @@ fn main() -> Result<()> {
 
     let selecting = Signal::new(false);
 
-    let start = Signal::new(Some(Utc::now()));
+    let start = Signal::new(Some(ImageKey {
+        datetime: Utc::now(),
+        hash: Arc::from(NULL_HASH),
+    }));
 
     let filter = Signal::new(TagTree::default());
 
@@ -865,7 +869,10 @@ fn main() -> Result<()> {
         move || {
             let _ = filter.get();
 
-            start.set(Some(Utc::now()));
+            start.set(Some(ImageKey {
+                datetime: Utc::now(),
+                hash: Arc::from(NULL_HASH),
+            }));
         }
     });
 
@@ -891,13 +898,13 @@ fn main() -> Result<()> {
 
             move || {
                 format!(
-                    "images?limit={}{}",
-                    MAX_IMAGES_PER_PAGE,
-                    if let Some(start) = start.get().deref() {
-                        format!("&start={}", start)
-                    } else {
-                        String::new()
-                    }
+                    "images?{}",
+                    serde_urlencoded::to_string(ImagesQuery {
+                        start: start.get().deref().clone(),
+                        limit: Some(MAX_IMAGES_PER_PAGE),
+                        filter: None // will be added by `watch`
+                    })
+                    .unwrap()
                 )
             }
         }),
@@ -941,16 +948,7 @@ fn main() -> Result<()> {
         let images = images.clone();
 
         move || {
-            let images = images.get();
-            log::info!(
-                "dicej images start {} total {} later_start {:?} earliest_start {:?}",
-                images.start,
-                images.total,
-                images.later_start,
-                images.earliest_start
-            );
-
-            (0..images.images.len())
+            (0..images.get().images.len())
                 .map(|_| ImageState {
                     selected: Signal::new(false),
                 })

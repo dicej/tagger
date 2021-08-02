@@ -1,12 +1,15 @@
 #![deny(warnings)]
 
 use {
-    chrono::{DateTime, Utc},
+    anyhow::{anyhow, Error},
+    chrono::{DateTime, SecondsFormat, Utc},
     lalrpop_util::lalrpop_mod,
+    serde::{Deserializer, Serializer},
     serde_derive::{Deserialize, Serialize},
     std::{
         collections::{HashMap, HashSet},
         fmt::{self, Display},
+        str::FromStr,
         sync::Arc,
     },
     tag_expression::{Tag, TagExpression},
@@ -69,9 +72,62 @@ pub struct TagsResponse {
     pub tags: HashMap<Arc<str>, u32>,
 }
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+pub struct ImageKey {
+    pub datetime: DateTime<Utc>,
+    pub hash: Arc<str>,
+}
+
+impl FromStr for ImageKey {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut split = s.split_inclusive('Z');
+        if let (Some(a), Some(b)) = (split.next(), split.next()) {
+            Ok(ImageKey {
+                datetime: a.parse()?,
+                hash: Arc::from(b),
+            })
+        } else {
+            Err(anyhow!("unable to parse {} as ImageKey", s))
+        }
+    }
+}
+
+impl Display for ImageKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            self.datetime.to_rfc3339_opts(SecondsFormat::Secs, true),
+            self.hash
+        )
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ImageKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl serde::Serialize for ImageKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ImagesQuery {
-    pub start: Option<DateTime<Utc>>,
+    pub start: Option<ImageKey>,
     pub limit: Option<u32>,
     pub filter: Option<TagExpression>,
 }
@@ -91,12 +147,21 @@ pub struct ImageData {
     pub tags: HashSet<Tag>,
 }
 
+impl ImageData {
+    pub fn key(&self) -> ImageKey {
+        ImageKey {
+            datetime: self.datetime,
+            hash: self.hash.clone(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ImagesResponse {
     pub start: u32,
     pub total: u32,
-    pub later_start: Option<DateTime<Utc>>,
-    pub earliest_start: Option<DateTime<Utc>>,
+    pub later_start: Option<ImageKey>,
+    pub earliest_start: Option<ImageKey>,
     pub images: Vec<ImageData>,
 }
 

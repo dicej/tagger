@@ -1,9 +1,11 @@
 #![deny(warnings)]
 
-use anyhow::Result;
-use futures::stream::{Stream, TryStreamExt};
-use structopt::StructOpt;
-use tagger_server::FileData;
+use {
+    anyhow::Result,
+    futures::stream::{Stream, TryStreamExt},
+    structopt::StructOpt,
+    tagger_server::FileData,
+};
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "tagger-admin", about = "Image tagging webapp admin tool")]

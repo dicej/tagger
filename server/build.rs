@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
-use sqlx::{sqlite::SqliteConnectOptions, ConnectOptions};
-use std::env;
-use tokio::fs;
+use {
+    anyhow::{anyhow, Result},
+    sqlx::{sqlite::SqliteConnectOptions, ConnectOptions},
+    std::env,
+    tokio::fs,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
