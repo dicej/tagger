@@ -207,10 +207,11 @@ fn find_new<'a>(
                 if let Some(name) = entry.file_name().to_str() {
                     let lowercase = name.to_lowercase();
 
-                    if lowercase.ends_with(".jpg")
-                        || lowercase.ends_with(".jpeg")
-                        || lowercase.ends_with(".mp4")
-                        || lowercase.ends_with(".mov")
+                    if !lowercase.starts_with(".trashed-")
+                        && (lowercase.ends_with(".jpg")
+                            || lowercase.ends_with(".jpeg")
+                            || lowercase.ends_with(".mp4")
+                            || lowercase.ends_with(".mov"))
                     {
                         let mut path = dir_buf.clone();
                         path.push(name);

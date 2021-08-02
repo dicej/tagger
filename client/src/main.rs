@@ -878,23 +878,25 @@ fn main() -> Result<()> {
     let items_per_page = Signal::new(DEFAULT_ITEMS_PER_PAGE);
 
     if let Ok(hash) = location.hash() {
-        match serde_urlencoded::from_str::<State>(&hash[1..]) {
-            Ok(state) => {
-                log::info!("state for {} is {:#?}", hash, state);
+        if hash.starts_with("#") {
+            match serde_urlencoded::from_str::<State>(&hash[1..]) {
+                Ok(state) => {
+                    log::info!("state for {} is {:#?}", hash, state);
 
-                overlay_image.set(state.overlay_image);
-                filter.set(state.filter.unwrap_or_default());
+                    overlay_image.set(state.overlay_image);
+                    filter.set(state.filter.unwrap_or_default());
 
-                if let Some(state_start) = state.start {
-                    start.set(Some(state_start));
+                    if let Some(state_start) = state.start {
+                        start.set(Some(state_start));
+                    }
+
+                    if let Some(state_items_per_page) = state.items_per_page {
+                        items_per_page.set(state_items_per_page);
+                    }
                 }
-
-                if let Some(state_items_per_page) = state.items_per_page {
-                    items_per_page.set(state_items_per_page);
+                Err(e) => {
+                    log::warn!("unable to decode state: {:?}", e);
                 }
-            }
-            Err(e) => {
-                log::warn!("unable to decode state: {:?}", e);
             }
         }
     }
