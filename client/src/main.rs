@@ -4,7 +4,7 @@ use {
     anyhow::{anyhow, Error, Result},
     chrono::Utc,
     futures::future::TryFutureExt,
-    reqwest::Client,
+    reqwest::{Client, StatusCode},
     serde_derive::{Deserialize, Serialize},
     std::{
         cell::Cell,
@@ -182,29 +182,34 @@ fn page_start(props: &PaginationProps) {
 }
 
 fn page_back(props: &PaginationProps) {
-    props.start.set(props.images.get().later_start.clone());
+    props
+        .start
+        .set(props.images.get().response.later_start.clone());
 }
 
 fn page_forward(props: &PaginationProps) {
     let images = props.images.get();
-    let ImagesResponse { start, total, .. } = *images;
-    let count = u32::try_from(images.images.len()).unwrap();
+    let ImagesResponse { start, total, .. } = *images.response;
+    let count = u32::try_from(images.response.images.len()).unwrap();
 
     if start + count < total {
-        props.start.set(images.images.last().map(|data| data.key()));
+        props
+            .start
+            .set(images.response.images.last().map(|data| data.key()));
     }
 }
 
 fn page_end(props: &PaginationProps) {
-    if let Some(earliest_start) = &props.images.get().earliest_start {
+    if let Some(earliest_start) = &props.images.get().response.earliest_start {
         props.start.set(Some(earliest_start.clone()));
     }
 }
 
 #[derive(Clone)]
 struct PaginationProps {
-    images: StateHandle<ImagesResponse>,
+    images: StateHandle<ImagesState>,
     start: Signal<Option<ImageKey>>,
+    show_message_on_zero: bool,
 }
 
 #[component(Pagination<G>)]
@@ -213,16 +218,20 @@ fn pagination(props: PaginationProps) -> Template<G> {
         span(class="pagination") {
             ({
                 let images = props.images.get();
-                let ImagesResponse { start, total, .. } = *images;
+                let ImagesResponse { start, total, .. } = *images.response;
 
                 if total == 0 {
-                    template! {
-                        em {
-                            "No images match current filter"
+                    if props.show_message_on_zero {
+                        template! {
+                            em {
+                                "No images match current filter"
+                            }
                         }
+                    } else {
+                        template! { }
                     }
                 } else {
-                    let count = u32::try_from(images.images.len()).unwrap();
+                    let count = u32::try_from(images.response.images.len()).unwrap();
 
                     let left_style = if start > 0 {
                         "visibility:visible;"
@@ -271,7 +280,7 @@ fn pagination(props: PaginationProps) -> Template<G> {
 
 struct TagSubMenuProps {
     client: Client,
-    token: StateHandle<Option<String>>,
+    token: Signal<Option<String>>,
     root: Rc<str>,
     tag: Tag,
     filter: Signal<TagTree>,
@@ -347,7 +356,7 @@ fn compare_numeric(a: &str, b: &str) -> Ordering {
 
 struct TagMenuProps {
     client: Client,
-    token: StateHandle<Option<String>>,
+    token: Signal<Option<String>>,
     root: Rc<str>,
     filter: Signal<TagTree>,
     filter_chain: List<Tag>,
@@ -533,14 +542,14 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
 
             template! {
                 li {
-                    i(class=format!("fa fa-check{}",
+                    i(class=format!("fa fa-check include{}",
                                     if let FilterState::Include = *filter_state.get() {
                                         " included"
                                     } else {
                                         ""
                                     }), on:click=toggle_included)
 
-                    i(class=format!("fa fa-times{}",
+                    i(class=format!("fa fa-times exclude{}",
                                     if let FilterState::Exclude = *filter_state2.get() {
                                         " excluded"
                                     } else {
@@ -590,8 +599,7 @@ struct ImageState {
 struct ImagesProps {
     root: Rc<str>,
     selecting: StateHandle<bool>,
-    images: StateHandle<ImagesResponse>,
-    image_states: StateHandle<Vec<ImageState>>,
+    images: StateHandle<ImagesState>,
     overlay_image: Signal<Option<usize>>,
 }
 
@@ -601,28 +609,23 @@ fn images(props: ImagesProps) -> Template<G> {
         root,
         selecting,
         images,
-        image_states,
         overlay_image,
     } = props;
 
     let images = IndexedProps {
         iterable: syc::create_selector({
             let images = images.clone();
-            let image_states = image_states.clone();
 
             move || {
                 let images = images.get();
 
-                if image_states.get().len() == images.images.len() {
-                    images
-                        .images
-                        .iter()
-                        .map(|data| data.hash.clone())
-                        .enumerate()
-                        .collect()
-                } else {
-                    Vec::new()
-                }
+                images
+                    .response
+                    .images
+                    .iter()
+                    .map(|data| data.hash.clone())
+                    .enumerate()
+                    .collect()
             }
         }),
 
@@ -630,26 +633,38 @@ fn images(props: ImagesProps) -> Template<G> {
             let url = format!("{}/image/{}?size=small", root, hash);
 
             let images = images.get();
-            let image_states = image_states.get();
 
-            if let (Some(data), Some(state)) = (images.images.get(index), image_states.get(index)) {
+            if let Some(data) = images.response.images.get(index) {
+                let state = images.states.get(&data.hash).unwrap();
+
                 let click = {
-                    let image_states = image_states.clone();
+                    let images = images.clone();
+                    let state = state.clone();
                     let selecting = selecting.clone();
                     let overlay_image = overlay_image.clone();
 
                     move |event: Event| {
                         if *selecting.get() {
-                            if let Some(state) = image_states.get(index) {
+                            if !*state.selected.get() {
                                 if let Ok(event) = event.dyn_into::<MouseEvent>() {
                                     if event.get_modifier_state("Shift") {
                                         if let (Some(first_selected), Some(last_selected)) = (
-                                            image_states
-                                                .iter()
-                                                .position(|state| *state.selected.get()),
-                                            image_states
-                                                .iter()
-                                                .rposition(|state| *state.selected.get()),
+                                            images.response.images.iter().position(|data| {
+                                                *images
+                                                    .states
+                                                    .get(&data.hash)
+                                                    .unwrap()
+                                                    .selected
+                                                    .get()
+                                            }),
+                                            images.response.images.iter().rposition(|data| {
+                                                *images
+                                                    .states
+                                                    .get(&data.hash)
+                                                    .unwrap()
+                                                    .selected
+                                                    .get()
+                                            }),
                                         ) {
                                             let range = if index < first_selected {
                                                 index..first_selected
@@ -659,19 +674,22 @@ fn images(props: ImagesProps) -> Template<G> {
                                                 index..(index + 1)
                                             };
 
-                                            for state in &image_states[range] {
+                                            for state in images.response.images[range]
+                                                .iter()
+                                                .map(|data| images.states.get(&data.hash).unwrap())
+                                            {
                                                 let selected = &state.selected;
-                                                selected.set(!*selected.get());
+                                                selected.set(true);
                                             }
 
                                             return;
                                         }
                                     }
                                 }
-
-                                let selected = &state.selected;
-                                selected.set(!*selected.get());
                             }
+
+                            let selected = &state.selected;
+                            selected.set(!*selected.get());
                         } else {
                             overlay_image.set(Some(index));
                         }
@@ -719,7 +737,7 @@ fn images(props: ImagesProps) -> Template<G> {
 fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
     uri: StateHandle<String>,
     client: Client,
-    token: StateHandle<Option<String>>,
+    token: Signal<Option<String>>,
     root: Rc<str>,
     filter: StateHandle<TagTree>,
 ) -> StateHandle<T> {
@@ -730,6 +748,7 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
 
         move || {
             let client = client.clone();
+            let token_signal = token.clone();
             let token = token.get();
             let filter = filter.get();
             let uri = uri.get();
@@ -760,7 +779,13 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
                             request = request.header("authorization", &format!("Bearer {}", token));
                         }
 
-                        signal.set(request.send().await?.json::<T>().await?);
+                        let response = request.send().await?;
+
+                        if response.status() == StatusCode::UNAUTHORIZED {
+                            token_signal.set(None);
+                        } else {
+                            signal.set(response.error_for_status()?.json::<T>().await?);
+                        }
 
                         Ok::<_, Error>(())
                     }
@@ -770,6 +795,42 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
                 }),
             )
         }
+    });
+
+    signal.into_handle()
+}
+
+fn fold_changes<A: Eq + std::fmt::Display, B>(
+    handle: StateHandle<A>,
+    signal: Signal<B>,
+    fun: impl Fn(Rc<B>, Rc<A>) -> B + 'static,
+) {
+    let mut old = handle.get();
+
+    wasm_bindgen_futures::spawn_local(async move {
+        syc::create_effect(move || {
+            let new = handle.get();
+
+            if new != old {
+                old = new.clone();
+
+                signal.set(fun(signal.get_untracked(), new));
+            }
+        })
+    });
+}
+
+fn fold<A, B>(
+    handle: StateHandle<A>,
+    init: B,
+    fun: impl Fn(Rc<B>, Rc<A>) -> B + 'static,
+) -> StateHandle<B> {
+    let signal = Signal::new(init);
+
+    syc::create_effect({
+        let signal = signal.clone();
+
+        move || signal.set(fun(signal.get_untracked(), handle.get()))
     });
 
     signal.into_handle()
@@ -785,13 +846,15 @@ fn patch_tags(client: Client, token: Signal<Option<String>>, root: Rc<str>, patc
                     request = request.header("authorization", &format!("Bearer {}", token));
                 }
 
-                let status = request.json(&patches).send().await?.status();
+                let response = request.json(&patches).send().await?;
 
-                if !status.is_success() {
-                    return Err(anyhow!("unexpected status code: {}", status));
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    token.set(None);
+                } else {
+                    response.error_for_status()?;
+
+                    token.trigger_subscribers();
                 }
-
-                token.trigger_subscribers();
 
                 Ok::<_, Error>(())
             }
@@ -834,6 +897,12 @@ enum Select {
     Last,
 }
 
+#[derive(Default)]
+struct ImagesState {
+    response: Rc<ImagesResponse>,
+    states: HashMap<Arc<str>, ImageState>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct State {
     #[serde(rename = "oi")]
@@ -862,6 +931,27 @@ fn main() -> Result<()> {
 
     let token = Signal::new(None);
 
+    if let Ok(Some(storage)) = window.local_storage() {
+        if let Ok(Some(stored_token)) = storage.get("token") {
+            token.set(Some(stored_token));
+        }
+    }
+
+    syc::create_effect({
+        let token = token.handle();
+        let window = window.clone();
+
+        move || {
+            if let Ok(Some(storage)) = window.local_storage() {
+                let _ = if let Some(token) = token.get().deref() {
+                    storage.set("token", token)
+                } else {
+                    storage.delete("token")
+                };
+            }
+        }
+    });
+
     let root = Rc::<str>::from(format!(
         "{}//{}",
         location.protocol().map_err(|e| anyhow!("{:?}", e))?,
@@ -884,8 +974,8 @@ fn main() -> Result<()> {
     let items_per_page = Signal::new(DEFAULT_ITEMS_PER_PAGE);
 
     if let Ok(hash) = location.hash() {
-        if hash.starts_with("#") {
-            match serde_urlencoded::from_str::<State>(&hash[1..]) {
+        if let Some(hash) = hash.strip_prefix('#') {
+            match serde_urlencoded::from_str::<State>(hash) {
                 Ok(state) => {
                     overlay_image.set(state.overlay_image);
                     filter.set(state.filter.unwrap_or_default());
@@ -960,75 +1050,77 @@ fn main() -> Result<()> {
     let unfiltered_tags = watch::<TagsResponse>(
         Signal::new("tags".into()).into_handle(),
         client.clone(),
-        token.handle(),
+        token.clone(),
         root.clone(),
         Signal::new(TagTree::default()).into_handle(),
     );
 
-    let images = watch::<ImagesResponse>(
-        syc::create_selector({
-            let start = start.clone();
-            let items_per_page = items_per_page.clone();
+    let selected_count = Signal::new(0);
 
-            move || {
-                format!(
-                    "images?{}",
-                    serde_urlencoded::to_string(ImagesQuery {
-                        start: start.get().deref().clone(),
-                        limit: Some(*items_per_page.get()),
-                        filter: None // will be added by `watch`
+    let images = fold(
+        watch::<ImagesResponse>(
+            syc::create_selector({
+                let start = start.clone();
+                let items_per_page = items_per_page.clone();
+
+                move || {
+                    format!(
+                        "images?{}",
+                        serde_urlencoded::to_string(ImagesQuery {
+                            start: start.get().deref().clone(),
+                            limit: Some(*items_per_page.get()),
+                            filter: None // will be added by `watch`
+                        })
+                        .unwrap()
+                    )
+                }
+            }),
+            client.clone(),
+            token.clone(),
+            root.clone(),
+            filter.handle(),
+        ),
+        ImagesState::default(),
+        {
+            let selected_count = selected_count.clone();
+
+            move |state, response| ImagesState {
+                states: response
+                    .images
+                    .iter()
+                    .map(|data| {
+                        (
+                            data.hash.clone(),
+                            state.states.get(&data.hash).cloned().unwrap_or_else({
+                                let selected_count = selected_count.clone();
+
+                                move || {
+                                    let selected = Signal::new(false);
+
+                                    fold_changes(
+                                        selected.handle(),
+                                        selected_count,
+                                        |count, selected| {
+                                            if *selected {
+                                                *count + 1
+                                            } else {
+                                                *count - 1
+                                            }
+                                        },
+                                    );
+
+                                    ImageState { selected }
+                                }
+                            }),
+                        )
                     })
-                    .unwrap()
-                )
+                    .collect(),
+                response,
             }
-        }),
-        client.clone(),
-        token.handle(),
-        root.clone(),
-        filter.handle(),
+        },
     );
 
-    wasm_bindgen_futures::spawn_local({
-        let client = client.clone();
-        let token = token.clone();
-        let root = root.clone();
-
-        async move {
-            token.set(Some(
-                client
-                    .post(format!("{}/token", root))
-                    .form(&TokenRequest {
-                        grant_type: GrantType::Password,
-                        username: "Jabberwocky".into(),
-                        password: "Bandersnatch".into(),
-                    })
-                    .send()
-                    .await?
-                    .json::<TokenSuccess>()
-                    .await?
-                    .access_token,
-            ));
-
-            Ok::<_, Error>(())
-        }
-        .unwrap_or_else(|e| {
-            log::error!("error retrieving data: {:?}", e);
-        })
-    });
-
     let show_menu = Signal::new(false);
-
-    let image_states = syc::create_memo({
-        let images = images.clone();
-
-        move || {
-            (0..images.get().images.len())
-                .map(|_| ImageState {
-                    selected: Signal::new(false),
-                })
-                .collect::<Vec<_>>()
-        }
-    });
 
     let overlay_image_visible = syc::create_selector({
         let overlay_image = overlay_image.clone();
@@ -1040,7 +1132,6 @@ fn main() -> Result<()> {
         root: root.clone(),
         selecting: selecting.handle(),
         images: images.clone(),
-        image_states: image_states.clone(),
         overlay_image: overlay_image.clone(),
     };
 
@@ -1058,14 +1149,14 @@ fn main() -> Result<()> {
                 Select::None => (),
 
                 Select::First => {
-                    if !images.images.is_empty() {
+                    if !images.response.images.is_empty() {
                         overlay_image.set(Some(0));
                     }
                 }
 
                 Select::Last => {
-                    if !images.images.is_empty() {
-                        overlay_image.set(Some(images.images.len() - 1));
+                    if !images.response.images.is_empty() {
+                        overlay_image.set(Some(images.response.images.len() - 1));
                     }
                 }
             }
@@ -1076,7 +1167,7 @@ fn main() -> Result<()> {
 
     let tag_menu = TagMenuProps {
         client: client.clone(),
-        token: token.handle(),
+        token: token.clone(),
         root: root.clone(),
         filter: filter.clone(),
         filter_chain: List::Nil,
@@ -1093,12 +1184,14 @@ fn main() -> Result<()> {
 
     let toggle_selecting = {
         let selecting = selecting.clone();
-        let image_states = image_states.clone();
+        let images = images.clone();
 
         move |_| {
             if *selecting.get() {
-                for state in image_states.get().deref() {
-                    state.selected.set(false);
+                for state in images.get().states.values() {
+                    if *state.selected.get() {
+                        state.selected.set(false);
+                    }
                 }
             }
 
@@ -1106,7 +1199,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let close_full_size = {
+    let close_overlay = {
         let overlay_image = overlay_image.clone();
 
         move |_| overlay_image.set(None)
@@ -1119,6 +1212,7 @@ fn main() -> Result<()> {
         let props = PaginationProps {
             images: images.clone(),
             start,
+            show_message_on_zero: false,
         };
 
         move |direction| {
@@ -1129,18 +1223,18 @@ fn main() -> Result<()> {
                     Direction::Left => {
                         if index > 0 {
                             overlay_image.set(Some(index - 1))
-                        } else if images.start > 0 {
+                        } else if images.response.start > 0 {
                             overlay_image_select.set(Select::Last);
                             page_back(&props);
                         }
                     }
 
                     Direction::Right => {
-                        if index + 1 < images.images.len() {
+                        if index + 1 < images.response.images.len() {
                             overlay_image.set(Some(index + 1))
                         } else {
-                            let count = u32::try_from(images.images.len()).unwrap();
-                            let ImagesResponse { start, total, .. } = *images;
+                            let count = u32::try_from(images.response.images.len()).unwrap();
+                            let ImagesResponse { start, total, .. } = *images.response;
 
                             if start + count < total {
                                 overlay_image_select.set(Select::First);
@@ -1175,17 +1269,16 @@ fn main() -> Result<()> {
     let selected_tags = KeyedProps {
         iterable: syc::create_selector({
             let images = images.clone();
-            let image_states = image_states.clone();
 
             move || {
                 let images = images.get();
 
-                let mut vec = image_states
-                    .get()
+                let mut vec = images
+                    .response
+                    .images
                     .iter()
-                    .enumerate()
-                    .filter(|(_, state)| *state.selected.get())
-                    .flat_map(|(index, _)| &images.images[index].tags)
+                    .filter(|data| *images.states.get(&data.hash).unwrap().selected.get())
+                    .flat_map(|data| &data.tags)
                     .cloned()
                     .collect::<HashSet<_>>()
                     .into_iter()
@@ -1202,7 +1295,6 @@ fn main() -> Result<()> {
             let token = token.clone();
             let root = root.clone();
             let images = images.clone();
-            let image_states = image_states.clone();
             let unfiltered_tags = unfiltered_tags.clone();
 
             move |tag| {
@@ -1213,7 +1305,6 @@ fn main() -> Result<()> {
                     let tag = tag.clone();
                     let unfiltered_tags = unfiltered_tags.clone();
                     let images = images.clone();
-                    let image_states = image_states.clone();
 
                     move |_| {
                         if !is_immutable_category(
@@ -1226,18 +1317,16 @@ fn main() -> Result<()> {
                                 client.clone(),
                                 token.clone(),
                                 root.clone(),
-                                image_states
-                                    .get()
+                                images
+                                    .response
+                                    .images
                                     .iter()
-                                    .enumerate()
-                                    .filter_map(|(index, state)| {
-                                        if *state.selected.get()
-                                            && images.images[index].tags.contains(&tag)
+                                    .filter_map(|data| {
+                                        if *images.states.get(&data.hash).unwrap().selected.get()
+                                            && data.tags.contains(&tag)
                                         {
                                             Some(Patch {
-                                                hash: String::from(
-                                                    images.images[index].hash.deref(),
-                                                ),
+                                                hash: String::from(data.hash.deref()),
                                                 tag: tag.clone(),
                                                 action: Action::Remove,
                                             })
@@ -1286,8 +1375,8 @@ fn main() -> Result<()> {
         let root = root.clone();
         let input_value = input_value.clone();
         let images = images.clone();
-        let image_states = image_states.clone();
         let token = token.clone();
+        let client = client.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
@@ -1309,18 +1398,21 @@ fn main() -> Result<()> {
                                     client.clone(),
                                     token.clone(),
                                     root.clone(),
-                                    image_states
-                                        .get()
+                                    images
+                                        .response
+                                        .images
                                         .iter()
-                                        .enumerate()
-                                        .filter_map(|(index, state)| {
-                                            if *state.selected.get()
-                                                && !images.images[index].tags.contains(&tag)
+                                        .filter_map(|data| {
+                                            if *images
+                                                .states
+                                                .get(&data.hash)
+                                                .unwrap()
+                                                .selected
+                                                .get()
+                                                && !data.tags.contains(&tag)
                                             {
                                                 Some(Patch {
-                                                    hash: String::from(
-                                                        images.images[index].hash.deref(),
-                                                    ),
+                                                    hash: String::from(data.hash.deref()),
                                                     tag: tag.clone(),
                                                     action: Action::Add,
                                                 })
@@ -1344,9 +1436,6 @@ fn main() -> Result<()> {
 
     let selecting2 = selecting.clone();
 
-    let selected =
-        syc::create_selector(move || image_states.get().iter().any(|state| *state.selected.get()));
-
     let playing = Signal::new(false);
 
     let toggle_playing = {
@@ -1355,9 +1444,16 @@ fn main() -> Result<()> {
         move |_| playing.set(!*playing.get())
     };
 
-    let pagination = PaginationProps {
+    let pagination1 = PaginationProps {
+        images: images.clone(),
+        start: start.clone(),
+        show_message_on_zero: true,
+    };
+
+    let pagination2 = PaginationProps {
         images: images.clone(),
         start,
+        show_message_on_zero: false,
     };
 
     syc::create_effect({
@@ -1385,23 +1481,122 @@ fn main() -> Result<()> {
         }
     };
 
-    let log_in = |_| log::info!("todo: log_in");
-    let log_out = |_| log::info!("todo: log_out");
+    let show_log_in = Signal::new(false);
+    let log_in_error = Signal::new(None);
+    let user_name = Signal::new(String::new());
+    let password = Signal::new(String::new());
+
+    let open_log_in = {
+        let show_log_in = show_log_in.clone();
+        let log_in_error = log_in_error.clone();
+        let user_name = user_name.clone();
+        let password = password.clone();
+
+        move |_| {
+            user_name.set(String::new());
+            password.set(String::new());
+            log_in_error.set(None);
+            show_log_in.set(true);
+        }
+    };
+
+    let close_log_in = {
+        let show_log_in = show_log_in.clone();
+
+        move |_| show_log_in.set(false)
+    };
+
+    let log_in_key = {
+        let user_name = user_name.clone();
+        let password = password.clone();
+        let show_log_in = show_log_in.clone();
+        let log_in_error = log_in_error.clone();
+        let token = token.clone();
+        let root = root.clone();
+
+        move |event: Event| {
+            if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
+                if event.key().deref() == "Enter" {
+                    wasm_bindgen_futures::spawn_local(
+                        {
+                            let user_name = user_name.get();
+                            let password = password.get();
+                            let show_log_in = show_log_in.clone();
+                            let log_in_error = log_in_error.clone();
+                            let token = token.clone();
+                            let client = client.clone();
+                            let root = root.clone();
+
+                            async move {
+                                let response = client
+                                    .post(format!("{}/token", root))
+                                    .form(&TokenRequest {
+                                        grant_type: GrantType::Password,
+                                        username: user_name.trim().into(),
+                                        password: password.trim().into(),
+                                    })
+                                    .send()
+                                    .await?;
+
+                                if response.status() == StatusCode::UNAUTHORIZED {
+                                    log_in_error.set(Some("Invalid user name or password".into()));
+                                } else {
+                                    show_log_in.set(false);
+
+                                    token.set(Some(
+                                        response
+                                            .error_for_status()?
+                                            .json::<TokenSuccess>()
+                                            .await?
+                                            .access_token,
+                                    ));
+                                }
+
+                                Ok::<_, Error>(())
+                            }
+                        }
+                        .unwrap_or_else({
+                            let log_in_error = log_in_error.clone();
+
+                            move |e| {
+                                log::error!("error logging in: {:?}", e);
+
+                                log_in_error.set(Some("Error communicating with server".into()));
+                            }
+                        }),
+                    );
+                }
+            }
+        }
+    };
+
+    let log_in_key2 = log_in_key.clone();
+
+    let log_out = {
+        let token = token.clone();
+
+        move |_| token.set(None)
+    };
 
     let filter = syc::create_selector(move || Option::<TagExpression>::from(filter.get().deref()));
     let filter2 = filter.clone();
+
+    let log_in_error2 = log_in_error.clone();
+    let token2 = token.clone();
+
+    let selected = syc::create_selector(move || *selected_count.get() > 0);
 
     sycamore::render(move || {
         template! {
             div(class="overlay",
                 style=format!("height:{};", if *overlay_image_visible.get() { "100%" } else { "0" }))
             {
-                i(class="fa fa-times big close cursor", on:click=close_full_size)
+                i(class="fa fa-times big close", on:click=close_overlay)
 
                 (if let Some(index) = *overlay_image.get() {
                     let images = images.get();
 
-                    if let Some(image) = images.images.get(index) {
+                    if let Some(image) = images.response.images.get(index) {
                         let url = format!("{}/image/{}?size=large", root, image.hash);
 
                         let medium = image.medium;
@@ -1434,11 +1629,11 @@ fn main() -> Result<()> {
                             Medium::Image | Medium::Video => template! {}
                         };
 
-                        let count = u32::try_from(images.images.len()).unwrap();
-                        let ImagesResponse { start, total, .. } = *images;
+                        let count = u32::try_from(images.response.images.len()).unwrap();
+                        let ImagesResponse { start, total, .. } = *images.response;
 
                         let have_left = index > 0 || start > 0;
-                        let have_right = index + 1 < images.images.len() || start + count < total;
+                        let have_right = index + 1 < images.response.images.len() || start + count < total;
 
                         let left = if have_left {
                             let next = next.clone();
@@ -1501,24 +1696,72 @@ fn main() -> Result<()> {
                 })
             }
 
+            div(class="log-in",
+                style=format!("height:{};", if *show_log_in.get() { "100%" } else { "0" }))
+            {
+                div(class="error",
+                    style=if log_in_error.get().is_some() {
+                        "visibility:visible;"
+                    } else {
+                        "visibility:hidden;"
+                    })
+                {
+                    (log_in_error2.get().deref().clone().unwrap_or_else(|| "placeholder".to_owned()))
+                }
+
+                i(class="fa fa-times big close", on:click=close_log_in) {}
+
+                form(class="log-in") {
+                    p {
+                        label(for="user_name") { "user name: " }
+
+                        input(bind:value=user_name.clone(),
+                              on:keyup=log_in_key,
+                              id="user_name") {}
+                    }
+
+                    p {
+                        label(for="password") { "password: " }
+
+                        input(type="password",
+                              on:keyup=log_in_key2,
+                              bind:value=password.clone(),
+                              id="password") {}
+                    }
+                }
+            }
+
             div {
                 div(class="nav") {
                     i(class="fa fa-bars big filter", on:click=toggle_menu)
 
-                    Pagination(pagination.clone())
+                    Pagination(pagination1)
 
-                    i(class=format!("fa fa-th-large big select{}", if *selecting.get() { " enabled" } else { "" }),
-                      on:click=toggle_selecting)
+                    (if token.get().is_some() {
+                        let selecting = selecting.clone();
+                        let toggle_selecting = toggle_selecting.clone();
+
+                        template! {
+                            i(class=format!("fa fa-th-large big select{}", if *selecting.get() {
+                                " enabled"
+                            } else {
+                                ""
+                            }),
+                              on:click=toggle_selecting)
+                        }
+                    } else {
+                        template! {}
+                    })
                 }
 
                 div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
-                    (if token.get().is_some() {
+                    (if token2.get().is_some() {
                         template! {
-                            div(class="link", on:click=log_out) { "log out" }
+                            div(class="link", on:click=log_out.clone()) { "log out" }
                         }
                     } else {
                         template! {
-                            div(class="link", on:click=log_in) { "log in" }
+                            div(class="link", on:click=open_log_in.clone()) { "log in" }
                         }
                     })
 
@@ -1556,8 +1799,7 @@ fn main() -> Result<()> {
 
                             div {
                                 "add tag: " input(on:keyup=inputkey.clone(),
-                                                  bind:value=input_value.clone(),
-                                                  class="edit")
+                                                  bind:value=input_value.clone())
                             }
                         }
                     } else {
@@ -1578,7 +1820,7 @@ fn main() -> Result<()> {
             Images(images_props)
 
             div(class="nav") {
-                Pagination(pagination)
+                Pagination(pagination2)
             }
         }
     });

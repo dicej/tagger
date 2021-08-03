@@ -8,14 +8,25 @@ body {
 a {
     color: white;
     text-decoration: none;
+    padding: 2px;
+    border: 1px solid white;
 }
 
 .link {
     color: white;
+    padding: 2px;
+    cursor: pointer;
 }
 
 i {
     color: white;
+    cursor: pointer;
+}
+
+i.include,
+i.exclude {
+    margin-left: 10px;
+    margin-right: 10px;
 }
 
 i.included {
@@ -120,6 +131,7 @@ ul ul {
     display: inline-block;
     margin: 0;
     border: 3px solid black;
+    cursor: pointer;
 }
 
 .selected {
@@ -127,25 +139,51 @@ ul ul {
 }
 
 span.tag {
-    padding: 0.2em;
-    margin: 0.2em;
-    border: 1px solid white;
+    font-size: 18px;
+    padding: 2px;
+    margin: 2px;
+    border: 1px solid #ccf;
 }
 
 span.tags {
     position: absolute;
     top: 10px;
-    left: 16px;
+    left: 10px;
 }
 
 a.original {
+    font-size: 18px;
     position: absolute;
     bottom: 10px;
-    right: 16px;
+    right: 10px;
 }
 
-div.overlay {
+.error {
+    color:  #f54
+}
+
+form.log-in {
+    flex-basis: 100%;
+    display: table;
+}
+
+form.log-in p {
+    display: table-row;
+}
+
+form.log-in p label {
+    display: table-cell;
+    padding-left: 40px;
+}
+
+form.log-in p input {
+    display: table-cell;
+}
+
+div.overlay,
+div.log-in {
     display: flex;
+    flex-wrap: wrap;
     justify-content: center;
     align-items: center;
     width: 100%;
