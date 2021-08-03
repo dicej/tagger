@@ -242,11 +242,11 @@ fn pagination(props: PaginationProps) -> Template<G> {
                     let props4 = props.clone();
 
                     template! {
-                        i(class="fa fa-angle-double-left big",
+                        i(class="fa fa-angle-double-left big start",
                           on:click=move |_| page_start(&props1),
                           style=left_style) " "
 
-                        i(class="fa fa-angle-left big",
+                        i(class="fa fa-angle-left big back",
                           on:click=move |_| page_back(&props2),
                           style=left_style)
 
@@ -255,11 +255,11 @@ fn pagination(props: PaginationProps) -> Template<G> {
                                  start + count,
                                  total))
 
-                        i(class="fa fa-angle-right big",
+                        i(class="fa fa-angle-right big forward",
                           on:click=move |_| page_forward(&props3),
                           style=right_style) " "
 
-                        i(class="fa fa-angle-double-right big",
+                        i(class="fa fa-angle-double-right big end",
                           on:click=move |_| page_end(&props4),
                           style=right_style)
                     }
@@ -608,15 +608,21 @@ fn images(props: ImagesProps) -> Template<G> {
     let images = IndexedProps {
         iterable: syc::create_selector({
             let images = images.clone();
+            let image_states = image_states.clone();
 
             move || {
-                images
-                    .get()
-                    .images
-                    .iter()
-                    .map(|data| data.hash.clone())
-                    .enumerate()
-                    .collect()
+                let images = images.get();
+
+                if image_states.get().len() == images.images.len() {
+                    images
+                        .images
+                        .iter()
+                        .map(|data| data.hash.clone())
+                        .enumerate()
+                        .collect()
+                } else {
+                    Vec::new()
+                }
             }
         }),
 
@@ -881,8 +887,6 @@ fn main() -> Result<()> {
         if hash.starts_with("#") {
             match serde_urlencoded::from_str::<State>(&hash[1..]) {
                 Ok(state) => {
-                    log::info!("state for {} is {:#?}", hash, state);
-
                     overlay_image.set(state.overlay_image);
                     filter.set(state.filter.unwrap_or_default());
 
@@ -1283,6 +1287,7 @@ fn main() -> Result<()> {
         let input_value = input_value.clone();
         let images = images.clone();
         let image_states = image_states.clone();
+        let token = token.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
@@ -1379,6 +1384,9 @@ fn main() -> Result<()> {
             }
         }
     };
+
+    let log_in = |_| log::info!("todo: log_in");
+    let log_out = |_| log::info!("todo: log_out");
 
     let filter = syc::create_selector(move || Option::<TagExpression>::from(filter.get().deref()));
     let filter2 = filter.clone();
@@ -1504,6 +1512,16 @@ fn main() -> Result<()> {
                 }
 
                 div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
+                    (if token.get().is_some() {
+                        template! {
+                            div(class="link", on:click=log_out) { "log out" }
+                        }
+                    } else {
+                        template! {
+                            div(class="link", on:click=log_in) { "log in" }
+                        }
+                    })
+
                     label(for="items_per_page") { "items per page: " }
 
                     select(name="items_per_page",
@@ -1552,8 +1570,8 @@ fn main() -> Result<()> {
                 }
 
                 div(style=format!("display:{};", if filter.get().is_some() { "block" } else { "none" })) {
-                    (filter2.get().deref().as_ref().map(|expression|
-                                                        expression.to_string()).unwrap_or_else(String::new))
+                    "filter: " (filter2.get().deref().as_ref().map
+                                (|expression| expression.to_string()).unwrap_or_else(String::new))
                 }
             }
 

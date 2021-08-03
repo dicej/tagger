@@ -1,5 +1,6 @@
 login/logout
   disallow selection when logged out
+https://busa.crabdance.com
 clean up
   modularize FE and BE
   componentize FE and minimize main
