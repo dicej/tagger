@@ -788,11 +788,7 @@ async fn get_variant(
     size: Size,
     variant: Variant,
     hash: &str,
-) -> Result<(
-    Box<dyn AsyncRead + Unpin + Send + 'static>,
-    &'static str,
-    u64,
-)> {
+) -> Result<(File, &'static str, u64)> {
     match variant {
         Variant::Still => {
             let (thumbnail, length, _) =
@@ -978,7 +974,7 @@ async fn video_preview(
     cache_dir: &str,
     size: Size,
     hash: &str,
-) -> Result<(Box<dyn AsyncRead + Unpin + Send + 'static>, u64)> {
+) -> Result<(File, u64)> {
     let filename = format!("{}/video/{}/{}.mp4", cache_dir, size, hash);
 
     let result = File::open(&filename).await;
@@ -986,7 +982,7 @@ async fn video_preview(
     if let Ok(file) = result {
         let length = file.metadata().await?.len();
 
-        Ok((Box::new(file), length))
+        Ok((file, length))
     } else {
         if let Some(parent) = Path::new(&filename).parent() {
             let _ = fs::create_dir(parent).await;
@@ -1058,7 +1054,7 @@ async fn video_preview(
                         let file = File::open(&full_path).await?;
                         let length = file.metadata().await?.len();
 
-                        return Ok((Box::new(file), length));
+                        return Ok((file, length));
                     }
                 } else if let Some(id) = video_data.pick_video_stream {
                     let tmp = copy_from_offset(&full_path, offset).await?;
@@ -1081,7 +1077,7 @@ async fn video_preview(
 
                     file.seek(SeekFrom::Start(offset)).await?;
 
-                    return Ok((Box::new(file), length));
+                    return Ok((file, length));
                 }
             }
         }?;
@@ -1090,7 +1086,7 @@ async fn video_preview(
             let file = File::open(&filename).await?;
             let length = file.metadata().await?.len();
 
-            Ok((Box::new(file), length))
+            Ok((file, length))
         } else {
             let _ = fs::remove_file(&filename).await;
 
@@ -1108,7 +1104,7 @@ async fn thumbnail(
     cache_dir: &str,
     size: Size,
     hash: &str,
-) -> Result<(Box<dyn AsyncRead + Unpin + Send + 'static>, u64, PathBuf)> {
+) -> Result<(File, u64, PathBuf)> {
     let filename = format!("{}/{}/{}.jpg", cache_dir, size, hash);
 
     let result = File::open(&filename).await;
@@ -1116,7 +1112,7 @@ async fn thumbnail(
     Ok(if let Ok(file) = result {
         let length = file.metadata().await?.len();
 
-        (Box::new(file), length, filename.into())
+        (file, length, filename.into())
     } else {
         let (image, format) = still_image(image_dir, path).await?;
 
@@ -1167,16 +1163,54 @@ async fn thumbnail(
         let file = File::open(&filename).await?;
         let length = file.metadata().await?.len();
 
-        (Box::new(file), length, filename.into())
+        (file, length, filename.into())
     })
 }
 
-fn as_stream(
-    input: Box<dyn AsyncRead + Unpin + Send + 'static>,
-) -> impl Stream<Item = Result<Bytes>> + Send {
+fn as_stream(input: impl AsyncRead + Send) -> impl Stream<Item = Result<Bytes>> + Send {
     FramedRead::new(input, BytesCodec::new())
         .map_ok(BytesMut::freeze)
         .map_err(Error::from)
+}
+
+struct Range {
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+struct Ranges(Vec<Range>);
+
+impl FromStr for Ranges {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parse = |s: Option<&str>| {
+            let s = s.ok_or_else(|| anyhow!("missing separator"))?;
+            Ok::<_, Error>(if s.is_empty() {
+                None
+            } else {
+                Some(u64::from_str(s)?)
+            })
+        };
+
+        let prefix = "bytes=";
+        if let Some(body) = s.strip_prefix(prefix) {
+            Ok(Ranges(
+                body.split(',')
+                    .map(|s| {
+                        let mut split = s.trim().split('-');
+
+                        let start = parse(split.next())?;
+                        let end = parse(split.next())?;
+
+                        Ok(Range { start, end })
+                    })
+                    .collect::<Result<_>>()?,
+            ))
+        } else {
+            Err(anyhow!("expected prefix \"{}\"", prefix))
+        }
+    }
 }
 
 async fn image(
@@ -1186,10 +1220,11 @@ async fn image(
     cache_dir: &str,
     hash: &str,
     query: &ImageQuery,
+    ranges: Option<&Ranges>,
 ) -> Result<Response<Body>> {
     let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
 
-    let (image, content_type, length) = if let Some(size) = query.size {
+    let (mut image, content_type, length) = if let Some(size) = query.size {
         // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
         // concurrently.  However, it's way too conservative since it prevents more than one task from accessing
         // any cache files concurrently -- even unrelated ones.  We should use separate locks per hash.
@@ -1211,7 +1246,7 @@ async fn image(
         let length = file.metadata().await?.len();
 
         (
-            Box::new(file) as Box<dyn AsyncRead + Unpin + Send + 'static>,
+            file,
             if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
                 "video/mp4"
             } else {
@@ -1221,10 +1256,51 @@ async fn image(
         )
     };
 
-    Ok(response()
-        .header(header::CONTENT_LENGTH, length)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::wrap_stream(as_stream(image)))?)
+    Ok(if let Some(ranges) = ranges {
+        if ranges.0.len() == 1 {
+            let range = &ranges.0[0];
+
+            let (start, end) = match (range.start, range.end) {
+                (Some(start), Some(end)) => (start, end + 1),
+                (Some(start), None) => (start, length),
+                (None, Some(end)) => (length - end, length),
+                _ => (0, length),
+            };
+
+            if start > length || end > length || start > end || i64::try_from(start).is_err() {
+                return Err(HttpError::from_slice(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "range not satisfiable",
+                )
+                .into());
+            }
+
+            image
+                .seek(SeekFrom::Current(start.try_into().unwrap()))
+                .await?;
+
+            response()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end - 1, length),
+                )
+                .header(header::CONTENT_LENGTH, end - start)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::wrap_stream(as_stream(image.take(end - start))))?
+        } else {
+            return Err(HttpError::from_slice(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "multiple ranges not yet supported",
+            )
+            .into());
+        }
+    } else {
+        response()
+            .header(header::CONTENT_LENGTH, length)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::wrap_stream(as_stream(image)))?
+    })
 }
 
 fn entry<'a>(
@@ -1403,10 +1479,8 @@ impl FromStr for Bearer {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let prefix = "Bearer ";
-        if s.starts_with(prefix) {
-            Ok(Self {
-                body: s.chars().skip(prefix.len()).collect(),
-            })
+        if let Some(body) = s.strip_prefix(prefix) {
+            Ok(Self { body: body.into() })
         } else {
             Err(anyhow!("expected prefix \"{}\"", prefix))
         }
@@ -1526,6 +1600,7 @@ fn routes(
                             })
                         }
                     })
+                    .with(warp::compression::gzip())
                     .or(warp::path("tags")
                         .and(auth)
                         .and(warp::query::<TagsQuery>())
@@ -1553,15 +1628,20 @@ fn routes(
                                     Rejection::from(HttpError::from(e))
                                 })
                             }
-                        }))
+                        })
+                        .with(warp::compression::gzip()))
                     .or(warp::path!("image" / String)
                         .and(auth)
                         .and(warp::query::<ImageQuery>())
+                        .and(warp::header::optional::<Ranges>("range"))
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
 
-                            move |hash: String, auth: Option<Arc<_>>, query| {
+                            move |hash: String,
+                                  auth: Option<Arc<_>>,
+                                  query,
+                                  ranges: Option<Ranges>| {
                                 let hash = Arc::<str>::from(hash);
 
                                 {
@@ -1578,6 +1658,7 @@ fn routes(
                                             &options.cache_directory,
                                             &hash,
                                             &query,
+                                            ranges.as_ref(),
                                         )
                                         .await
                                     }
@@ -1589,7 +1670,8 @@ fn routes(
                                 })
                             }
                         }))
-                    .or(warp::fs::dir(options.public_directory.clone())),
+                    .or(warp::fs::dir(options.public_directory.clone())
+                        .with(warp::compression::gzip())),
             )
             .or(warp::patch().and(
                 warp::path("tags")
@@ -1627,6 +1709,7 @@ fn routes(
             )))
         .recover(warp_util::handle_rejection)
         .with(warp::log("tagger"))
+        .map(|reply| warp::reply::with_header(reply, "Accept-Ranges", "bytes"))
 }
 
 fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
