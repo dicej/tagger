@@ -60,7 +60,7 @@ impl serde::Serialize for Tag {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum TagExpression {
     Or(Box<TagExpression>, Box<TagExpression>),
     And(Box<TagExpression>, Box<TagExpression>),
@@ -80,6 +80,15 @@ impl TagExpression {
             }
             TagExpression::Not(a) => a.fold_tags(value, fold),
             TagExpression::Tag(tag) => fold(value, tag.category.as_deref(), &tag.value),
+        }
+    }
+
+    pub fn evaluate(&self, tag: &Tag) -> bool {
+        match self {
+            TagExpression::Or(a, b) => a.evaluate(tag) || b.evaluate(tag),
+            TagExpression::And(a, b) => a.evaluate(tag) && b.evaluate(tag),
+            TagExpression::Not(a) => !a.evaluate(tag),
+            TagExpression::Tag(a) => a == tag,
         }
     }
 }

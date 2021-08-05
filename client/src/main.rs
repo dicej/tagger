@@ -286,6 +286,7 @@ struct TagSubMenuProps {
     filter: Signal<TagTree>,
     filter_chain: List<Tag>,
     unfiltered_tags: StateHandle<TagsResponse>,
+    on_unauthorized: Rc<dyn Fn()>,
 }
 
 #[component(TagSubMenu<G>)]
@@ -298,15 +299,18 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
         filter,
         filter_chain,
         unfiltered_tags,
+        on_unauthorized,
     } = props;
 
     let tag_menu = {
         let tag = tag.clone();
         let filter_chain = filter_chain.clone();
         let filter = filter.clone();
+        let on_unauthorized = on_unauthorized.clone();
 
         move || {
             let filter_chain = List::Cons(Rc::new((tag.clone(), filter_chain.clone())));
+            let on_unauthorized = on_unauthorized.clone();
 
             TagMenuProps {
                 client: client.clone(),
@@ -315,14 +319,19 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
                 filter: filter.clone(),
                 filter_chain: filter_chain.clone(),
                 unfiltered_tags: unfiltered_tags.clone(),
-                filtered_tags: watch::<TagsResponse>(
+                filtered_tags: watch::<TagsResponse, _>(
                     Signal::new("tags".into()).into_handle(),
                     client.clone(),
                     token.clone(),
                     root.clone(),
                     Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
+                    {
+                        let on_unauthorized = on_unauthorized.clone();
+                        move || on_unauthorized()
+                    },
                 ),
                 category: None,
+                on_unauthorized: on_unauthorized.clone(),
             }
         }
     };
@@ -363,6 +372,7 @@ struct TagMenuProps {
     unfiltered_tags: StateHandle<TagsResponse>,
     filtered_tags: StateHandle<TagsResponse>,
     category: Option<Arc<str>>,
+    on_unauthorized: Rc<dyn Fn()>,
 }
 
 #[component(TagMenu<G>)]
@@ -376,6 +386,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
         unfiltered_tags,
         filtered_tags,
         category,
+        on_unauthorized,
     } = props;
 
     let categories = if category.is_none() {
@@ -409,6 +420,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                 let token = token.clone();
                 let root = root.clone();
                 let filter = filter.clone();
+                let on_unauthorized = on_unauthorized.clone();
 
                 move |category| {
                     let tag_menu = TagMenuProps {
@@ -420,6 +432,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                         unfiltered_tags: unfiltered_tags.clone(),
                         filtered_tags: filtered_tags.clone(),
                         category: Some(category.clone()),
+                        on_unauthorized: on_unauthorized.clone(),
                     };
 
                     template! {
@@ -487,6 +500,7 @@ fn tag_menu(props: TagMenuProps) -> Template<G> {
                 filter: filter.clone(),
                 filter_chain: filter_chain.clone(),
                 unfiltered_tags: unfiltered_tags.clone(),
+                on_unauthorized: on_unauthorized.clone(),
             };
 
             let filter_state = syc::create_selector({
@@ -630,7 +644,7 @@ fn images(props: ImagesProps) -> Template<G> {
         }),
 
         template: move |(index, hash)| {
-            let url = format!("{}/image/{}?size=small", root, hash);
+            let url = format!("{}/image/small-image/{}", root, hash);
 
             let images = images.get();
 
@@ -700,7 +714,7 @@ fn images(props: ImagesProps) -> Template<G> {
 
                 match data.medium {
                     Medium::ImageWithVideo | Medium::Video => {
-                        let video_url = format!("{}&variant=video", url);
+                        let video_url = format!("{}/image/small-video/{}", root, hash);
 
                         template! {
                             video(src=video_url,
@@ -734,12 +748,13 @@ fn images(props: ImagesProps) -> Template<G> {
     }
 }
 
-fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
+fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'static>(
     uri: StateHandle<String>,
     client: Client,
     token: Signal<Option<String>>,
     root: Rc<str>,
     filter: StateHandle<TagTree>,
+    on_unauthorized: F,
 ) -> StateHandle<T> {
     let signal = Signal::new(T::default());
 
@@ -754,6 +769,7 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
             let uri = uri.get();
             let root = root.clone();
             let signal = signal.clone();
+            let on_unauthorized = on_unauthorized.clone();
 
             wasm_bindgen_futures::spawn_local(
                 {
@@ -783,6 +799,7 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
 
                         if response.status() == StatusCode::UNAUTHORIZED {
                             token_signal.set(None);
+                            on_unauthorized();
                         } else {
                             signal.set(response.error_for_status()?.json::<T>().await?);
                         }
@@ -800,11 +817,7 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
     signal.into_handle()
 }
 
-fn fold_changes<A: Eq + std::fmt::Display, B>(
-    handle: StateHandle<A>,
-    signal: Signal<B>,
-    fun: impl Fn(Rc<B>, Rc<A>) -> B + 'static,
-) {
+fn watch_changes<A: Eq>(handle: StateHandle<A>, fun: impl Fn(&Rc<A>, &Rc<A>) + 'static) {
     let mut old = handle.get();
 
     wasm_bindgen_futures::spawn_local(async move {
@@ -812,11 +825,21 @@ fn fold_changes<A: Eq + std::fmt::Display, B>(
             let new = handle.get();
 
             if new != old {
-                old = new.clone();
+                fun(&old, &new);
 
-                signal.set(fun(signal.get_untracked(), new));
+                old = new;
             }
         })
+    });
+}
+
+fn fold_changes<A: Eq, B>(
+    handle: StateHandle<A>,
+    signal: Signal<B>,
+    fun: impl Fn(Rc<B>, Rc<A>) -> B + 'static,
+) {
+    watch_changes(handle, move |_, new| {
+        signal.set(fun(signal.get_untracked(), new.clone()))
     });
 }
 
@@ -836,7 +859,13 @@ fn fold<A, B>(
     signal.into_handle()
 }
 
-fn patch_tags(client: Client, token: Signal<Option<String>>, root: Rc<str>, patches: Vec<Patch>) {
+fn patch_tags(
+    client: Client,
+    token: Signal<Option<String>>,
+    root: Rc<str>,
+    patches: Vec<Patch>,
+    on_unauthorized: impl Fn() + Clone + 'static,
+) {
     wasm_bindgen_futures::spawn_local(
         {
             async move {
@@ -850,6 +879,7 @@ fn patch_tags(client: Client, token: Signal<Option<String>>, root: Rc<str>, patc
 
                 if response.status() == StatusCode::UNAUTHORIZED {
                     token.set(None);
+                    on_unauthorized();
                 } else {
                     response.error_for_status()?;
 
@@ -1047,18 +1077,38 @@ fn main() -> Result<()> {
         }
     });
 
-    let unfiltered_tags = watch::<TagsResponse>(
+    let show_log_in = Signal::new(false);
+    let log_in_error = Signal::new(None);
+    let user_name = Signal::new(String::new());
+    let password = Signal::new(String::new());
+
+    let open_log_in = {
+        let show_log_in = show_log_in.clone();
+        let log_in_error = log_in_error.clone();
+        let user_name = user_name.clone();
+        let password = password.clone();
+
+        move || {
+            user_name.set(String::new());
+            password.set(String::new());
+            log_in_error.set(None);
+            show_log_in.set(true);
+        }
+    };
+
+    let unfiltered_tags = watch::<TagsResponse, _>(
         Signal::new("tags".into()).into_handle(),
         client.clone(),
         token.clone(),
         root.clone(),
         Signal::new(TagTree::default()).into_handle(),
+        open_log_in.clone(),
     );
 
     let selected_count = Signal::new(0);
 
     let images = fold(
-        watch::<ImagesResponse>(
+        watch::<ImagesResponse, _>(
             syc::create_selector({
                 let start = start.clone();
                 let items_per_page = items_per_page.clone();
@@ -1079,6 +1129,7 @@ fn main() -> Result<()> {
             token.clone(),
             root.clone(),
             filter.handle(),
+            open_log_in.clone(),
         ),
         ImagesState::default(),
         {
@@ -1174,6 +1225,7 @@ fn main() -> Result<()> {
         unfiltered_tags: unfiltered_tags.clone(),
         filtered_tags: unfiltered_tags.clone(),
         category: None,
+        on_unauthorized: Rc::new(open_log_in.clone()),
     };
 
     let toggle_menu = {
@@ -1296,6 +1348,7 @@ fn main() -> Result<()> {
             let root = root.clone();
             let images = images.clone();
             let unfiltered_tags = unfiltered_tags.clone();
+            let open_log_in = open_log_in.clone();
 
             move |tag| {
                 let remove = {
@@ -1305,6 +1358,7 @@ fn main() -> Result<()> {
                     let tag = tag.clone();
                     let unfiltered_tags = unfiltered_tags.clone();
                     let images = images.clone();
+                    let open_log_in = open_log_in.clone();
 
                     move |_| {
                         if !is_immutable_category(
@@ -1335,6 +1389,7 @@ fn main() -> Result<()> {
                                         }
                                     })
                                     .collect(),
+                                open_log_in.clone(),
                             )
                         }
                     }
@@ -1377,6 +1432,7 @@ fn main() -> Result<()> {
         let images = images.clone();
         let token = token.clone();
         let client = client.clone();
+        let open_log_in = open_log_in.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
@@ -1421,6 +1477,7 @@ fn main() -> Result<()> {
                                             }
                                         })
                                         .collect(),
+                                    open_log_in.clone(),
                                 )
                             }
                         }
@@ -1478,25 +1535,6 @@ fn main() -> Result<()> {
             {
                 items_per_page.set(items)
             }
-        }
-    };
-
-    let show_log_in = Signal::new(false);
-    let log_in_error = Signal::new(None);
-    let user_name = Signal::new(String::new());
-    let password = Signal::new(String::new());
-
-    let open_log_in = {
-        let show_log_in = show_log_in.clone();
-        let log_in_error = log_in_error.clone();
-        let user_name = user_name.clone();
-        let password = password.clone();
-
-        move |_| {
-            user_name.set(String::new());
-            password.set(String::new());
-            log_in_error.set(None);
-            show_log_in.set(true);
         }
     };
 
@@ -1586,6 +1624,8 @@ fn main() -> Result<()> {
 
     let selected = syc::create_selector(move || *selected_count.get() > 0);
 
+    let open_log_in_event = move |_| open_log_in();
+
     sycamore::render(move || {
         template! {
             div(class="overlay",
@@ -1597,7 +1637,7 @@ fn main() -> Result<()> {
                     let images = images.get();
 
                     if let Some(image) = images.response.images.get(index) {
-                        let url = format!("{}/image/{}?size=large", root, image.hash);
+                        let url = format!("{}/image/large-image/{}", root, image.hash);
 
                         let medium = image.medium;
 
@@ -1657,7 +1697,7 @@ fn main() -> Result<()> {
                             template! {}
                         };
 
-                        let original_url = format!("{}/image/{}", root, image.hash);
+                        let original_url = format!("{}/image/original/{}", root, image.hash);
 
                         let show_video = match medium {
                             Medium::ImageWithVideo => playing,
@@ -1666,7 +1706,8 @@ fn main() -> Result<()> {
                         };
 
                         let image = if show_video {
-                            let video_url = format!("{}&variant=video", url);
+                            let video_url = format!("{}/image/large-video/{}", root, image.hash);
+
                             template! {
                                 video(src=video_url,
                                       poster=url,
@@ -1761,7 +1802,7 @@ fn main() -> Result<()> {
                         }
                     } else {
                         template! {
-                            div(class="link", on:click=open_log_in.clone()) { "log in" }
+                            div(class="link", on:click=open_log_in_event.clone()) { "log in" }
                         }
                     })
 

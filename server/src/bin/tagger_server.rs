@@ -1,15 +1,74 @@
 #![deny(warnings)]
 
 use {
-    anyhow::Result,
+    anyhow::{anyhow, Result},
+    futures::{
+        channel::mpsc::{self, Sender},
+        future, FutureExt, SinkExt, StreamExt, TryFutureExt,
+    },
+    rand::Rng,
+    sqlx::SqliteConnection,
     std::{process, sync::Arc, time::Duration},
     structopt::StructOpt,
     tagger_server::Options,
-    tokio::{sync::Mutex as AsyncMutex, task, time},
+    tokio::{fs::File, io::AsyncReadExt, sync::Mutex as AsyncMutex, task, time},
     tracing::error,
 };
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+async fn content(file_name: &str) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+
+    File::open(file_name)
+        .await?
+        .read_to_end(&mut buffer)
+        .await?;
+
+    Ok(buffer)
+}
+
+async fn sync_loop(
+    options: Arc<Options>,
+    conn: Arc<AsyncMutex<SqliteConnection>>,
+    mut restart_tx: Sender<()>,
+) -> Result<()> {
+    let mut cert_and_key =
+        if let (Some(cert_file), Some(key_file)) = (&options.cert_file, &options.key_file) {
+            Some((
+                cert_file,
+                content(cert_file).await?,
+                key_file,
+                content(key_file).await?,
+            ))
+        } else {
+            None
+        };
+
+    loop {
+        tagger_server::sync(
+            &conn,
+            &options.image_directory,
+            &options.cache_directory,
+            options.preload_cache,
+        )
+        .await?;
+
+        time::sleep(SYNC_INTERVAL).await;
+
+        if let Some((cert_file, old_cert, key_file, old_key)) = &mut cert_and_key {
+            let new_cert = content(cert_file).await?;
+            let new_key = content(key_file).await?;
+
+            if *old_cert != new_cert || *old_key != new_key {
+                *old_cert = new_cert;
+                *old_key = new_key;
+
+                restart_tx.send(()).await?;
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -21,28 +80,27 @@ async fn main() -> Result<()> {
         tagger_server::open(&options.state_file).await?,
     ));
 
-    task::spawn({
-        let options = options.clone();
-        let conn = conn.clone();
+    let (restart_tx, mut restart_rx) = mpsc::channel(2);
 
-        async move {
-            loop {
-                if let Err(e) = tagger_server::sync(
-                    &conn,
-                    &options.image_directory,
-                    &options.cache_directory,
-                    options.preload_cache,
-                )
-                .await
-                {
-                    error!("sync error: {:?}", e);
-                    process::exit(-1)
-                }
+    task::spawn(
+        sync_loop(options.clone(), conn.clone(), restart_tx).map_err(|e| {
+            error!("sync error: {:?}", e);
+            process::exit(-1)
+        }),
+    );
 
-                time::sleep(SYNC_INTERVAL).await;
-            }
-        }
-    });
+    let mut auth_key = [0u8; 32];
+    rand::thread_rng().fill(&mut auth_key);
 
-    tagger_server::serve(&conn, &options).await
+    loop {
+        future::select(
+            tagger_server::serve(&conn, &options, auth_key).boxed(),
+            restart_rx
+                .next()
+                .map(|o| o.ok_or_else(|| anyhow!("unexpected end of stream"))),
+        )
+        .await
+        .factor_first()
+        .0?;
+    }
 }

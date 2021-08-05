@@ -18,11 +18,8 @@ use {
     jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation},
     lazy_static::lazy_static,
     mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType},
-    rand::Rng,
     regex::Regex,
     rexiv2::{Metadata as ExifMetadata, Orientation},
-    serde_derive::Deserialize,
-    serde_json::json,
     sha2::{Digest, Sha256},
     sqlx::{
         query::Query,
@@ -47,9 +44,9 @@ use {
     structopt::StructOpt,
     tagger_shared::{
         tag_expression::{Tag, TagExpression},
-        Action, ImageData, ImageKey, ImageQuery, ImagesQuery, ImagesResponse, Medium, Patch, Size,
-        TagsQuery, TagsResponse, TokenError, TokenErrorType, TokenRequest, TokenSuccess, TokenType,
-        Variant,
+        Action, Authorization, ImageData, ImageKey, ImagesQuery, ImagesResponse, Medium, Patch,
+        Size, TagsQuery, TagsResponse, TokenError, TokenErrorType, TokenRequest, TokenSuccess,
+        TokenType, Variant,
     },
     tempfile::NamedTempFile,
     tokio::{
@@ -600,14 +597,24 @@ async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<Imag
 }
 
 async fn apply(
-    auth: Option<&Authorization>,
+    auth: &Authorization,
     conn: &mut SqliteConnection,
     patches: &[Patch],
 ) -> Result<Response<Body>> {
-    if auth.is_none() {
+    if !auth.may_patch {
         return Ok(response()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::empty())?);
+    }
+
+    if let Some(filter) = &auth.filter {
+        for patch in patches {
+            if !(filter.evaluate(&patch.tag) && visible(conn, filter, &patch.hash).await?) {
+                return Ok(response()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(Body::empty())?);
+            }
+        }
     }
 
     for patch in patches {
@@ -626,7 +633,9 @@ async fn apply(
                 }
             }
         }
+    }
 
+    for patch in patches {
         let value = patch.tag.value.deref();
 
         match patch.action {
@@ -771,10 +780,10 @@ pub async fn preload_cache(
     hash: &str,
 ) -> Result<()> {
     for size in &[Size::Small, Size::Large] {
-        get_variant(image_dir, file_data, cache_dir, *size, Variant::Still, hash).await?;
+        get_variant(image_dir, file_data, cache_dir, Variant::Still(*size), hash).await?;
 
         if file_data.video_offset.is_some() {
-            get_variant(image_dir, file_data, cache_dir, *size, Variant::Video, hash).await?;
+            get_variant(image_dir, file_data, cache_dir, Variant::Video(*size), hash).await?;
         }
     }
 
@@ -785,19 +794,18 @@ async fn get_variant(
     image_dir: &str,
     file_data: &FileData,
     cache_dir: &str,
-    size: Size,
     variant: Variant,
     hash: &str,
 ) -> Result<(File, &'static str, u64)> {
     match variant {
-        Variant::Still => {
+        Variant::Still(size) => {
             let (thumbnail, length, _) =
                 thumbnail(image_dir, &file_data.path, cache_dir, size, hash).await?;
 
             Ok((thumbnail, "image/jpeg", length))
         }
 
-        Variant::Video => {
+        Variant::Video(size) => {
             if let Some(offset) = file_data.video_offset {
                 let (preview, length) =
                     video_preview(image_dir, &file_data.path, offset, cache_dir, size, hash)
@@ -807,6 +815,23 @@ async fn get_variant(
             } else {
                 Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
             }
+        }
+
+        Variant::Original => {
+            let lowercase = file_data.path.to_lowercase();
+
+            let file = File::open([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?;
+            let length = file.metadata().await?.len();
+
+            Ok((
+                file,
+                if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
+                    "video/mp4"
+                } else {
+                    "image/jpeg"
+                },
+                length,
+            ))
         }
     }
 }
@@ -1213,48 +1238,62 @@ impl FromStr for Ranges {
     }
 }
 
+async fn visible(conn: &mut SqliteConnection, filter: &TagExpression, hash: &str) -> Result<bool> {
+    Ok(bind_filter_clause(
+        filter,
+        sqlx::query(&format!(
+            "SELECT 1 as x FROM tags WHERE hash = ?1 AND {}",
+            {
+                let mut buffer = String::new();
+                append_filter_clause(&mut buffer, filter);
+                buffer
+            }
+        ))
+        .bind(hash),
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn image(
+    auth: &Authorization,
     conn: &AsyncMutex<SqliteConnection>,
     image_mutex: &AsyncMutex<()>,
     image_dir: &str,
     cache_dir: &str,
     hash: &str,
-    query: &ImageQuery,
+    variant: Variant,
+    if_modified_since: Option<HttpDate>,
     ranges: Option<&Ranges>,
 ) -> Result<Response<Body>> {
+    if if_modified_since.is_some() {
+        return Ok(response()
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())?);
+    }
+
+    if let Some(filter) = &auth.filter {
+        if !visible(conn.lock().await.deref_mut(), filter, hash).await? {
+            return Ok(response()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::empty())?);
+        }
+    }
+
     let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
 
-    let (mut image, content_type, length) = if let Some(size) = query.size {
+    let (mut image, content_type, length) = {
         // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
         // concurrently.  However, it's way too conservative since it prevents more than one task from accessing
         // any cache files concurrently -- even unrelated ones.  We should use separate locks per hash.
         let _lock = image_mutex.lock().await;
 
-        get_variant(
-            image_dir,
-            &file_data,
-            cache_dir,
-            size,
-            query.variant.unwrap_or(Variant::Still),
-            hash,
-        )
-        .await?
-    } else {
-        let lowercase = file_data.path.to_lowercase();
+        get_variant(image_dir, &file_data, cache_dir, variant, hash).await
+    }?;
 
-        let file = File::open([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?;
-        let length = file.metadata().await?.len();
-
-        (
-            file,
-            if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
-                "video/mp4"
-            } else {
-                "image/jpeg"
-            },
-            length,
-        )
-    };
+    let cache_control = "public, max-age=31536000, immutable";
 
     Ok(if let Some(ranges) = ranges {
         if ranges.0.len() == 1 {
@@ -1267,7 +1306,12 @@ async fn image(
                 _ => (0, length),
             };
 
-            if start > length || end > length || start > end || i64::try_from(start).is_err() {
+            if start > length
+                || end > length
+                || start > end
+                || i64::try_from(start).is_err()
+                || end == 0
+            {
                 return Err(HttpError::from_slice(
                     StatusCode::RANGE_NOT_SATISFIABLE,
                     "range not satisfiable",
@@ -1287,6 +1331,7 @@ async fn image(
                 )
                 .header(header::CONTENT_LENGTH, end - start)
                 .header(header::CONTENT_TYPE, content_type)
+                .header(header::CACHE_CONTROL, cache_control)
                 .body(Body::wrap_stream(as_stream(image.take(end - start))))?
         } else {
             return Err(HttpError::from_slice(
@@ -1299,6 +1344,7 @@ async fn image(
         response()
             .header(header::CONTENT_LENGTH, length)
             .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, cache_control)
             .body(Body::wrap_stream(as_stream(image)))?
     })
 }
@@ -1417,36 +1463,39 @@ async fn authenticate(
 
     let hash = hash_password(request.username.as_bytes(), request.password.as_bytes());
 
-    let found = sqlx::query!(
-        "SELECT 1 as x FROM users WHERE name = ?1 AND password_hash = ?2",
+    let permissions = sqlx::query!(
+        "SELECT filter, may_patch FROM users WHERE name = ?1 AND password_hash = ?2",
         request.username,
         hash
     )
     .fetch_optional(conn.lock().await.deref_mut())
-    .await?
-    .is_some();
+    .await?;
 
-    Ok(if found {
+    Ok(if let Some(permissions) = permissions {
         let expiration = (SystemTime::now() + Duration::from_secs(TOKEN_EXPIRATION_SECS))
             .duration_since(UNIX_EPOCH)?
             .as_secs();
 
-        let success = serde_json::to_vec(&TokenSuccess {
+        let success = TokenSuccess {
             access_token: jsonwebtoken::encode(
                 &Header::new(Algorithm::HS256),
-                &json!({
-                    "exp": expiration,
-                    "sub": &request.username
-                }),
+                &Authorization {
+                    expiration: Some(expiration),
+                    subject: request.username.clone(),
+                    filter: permissions.filter.map(|s| s.parse()).transpose()?,
+                    may_patch: permissions.may_patch != 0,
+                },
                 &EncodingKey::from_secret(key),
             )?,
             token_type: TokenType::Jwt,
-        })?;
+        };
+
+        let json = serde_json::to_vec(&success)?;
 
         response()
-            .header(header::CONTENT_LENGTH, success.len())
+            .header(header::CONTENT_LENGTH, json.len())
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(success))?
+            .body(Body::from(json))?
     } else {
         warn!("received invalid credentials; delaying response");
 
@@ -1463,11 +1512,6 @@ async fn authenticate(
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(error))?
     })
-}
-
-#[derive(Deserialize, Debug)]
-struct Authorization {
-    sub: String,
 }
 
 struct Bearer {
@@ -1503,17 +1547,15 @@ fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpError> {
     ))
 }
 
-fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Option<Arc<Authorization>>) {
-    if auth.is_none() {
-        let tag = TagExpression::Tag(Tag {
-            category: None,
-            value: "public".into(),
-        });
-
+fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
+    if let Some(user_filter) = &auth.filter {
         if let Some(inner) = filter.take() {
-            *filter = Some(TagExpression::And(Box::new(inner), Box::new(tag)));
+            *filter = Some(TagExpression::And(
+                Box::new(inner),
+                Box::new(user_filter.clone()),
+            ));
         } else {
-            *filter = Some(tag);
+            *filter = Some(user_filter.clone());
         }
     }
 }
@@ -1522,28 +1564,64 @@ fn response() -> response::Builder {
     Response::builder()
 }
 
-fn routes(
+#[derive(Copy, Clone)]
+struct HttpDate(DateTime<Utc>);
+
+impl FromStr for HttpDate {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(HttpDate(DateTime::<Utc>::from(
+            DateTime::parse_from_rfc2822(s)?,
+        )))
+    }
+}
+
+async fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     options: &Arc<Options>,
+    auth_key: [u8; 32],
     invalid_credential_delay: Duration,
-) -> impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone {
-    let mut auth_key = [0u8; 32];
-    rand::thread_rng().fill(&mut auth_key);
+) -> Result<impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone> {
+    let default_auth = if let Some(row) = sqlx::query!(
+        "SELECT filter, may_patch FROM users WHERE name IS NULL AND password_hash IS NULL"
+    )
+    .fetch_optional(conn.lock().await.deref_mut())
+    .await?
+    {
+        Some(Arc::new(Authorization {
+            expiration: None,
+            subject: "(default)".into(),
+            filter: row.filter.map(|s| s.parse()).transpose()?,
+            may_patch: row.may_patch != 0,
+        }))
+    } else {
+        None
+    };
 
     let auth_mutex = Arc::new(AsyncMutex::new(()));
     let image_mutex = Arc::new(AsyncMutex::new(()));
 
     let auth = warp::header::optional::<Bearer>("authorization").and_then(
-        move |header: Option<Bearer>| async move {
-            Ok::<_, Rejection>(if let Some(token) = header.map(|h| h.body) {
-                Some(authorize(&token, &auth_key)?)
-            } else {
-                None
-            })
+        move |authorization: Option<Bearer>| {
+            let default_auth = default_auth.clone();
+
+            async move {
+                if let Some(token) = authorization.as_ref().map(|h| &h.body) {
+                    Ok(authorize(token, &auth_key)?)
+                } else if let Some(default_auth) = &default_auth {
+                    Ok(default_auth.clone())
+                } else {
+                    Err(Rejection::from(HttpError::from_slice(
+                        StatusCode::UNAUTHORIZED,
+                        "missing token",
+                    )))
+                }
+            }
         },
     );
 
-    warp::post()
+    Ok(warp::post()
         .and(warp::path("token"))
         .and(warp::body::form::<TokenRequest>())
         .and_then({
@@ -1573,12 +1651,12 @@ fn routes(
         .or(warp::get()
             .and(
                 warp::path("images")
-                    .and(auth)
+                    .and(auth.clone())
                     .and(warp::query::<ImagesQuery>())
                     .and_then({
                         let conn = conn.clone();
 
-                        move |auth, mut query: ImagesQuery| {
+                        move |auth: Arc<Authorization>, mut query: ImagesQuery| {
                             maybe_wrap_filter(&mut query.filter, &auth);
 
                             let conn = conn.clone();
@@ -1600,14 +1678,13 @@ fn routes(
                             })
                         }
                     })
-                    .with(warp::compression::gzip())
                     .or(warp::path("tags")
-                        .and(auth)
+                        .and(auth.clone())
                         .and(warp::query::<TagsQuery>())
                         .and_then({
                             let conn = conn.clone();
 
-                            move |auth, mut query: TagsQuery| {
+                            move |auth: Arc<Authorization>, mut query: TagsQuery| {
                                 maybe_wrap_filter(&mut query.filter, &auth);
 
                                 let conn = conn.clone();
@@ -1628,23 +1705,24 @@ fn routes(
                                     Rejection::from(HttpError::from(e))
                                 })
                             }
-                        })
-                        .with(warp::compression::gzip()))
-                    .or(warp::path!("image" / String)
-                        .and(auth)
-                        .and(warp::query::<ImageQuery>())
+                        }))
+                    .or(warp::path!("image" / Variant / String)
+                        .and(auth.clone())
+                        .and(warp::header::optional::<HttpDate>("if-modified-since"))
                         .and(warp::header::optional::<Ranges>("range"))
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
 
-                            move |hash: String,
-                                  auth: Option<Arc<_>>,
-                                  query,
+                            move |variant: Variant,
+                                  hash: String,
+                                  auth: Arc<Authorization>,
+                                  if_modified_since: Option<HttpDate>,
                                   ranges: Option<Ranges>| {
                                 let hash = Arc::<str>::from(hash);
 
                                 {
+                                    let auth = auth.clone();
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
@@ -1652,12 +1730,14 @@ fn routes(
 
                                     async move {
                                         image(
+                                            &auth,
                                             &conn,
                                             &image_mutex,
                                             &options.image_directory,
                                             &options.cache_directory,
                                             &hash,
-                                            &query,
+                                            variant,
+                                            if_modified_since,
                                             ranges.as_ref(),
                                         )
                                         .await
@@ -1670,8 +1750,7 @@ fn routes(
                                 })
                             }
                         }))
-                    .or(warp::fs::dir(options.public_directory.clone())
-                        .with(warp::compression::gzip())),
+                    .or(warp::fs::dir(options.public_directory.clone())),
             )
             .or(warp::patch().and(
                 warp::path("tags")
@@ -1679,7 +1758,7 @@ fn routes(
                     .and(warp::body::json())
                     .and_then({
                         let conn = conn.clone();
-                        move |auth: Option<Arc<_>>, patches: Vec<Patch>| {
+                        move |auth: Arc<Authorization>, patches: Vec<Patch>| {
                             let patches = Arc::new(patches);
 
                             {
@@ -1688,8 +1767,7 @@ fn routes(
                                 let conn = conn.clone();
 
                                 async move {
-                                    apply(auth.as_deref(), conn.lock().await.deref_mut(), &patches)
-                                        .await
+                                    apply(&auth, conn.lock().await.deref_mut(), &patches).await
                                 }
                             }
                             .map_err(move |e| {
@@ -1709,7 +1787,7 @@ fn routes(
             )))
         .recover(warp_util::handle_rejection)
         .with(warp::log("tagger"))
-        .map(|reply| warp::reply::with_header(reply, "Accept-Ranges", "bytes"))
+        .map(|reply| warp::reply::with_header(reply, "Accept-Ranges", "bytes")))
 }
 
 fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
@@ -1724,12 +1802,18 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
     })
 }
 
-pub async fn serve(conn: &Arc<AsyncMutex<SqliteConnection>>, options: &Arc<Options>) -> Result<()> {
+pub async fn serve(
+    conn: &Arc<AsyncMutex<SqliteConnection>>,
+    options: &Arc<Options>,
+    auth_key: [u8; 32],
+) -> Result<()> {
     let routes = routes(
         conn,
         options,
+        auth_key,
         Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS),
-    );
+    )
+    .await?;
 
     let (address, future) = if let (Some(cert), Some(key)) = (&options.cert_file, &options.key_file)
     {
@@ -1797,7 +1881,7 @@ mod test {
         super::*,
         image::{ImageBuffer, Rgb},
         maplit::{hashmap, hashset},
-        rand::{rngs::StdRng, SeedableRng},
+        rand::{rngs::StdRng, Rng, SeedableRng},
         std::iter,
         tempfile::TempDir,
     };
@@ -1844,6 +1928,9 @@ mod test {
             .to_str()
             .ok_or_else(|| anyhow!("invalid UTF-8"))?;
 
+        let mut auth_key = [0u8; 32];
+        rand::thread_rng().fill(&mut auth_key);
+
         let routes = routes(
             &conn,
             &Arc::new(Options {
@@ -1856,8 +1943,10 @@ mod test {
                 key_file: None,
                 preload_cache: false,
             }),
+            auth_key,
             Duration::from_secs(0),
-        );
+        )
+        .await?;
 
         // Invalid user and password should yield `UNAUTHORIZED` from /token.
 

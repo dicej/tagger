@@ -1,7 +1,7 @@
 #![deny(warnings)]
 
 use {
-    anyhow::Error,
+    anyhow::{anyhow, Error},
     chrono::{DateTime, SecondsFormat, Utc},
     lalrpop_util::lalrpop_mod,
     serde::{Deserializer, Serializer},
@@ -178,8 +178,7 @@ pub struct ImagesResponse {
     pub images: Vec<ImageData>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Copy, Clone)]
 pub enum Size {
     Small,
     Large,
@@ -194,26 +193,26 @@ impl Display for Size {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Copy, Clone)]
 pub enum Variant {
-    Still,
-    Video,
+    Still(Size),
+    Video(Size),
+    Original,
 }
 
-impl Display for Variant {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Variant::Still => write!(f, "still"),
-            Variant::Video => write!(f, "video"),
-        }
+impl FromStr for Variant {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "small-image" => Self::Still(Size::Small),
+            "large-image" => Self::Still(Size::Large),
+            "small-video" => Self::Video(Size::Small),
+            "large-video" => Self::Video(Size::Large),
+            "original" => Self::Original,
+            _ => return Err(anyhow!("unrecognized variant: {}", s)),
+        })
     }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ImageQuery {
-    pub size: Option<Size>,
-    pub variant: Option<Variant>,
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone)]
@@ -228,4 +227,19 @@ pub struct Patch {
     pub hash: String,
     pub tag: Tag,
     pub action: Action,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Authorization {
+    #[serde(rename = "exp")]
+    pub expiration: Option<u64>,
+
+    #[serde(rename = "sub")]
+    pub subject: String,
+
+    #[serde(rename = "fil")]
+    pub filter: Option<TagExpression>,
+
+    #[serde(rename = "pat")]
+    pub may_patch: bool,
 }

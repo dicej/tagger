@@ -33,8 +33,10 @@ pub static DDL_STATEMENTS: &[&str] = &[
     "INSERT INTO categories (name, parent, immutable)
      VALUES ('year', NULL, 1), ('month', 'year', 1) ON CONFLICT DO NOTHING",
     "CREATE TABLE IF NOT EXISTS users (
-       name          TEXT NOT NULL,
-       password_hash TEXT NOT NULL,
+       name          TEXT,
+       password_hash TEXT,
+       filter        TEXT,
+       may_patch     INTEGER NOT NULL DEFAULT 0,
 
        PRIMARY KEY (name, password_hash)
      )",
