@@ -205,8 +205,8 @@ impl FromStr for Variant {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
-            "small-image" => Self::Still(Size::Small),
-            "large-image" => Self::Still(Size::Large),
+            "small" => Self::Still(Size::Small),
+            "large" => Self::Still(Size::Large),
             "small-video" => Self::Video(Size::Small),
             "large-video" => Self::Video(Size::Large),
             "original" => Self::Original,

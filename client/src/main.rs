@@ -644,7 +644,7 @@ fn images(props: ImagesProps) -> Template<G> {
         }),
 
         template: move |(index, hash)| {
-            let url = format!("{}/image/small-image/{}", root, hash);
+            let url = format!("{}/image/small/{}", root, hash);
 
             let images = images.get();
 
@@ -798,7 +798,10 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'stati
                         let response = request.send().await?;
 
                         if response.status() == StatusCode::UNAUTHORIZED {
-                            token_signal.set(None);
+                            if token_signal.get().is_some() {
+                                token_signal.set(None);
+                            }
+
                             on_unauthorized();
                         } else {
                             signal.set(response.error_for_status()?.json::<T>().await?);
@@ -1637,7 +1640,7 @@ fn main() -> Result<()> {
                     let images = images.get();
 
                     if let Some(image) = images.response.images.get(index) {
-                        let url = format!("{}/image/large-image/{}", root, image.hash);
+                        let url = format!("{}/image/large/{}", root, image.hash);
 
                         let medium = image.medium;
 

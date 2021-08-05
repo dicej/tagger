@@ -1258,7 +1258,6 @@ async fn visible(conn: &mut SqliteConnection, filter: &TagExpression, hash: &str
 
 #[allow(clippy::too_many_arguments)]
 async fn image(
-    auth: &Authorization,
     conn: &AsyncMutex<SqliteConnection>,
     image_mutex: &AsyncMutex<()>,
     image_dir: &str,
@@ -1272,14 +1271,6 @@ async fn image(
         return Ok(response()
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())?);
-    }
-
-    if let Some(filter) = &auth.filter {
-        if !visible(conn.lock().await.deref_mut(), filter, hash).await? {
-            return Ok(response()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::empty())?);
-        }
     }
 
     let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
@@ -1707,7 +1698,6 @@ async fn routes(
                             }
                         }))
                     .or(warp::path!("image" / Variant / String)
-                        .and(auth.clone())
                         .and(warp::header::optional::<HttpDate>("if-modified-since"))
                         .and(warp::header::optional::<Ranges>("range"))
                         .and_then({
@@ -1716,13 +1706,11 @@ async fn routes(
 
                             move |variant: Variant,
                                   hash: String,
-                                  auth: Arc<Authorization>,
                                   if_modified_since: Option<HttpDate>,
                                   ranges: Option<Ranges>| {
                                 let hash = Arc::<str>::from(hash);
 
                                 {
-                                    let auth = auth.clone();
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
@@ -1730,7 +1718,6 @@ async fn routes(
 
                                     async move {
                                         image(
-                                            &auth,
                                             &conn,
                                             &image_mutex,
                                             &options.image_directory,
@@ -1744,7 +1731,7 @@ async fn routes(
                                     }
                                 }
                                 .map_err(move |e| {
-                                    warn!(?auth, "error retrieving image {}: {:?}", hash, e);
+                                    warn!("error retrieving image {}: {:?}", hash, e);
 
                                     Rejection::from(HttpError::from(e))
                                 })
