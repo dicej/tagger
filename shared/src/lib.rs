@@ -235,7 +235,7 @@ pub struct Authorization {
     pub expiration: Option<u64>,
 
     #[serde(rename = "sub")]
-    pub subject: String,
+    pub subject: Option<String>,
 
     #[serde(rename = "fil")]
     pub filter: Option<TagExpression>,

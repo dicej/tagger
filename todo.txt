@@ -3,6 +3,8 @@ only allow unauthenticated requests if there's a user in the db with null name a
   add optional filter to users table and include in auth object
   show login overlay in FE on 401 (not just when token is unset)
   only show selection icon when token has may_patch
+  add GET /token support and use it in the front end on load
+    don't hard-code public filter
 check cert and key periodically and reload if needed
 cache headers and/or if-modified-since
   use path instead of query string

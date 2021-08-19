@@ -1472,7 +1472,7 @@ async fn authenticate(
                 &Header::new(Algorithm::HS256),
                 &Authorization {
                     expiration: Some(expiration),
-                    subject: request.username.clone(),
+                    subject: Some(request.username.clone()),
                     filter: permissions.filter.map(|s| s.parse()).transpose()?,
                     may_patch: permissions.may_patch != 0,
                 },
@@ -1492,6 +1492,55 @@ async fn authenticate(
 
         time::sleep(invalid_credential_delay).await;
 
+        let error = serde_json::to_vec(&TokenError {
+            error: TokenErrorType::UnauthorizedClient,
+            error_description: None,
+        })?;
+
+        response()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_LENGTH, error.len())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(error))?
+    })
+}
+
+async fn authenticate_anonymous(
+    conn: &AsyncMutex<SqliteConnection>,
+    key: &[u8],
+) -> Result<Response<Body>> {
+    let permissions = sqlx::query!(
+        "SELECT filter, may_patch FROM users WHERE name IS NULL AND password_hash IS NULL"
+    )
+    .fetch_optional(conn.lock().await.deref_mut())
+    .await?;
+
+    Ok(if let Some(permissions) = permissions {
+        let expiration = (SystemTime::now() + Duration::from_secs(TOKEN_EXPIRATION_SECS))
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+
+        let success = TokenSuccess {
+            access_token: jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &Authorization {
+                    expiration: Some(expiration),
+                    subject: None,
+                    filter: permissions.filter.map(|s| s.parse()).transpose()?,
+                    may_patch: permissions.may_patch != 0,
+                },
+                &EncodingKey::from_secret(key),
+            )?,
+            token_type: TokenType::Jwt,
+        };
+
+        let json = serde_json::to_vec(&success)?;
+
+        response()
+            .header(header::CONTENT_LENGTH, json.len())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json))?
+    } else {
         let error = serde_json::to_vec(&TokenError {
             error: TokenErrorType::UnauthorizedClient,
             error_description: None,
@@ -1582,7 +1631,7 @@ async fn routes(
     {
         Some(Arc::new(Authorization {
             expiration: None,
-            subject: "(default)".into(),
+            subject: Some("(default)".into()),
             filter: row.filter.map(|s| s.parse()).transpose()?,
             may_patch: row.may_patch != 0,
         }))
@@ -1737,6 +1786,16 @@ async fn routes(
                                 })
                             }
                         }))
+                    .or(warp::path("token").and_then({
+                        let conn = conn.clone();
+
+                        move || {
+                            let conn = conn.clone();
+
+                            async move { authenticate_anonymous(&conn, &auth_key).await }
+                                .map_err(|e| Rejection::from(HttpError::from(e)))
+                        }
+                    }))
                     .or(warp::fs::dir(options.public_directory.clone())),
             )
             .or(warp::patch().and(

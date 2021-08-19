@@ -22,8 +22,8 @@ use {
     },
     tagger_shared::{
         tag_expression::{Tag, TagExpression, TagState, TagTree},
-        Action, GrantType, ImageKey, ImagesQuery, ImagesResponse, Medium, Patch, TagsResponse,
-        TokenRequest, TokenSuccess,
+        Action, Authorization, GrantType, ImageKey, ImagesQuery, ImagesResponse, Medium, Patch,
+        TagsResponse, TokenRequest, TokenSuccess,
     },
     wasm_bindgen::{closure::Closure, JsCast},
     web_sys::{Event, HtmlSelectElement, HtmlVideoElement, KeyboardEvent, MouseEvent},
@@ -763,7 +763,6 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'stati
 
         move || {
             let client = client.clone();
-            let token_signal = token.clone();
             let token = token.get();
             let filter = filter.get();
             let uri = uri.get();
@@ -798,10 +797,6 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'stati
                         let response = request.send().await?;
 
                         if response.status() == StatusCode::UNAUTHORIZED {
-                            if token_signal.get().is_some() {
-                                token_signal.set(None);
-                            }
-
                             on_unauthorized();
                         } else {
                             signal.set(response.error_for_status()?.json::<T>().await?);
@@ -881,7 +876,6 @@ fn patch_tags(
                 let response = request.json(&patches).send().await?;
 
                 if response.status() == StatusCode::UNAUTHORIZED {
-                    token.set(None);
                     on_unauthorized();
                 } else {
                     response.error_for_status()?;
@@ -951,11 +945,51 @@ struct State {
     items_per_page: Option<u32>,
 }
 
+fn try_anonymous_login(token: Signal<Option<String>>, client: Client, root: Rc<str>) {
+    if token.get_untracked().is_some() {
+        token.set(None);
+    }
+
+    wasm_bindgen_futures::spawn_local(
+        async move {
+            let response = client.get(format!("{}/token", root)).send().await?;
+
+            if response.status() == StatusCode::UNAUTHORIZED {
+                // This means the server doesn't accept anonymous logins, which is fine.
+            } else {
+                token.set(Some(
+                    response
+                        .error_for_status()?
+                        .json::<TokenSuccess>()
+                        .await?
+                        .access_token,
+                ));
+            }
+
+            Ok::<_, Error>(())
+        }
+        .unwrap_or_else(move |e| {
+            log::error!("error logging in anonymously: {:?}", e);
+        }),
+    );
+}
+
+fn logged_in(token: &Option<String>) -> bool {
+    if let Some(token) = token {
+        jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
+            .map(|data| data.claims.subject.is_some())
+            .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
 fn main() -> Result<()> {
     panic::set_hook(Box::new(console_error_panic_hook::hook));
 
     log::set_logger(&wasm_bindgen_console_logger::DEFAULT_LOGGER)
         .map_err(|e| anyhow!("{:?}", e))?;
+
     log::set_max_level(log::LevelFilter::Info);
 
     let window = web_sys::window().ok_or_else(|| anyhow!("can't get browser window"))?;
@@ -964,9 +998,19 @@ fn main() -> Result<()> {
 
     let token = Signal::new(None);
 
+    let root = Rc::<str>::from(format!(
+        "{}//{}",
+        location.protocol().map_err(|e| anyhow!("{:?}", e))?,
+        location.host().map_err(|e| anyhow!("{:?}", e))?
+    ));
+
+    let client = Client::new();
+
     if let Ok(Some(storage)) = window.local_storage() {
         if let Ok(Some(stored_token)) = storage.get("token") {
             token.set(Some(stored_token));
+        } else {
+            try_anonymous_login(token.clone(), client.clone(), root.clone());
         }
     }
 
@@ -984,14 +1028,6 @@ fn main() -> Result<()> {
             }
         }
     });
-
-    let root = Rc::<str>::from(format!(
-        "{}//{}",
-        location.protocol().map_err(|e| anyhow!("{:?}", e))?,
-        location.host().map_err(|e| anyhow!("{:?}", e))?
-    ));
-
-    let client = Client::new();
 
     let overlay_image = Signal::new(None);
 
@@ -1090,12 +1126,21 @@ fn main() -> Result<()> {
         let log_in_error = log_in_error.clone();
         let user_name = user_name.clone();
         let password = password.clone();
+        let client = client.clone();
+        let token = token.clone();
+        let root = root.clone();
 
         move || {
-            user_name.set(String::new());
-            password.set(String::new());
-            log_in_error.set(None);
-            show_log_in.set(true);
+            let was_logged_in = logged_in(token.get().deref());
+
+            try_anonymous_login(token.clone(), client.clone(), root.clone());
+
+            if was_logged_in {
+                user_name.set(String::new());
+                password.set(String::new());
+                log_in_error.set(None);
+                show_log_in.set(true);
+            }
         }
     };
 
@@ -1554,6 +1599,7 @@ fn main() -> Result<()> {
         let log_in_error = log_in_error.clone();
         let token = token.clone();
         let root = root.clone();
+        let client = client.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
@@ -1615,19 +1661,39 @@ fn main() -> Result<()> {
 
     let log_out = {
         let token = token.clone();
+        let root = root.clone();
 
-        move |_| token.set(None)
+        move |_| try_anonymous_login(token.clone(), client.clone(), root.clone())
     };
 
     let filter = syc::create_selector(move || Option::<TagExpression>::from(filter.get().deref()));
     let filter2 = filter.clone();
 
     let log_in_error2 = log_in_error.clone();
-    let token2 = token.clone();
+
+    let logged_in = syc::create_selector({
+        let token = token.handle();
+
+        move || logged_in(token.get().deref())
+    });
 
     let selected = syc::create_selector(move || *selected_count.get() > 0);
 
     let open_log_in_event = move |_| open_log_in();
+
+    let may_select = syc::create_selector({
+        let token = token.handle();
+
+        move || {
+            if let Some(token) = token.get().deref() {
+                jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
+                    .map(|data| data.claims.may_patch)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    });
 
     sycamore::render(move || {
         template! {
@@ -1781,7 +1847,7 @@ fn main() -> Result<()> {
 
                     Pagination(pagination1)
 
-                    (if token.get().is_some() {
+                    (if *may_select.get() {
                         let selecting = selecting.clone();
                         let toggle_selecting = toggle_selecting.clone();
 
@@ -1799,7 +1865,7 @@ fn main() -> Result<()> {
                 }
 
                 div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
-                    (if token2.get().is_some() {
+                    (if *logged_in.get() {
                         template! {
                             div(class="link", on:click=log_out.clone()) { "log out" }
                         }
