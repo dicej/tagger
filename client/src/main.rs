@@ -797,6 +797,7 @@ fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'stati
                         let response = request.send().await?;
 
                         if response.status() == StatusCode::UNAUTHORIZED {
+                            signal.set(T::default());
                             on_unauthorized();
                         } else {
                             signal.set(response.error_for_status()?.json::<T>().await?);
@@ -945,7 +946,12 @@ struct State {
     items_per_page: Option<u32>,
 }
 
-fn try_anonymous_login(token: Signal<Option<String>>, client: Client, root: Rc<str>) {
+fn try_anonymous_login(
+    token: Signal<Option<String>>,
+    client: Client,
+    root: Rc<str>,
+    on_unauthorized: impl Fn() + 'static,
+) {
     if token.get_untracked().is_some() {
         token.set(None);
     }
@@ -955,7 +961,7 @@ fn try_anonymous_login(token: Signal<Option<String>>, client: Client, root: Rc<s
             let response = client.get(format!("{}/token", root)).send().await?;
 
             if response.status() == StatusCode::UNAUTHORIZED {
-                // This means the server doesn't accept anonymous logins, which is fine.
+                on_unauthorized();
             } else {
                 token.set(Some(
                     response
@@ -1006,11 +1012,35 @@ fn main() -> Result<()> {
 
     let client = Client::new();
 
+    let show_log_in = Signal::new(false);
+    let log_in_error = Signal::new(None);
+    let user_name = Signal::new(String::new());
+    let password = Signal::new(String::new());
+
+    let open_log_in = {
+        let show_log_in = show_log_in.clone();
+        let log_in_error = log_in_error.clone();
+        let user_name = user_name.clone();
+        let password = password.clone();
+
+        move || {
+            user_name.set(String::new());
+            password.set(String::new());
+            log_in_error.set(None);
+            show_log_in.set(true);
+        }
+    };
+
     if let Ok(Some(storage)) = window.local_storage() {
         if let Ok(Some(stored_token)) = storage.get("token") {
             token.set(Some(stored_token));
         } else {
-            try_anonymous_login(token.clone(), client.clone(), root.clone());
+            try_anonymous_login(
+                token.clone(),
+                client.clone(),
+                root.clone(),
+                open_log_in.clone(),
+            );
         }
     }
 
@@ -1116,16 +1146,8 @@ fn main() -> Result<()> {
         }
     });
 
-    let show_log_in = Signal::new(false);
-    let log_in_error = Signal::new(None);
-    let user_name = Signal::new(String::new());
-    let password = Signal::new(String::new());
-
-    let open_log_in = {
-        let show_log_in = show_log_in.clone();
-        let log_in_error = log_in_error.clone();
-        let user_name = user_name.clone();
-        let password = password.clone();
+    let on_unauthorized = {
+        let open_log_in = open_log_in.clone();
         let client = client.clone();
         let token = token.clone();
         let root = root.clone();
@@ -1133,13 +1155,10 @@ fn main() -> Result<()> {
         move || {
             let was_logged_in = logged_in(token.get().deref());
 
-            try_anonymous_login(token.clone(), client.clone(), root.clone());
+            try_anonymous_login(token.clone(), client.clone(), root.clone(), || ());
 
             if was_logged_in {
-                user_name.set(String::new());
-                password.set(String::new());
-                log_in_error.set(None);
-                show_log_in.set(true);
+                open_log_in();
             }
         }
     };
@@ -1150,7 +1169,7 @@ fn main() -> Result<()> {
         token.clone(),
         root.clone(),
         Signal::new(TagTree::default()).into_handle(),
-        open_log_in.clone(),
+        on_unauthorized.clone(),
     );
 
     let selected_count = Signal::new(0);
@@ -1177,7 +1196,7 @@ fn main() -> Result<()> {
             token.clone(),
             root.clone(),
             filter.handle(),
-            open_log_in.clone(),
+            on_unauthorized.clone(),
         ),
         ImagesState::default(),
         {
@@ -1273,7 +1292,7 @@ fn main() -> Result<()> {
         unfiltered_tags: unfiltered_tags.clone(),
         filtered_tags: unfiltered_tags.clone(),
         category: None,
-        on_unauthorized: Rc::new(open_log_in.clone()),
+        on_unauthorized: Rc::new(on_unauthorized.clone()),
     };
 
     let toggle_menu = {
@@ -1396,7 +1415,7 @@ fn main() -> Result<()> {
             let root = root.clone();
             let images = images.clone();
             let unfiltered_tags = unfiltered_tags.clone();
-            let open_log_in = open_log_in.clone();
+            let on_unauthorized = on_unauthorized.clone();
 
             move |tag| {
                 let remove = {
@@ -1406,7 +1425,7 @@ fn main() -> Result<()> {
                     let tag = tag.clone();
                     let unfiltered_tags = unfiltered_tags.clone();
                     let images = images.clone();
-                    let open_log_in = open_log_in.clone();
+                    let on_unauthorized = on_unauthorized.clone();
 
                     move |_| {
                         if !is_immutable_category(
@@ -1437,7 +1456,7 @@ fn main() -> Result<()> {
                                         }
                                     })
                                     .collect(),
-                                open_log_in.clone(),
+                                on_unauthorized.clone(),
                             )
                         }
                     }
@@ -1480,7 +1499,7 @@ fn main() -> Result<()> {
         let images = images.clone();
         let token = token.clone();
         let client = client.clone();
-        let open_log_in = open_log_in.clone();
+        let on_unauthorized = on_unauthorized.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
@@ -1525,7 +1544,7 @@ fn main() -> Result<()> {
                                             }
                                         })
                                         .collect(),
-                                    open_log_in.clone(),
+                                    on_unauthorized.clone(),
                                 )
                             }
                         }
@@ -1662,8 +1681,16 @@ fn main() -> Result<()> {
     let log_out = {
         let token = token.clone();
         let root = root.clone();
+        let open_log_in = open_log_in.clone();
 
-        move |_| try_anonymous_login(token.clone(), client.clone(), root.clone())
+        move |_| {
+            try_anonymous_login(
+                token.clone(),
+                client.clone(),
+                root.clone(),
+                open_log_in.clone(),
+            )
+        }
     };
 
     let filter = syc::create_selector(move || Option::<TagExpression>::from(filter.get().deref()));

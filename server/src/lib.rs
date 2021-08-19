@@ -1952,13 +1952,17 @@ mod test {
             let hash = hash_password(user.as_bytes(), password.as_bytes());
 
             sqlx::query!(
-                "INSERT INTO users (name, password_hash) VALUES (?1, ?2)",
+                "INSERT INTO users (name, password_hash, may_patch) VALUES (?1, ?2, 1)",
                 user,
                 hash,
             )
             .execute(&mut conn)
             .await?;
         }
+
+        sqlx::query!("INSERT INTO users (filter) VALUES ('public')")
+            .execute(&mut conn)
+            .await?;
 
         let conn = Arc::new(AsyncMutex::new(conn));
 
@@ -3345,15 +3349,15 @@ mod test {
                     .method("GET")
                     .header("authorization", format!("Bearer {}", token))
                     .path(&format!(
-                        "/image/{}{}",
+                        "/image/{}/{}",
+                        match size {
+                            Size::Small => "small",
+                            Size::Large => "large",
+                            Size::Original => "original",
+                        },
                         hashes
                             .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
-                            .unwrap(),
-                        match size {
-                            Size::Small => "?size=small",
-                            Size::Large => "?size=large",
-                            Size::Original => "",
-                        }
+                            .unwrap()
                     ))
                     .reply(&routes)
                     .await;

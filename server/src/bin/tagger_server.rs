@@ -12,10 +12,10 @@ use {
     structopt::StructOpt,
     tagger_server::Options,
     tokio::{fs::File, io::AsyncReadExt, sync::Mutex as AsyncMutex, task, time},
-    tracing::error,
+    tracing::{error, info},
 };
 
-const SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const SYNC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 async fn content(file_name: &str) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
@@ -64,6 +64,7 @@ async fn sync_loop(
                 *old_cert = new_cert;
                 *old_key = new_key;
 
+                info!("cert or key changed -- restarting");
                 restart_tx.send(()).await?;
             }
         }
