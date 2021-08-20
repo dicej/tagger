@@ -1,3 +1,4 @@
+when selecting, alt-click to open
 clean up
   modularize FE and BE
   componentize FE and minimize main

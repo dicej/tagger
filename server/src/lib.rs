@@ -643,7 +643,7 @@ async fn apply(
                 let category = patch.tag.category.as_deref();
 
                 sqlx::query!(
-                    "INSERT INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
                     patch.hash,
                     value,
                     category
@@ -1620,7 +1620,7 @@ impl FromStr for HttpDate {
 async fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     options: &Arc<Options>,
-    auth_key: [u8; 32],
+    default_auth_key: [u8; 32],
     invalid_credential_delay: Duration,
 ) -> Result<impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone> {
     let default_auth = if let Some(row) = sqlx::query!(
@@ -1637,6 +1637,19 @@ async fn routes(
         }))
     } else {
         None
+    };
+
+    let auth_key = if let Some(auth_key_file) = &options.auth_key_file {
+        let mut key = [0u8; 32];
+
+        File::open(auth_key_file)
+            .await?
+            .read_exact(&mut key)
+            .await?;
+
+        key
+    } else {
+        default_auth_key
     };
 
     let auth_mutex = Arc::new(AsyncMutex::new(()));
@@ -1851,12 +1864,12 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
 pub async fn serve(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     options: &Arc<Options>,
-    auth_key: [u8; 32],
+    default_auth_key: [u8; 32],
 ) -> Result<()> {
     let routes = routes(
         conn,
         options,
-        auth_key,
+        default_auth_key,
         Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS),
     )
     .await?;
@@ -1915,6 +1928,10 @@ pub struct Options {
     /// File containing TLS key to use
     #[structopt(long)]
     pub key_file: Option<String>,
+
+    /// File containing HS256 key for signing and verifying JWTs
+    #[structopt(long)]
+    pub auth_key_file: Option<String>,
 
     /// If set, pre-generate thumnail cache files for newly-discovered images and videos when syncing
     #[structopt(long)]
@@ -1991,6 +2008,7 @@ mod test {
                 public_directory: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
                 cert_file: None,
                 key_file: None,
+                auth_key_file: None,
                 preload_cache: false,
             }),
             auth_key,

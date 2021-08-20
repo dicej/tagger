@@ -45,6 +45,12 @@ async fn sync_loop(
             None
         };
 
+    let mut auth_key = if let Some(auth_key_file) = &options.auth_key_file {
+        Some((auth_key_file, content(auth_key_file).await?))
+    } else {
+        None
+    };
+
     loop {
         tagger_server::sync(
             &conn,
@@ -65,6 +71,17 @@ async fn sync_loop(
                 *old_key = new_key;
 
                 info!("cert or key changed -- restarting");
+                restart_tx.send(()).await?;
+            }
+        }
+
+        if let Some((key_file, old_key)) = &mut auth_key {
+            let new_key = content(key_file).await?;
+
+            if *old_key != new_key {
+                *old_key = new_key;
+
+                info!("auth key changed -- restarting");
                 restart_tx.send(()).await?;
             }
         }
@@ -90,12 +107,12 @@ async fn main() -> Result<()> {
         }),
     );
 
-    let mut auth_key = [0u8; 32];
-    rand::thread_rng().fill(&mut auth_key);
+    let mut default_auth_key = [0u8; 32];
+    rand::thread_rng().fill(&mut default_auth_key);
 
     loop {
         future::select(
-            tagger_server::serve(&conn, &options, auth_key).boxed(),
+            tagger_server::serve(&conn, &options, default_auth_key).boxed(),
             restart_rx
                 .next()
                 .map(|o| o.ok_or_else(|| anyhow!("unexpected end of stream"))),

@@ -610,6 +610,18 @@ struct ImageState {
     selected: Signal<bool>,
 }
 
+impl Drop for ImageState {
+    fn drop(&mut self) {
+        if *self.selected.get_untracked() {
+            let selected = self.selected.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                selected.set(false);
+            });
+        }
+    }
+}
+
 struct ImagesProps {
     root: Rc<str>,
     selecting: StateHandle<bool>,
@@ -1499,7 +1511,6 @@ fn main() -> Result<()> {
         let images = images.clone();
         let token = token.clone();
         let client = client.clone();
-        let on_unauthorized = on_unauthorized.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
