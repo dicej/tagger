@@ -5,6 +5,7 @@ use {
     futures::stream::{Stream, TryStreamExt},
     structopt::StructOpt,
     tagger_server::FileData,
+    tokio::sync::RwLock as AsyncRwLock,
 };
 
 #[derive(StructOpt, Debug)]
@@ -39,6 +40,7 @@ enum Command {
 }
 
 async fn preload_cache(
+    image_lock: &AsyncRwLock<()>,
     image_directory: &str,
     cache_directory: &str,
     mut images: impl Stream<Item = Result<(String, Option<i64>, String), sqlx::Error>> + Unpin,
@@ -46,8 +48,14 @@ async fn preload_cache(
     while let Some((hash, video_offset, path)) = images.try_next().await? {
         let file_data = FileData { path, video_offset };
 
-        if let Err(e) =
-            tagger_server::preload_cache(image_directory, &file_data, cache_directory, &hash).await
+        if let Err(e) = tagger_server::preload_cache(
+            image_lock,
+            image_directory,
+            &file_data,
+            cache_directory,
+            &hash,
+        )
+        .await
         {
             tracing::warn!("error preloading cache for {}: {:?}", hash, e);
         }
@@ -87,8 +95,11 @@ async fn main() -> Result<()> {
         } => {
             let mut conn = tagger_server::open(&state_file).await?;
 
+            let image_lock = AsyncRwLock::new(());
+
             if let Some(hash) = hash {
                 preload_cache(
+                    &image_lock,
                     &image_directory,
                     &cache_directory,
                     sqlx::query!(
@@ -105,6 +116,7 @@ async fn main() -> Result<()> {
                 .await
             } else {
                 preload_cache(
+                    &image_lock,
                     &image_directory,
                     &cache_directory,
                     sqlx::query!(

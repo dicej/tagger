@@ -670,9 +670,14 @@ fn images(props: ImagesProps) -> Template<G> {
                     let overlay_image = overlay_image.clone();
 
                     move |event: Event| {
-                        if *selecting.get() {
-                            if !*state.selected.get() {
-                                if let Ok(event) = event.dyn_into::<MouseEvent>() {
+                        if let Ok(event) = event.dyn_into::<MouseEvent>() {
+                            if *selecting.get() {
+                                if event.get_modifier_state("Control") {
+                                    overlay_image.set(Some(index));
+                                    return;
+                                }
+
+                                if !*state.selected.get() {
                                     if event.get_modifier_state("Shift") {
                                         if let (Some(first_selected), Some(last_selected)) = (
                                             images.response.images.iter().position(|data| {
@@ -712,12 +717,12 @@ fn images(props: ImagesProps) -> Template<G> {
                                         }
                                     }
                                 }
-                            }
 
-                            let selected = &state.selected;
-                            selected.set(!*selected.get());
-                        } else {
-                            overlay_image.set(Some(index));
+                                let selected = &state.selected;
+                                selected.set(!*selected.get());
+                            } else {
+                                overlay_image.set(Some(index));
+                            }
                         }
                     }
                 };

@@ -53,7 +53,7 @@ use {
         fs::{self, File},
         io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
         process::Command,
-        sync::Mutex as AsyncMutex,
+        sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
         task, time,
     },
     tokio_util::codec::{BytesCodec, FramedRead},
@@ -273,6 +273,7 @@ fn find_new<'a>(
 
 pub async fn sync(
     conn: &AsyncMutex<SqliteConnection>,
+    image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
     preload: bool,
@@ -368,6 +369,7 @@ pub async fn sync(
 
             if preload {
                 if let Err(e) = preload_cache(
+                    image_lock,
                     image_dir,
                     &FileData {
                         path,
@@ -774,16 +776,33 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
 }
 
 pub async fn preload_cache(
+    image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     file_data: &FileData,
     cache_dir: &str,
     hash: &str,
 ) -> Result<()> {
     for size in &[Size::Small, Size::Large] {
-        get_variant(image_dir, file_data, cache_dir, Variant::Still(*size), hash).await?;
+        get_variant(
+            image_lock,
+            image_dir,
+            file_data,
+            cache_dir,
+            Variant::Still(*size),
+            hash,
+        )
+        .await?;
 
         if file_data.video_offset.is_some() {
-            get_variant(image_dir, file_data, cache_dir, Variant::Video(*size), hash).await?;
+            get_variant(
+                image_lock,
+                image_dir,
+                file_data,
+                cache_dir,
+                Variant::Video(*size),
+                hash,
+            )
+            .await?;
         }
     }
 
@@ -791,6 +810,7 @@ pub async fn preload_cache(
 }
 
 async fn get_variant(
+    image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     file_data: &FileData,
     cache_dir: &str,
@@ -799,17 +819,31 @@ async fn get_variant(
 ) -> Result<(File, &'static str, u64)> {
     match variant {
         Variant::Still(size) => {
-            let (thumbnail, length, _) =
-                thumbnail(image_dir, &file_data.path, cache_dir, size, hash).await?;
+            let (thumbnail, length, _) = thumbnail(
+                Some(image_lock),
+                image_dir,
+                &file_data.path,
+                cache_dir,
+                size,
+                hash,
+            )
+            .await?;
 
             Ok((thumbnail, "image/jpeg", length))
         }
 
         Variant::Video(size) => {
             if let Some(offset) = file_data.video_offset {
-                let (preview, length) =
-                    video_preview(image_dir, &file_data.path, offset, cache_dir, size, hash)
-                        .await?;
+                let (preview, length) = video_preview(
+                    image_lock,
+                    image_dir,
+                    &file_data.path,
+                    offset,
+                    cache_dir,
+                    size,
+                    hash,
+                )
+                .await?;
 
                 Ok((preview, "video/mp4", length))
             } else {
@@ -843,7 +877,9 @@ async fn video_scale(
     size: Size,
     hash: &str,
 ) -> Result<String> {
-    let thumbnail = thumbnail(image_dir, path, cache_dir, size, hash).await?.2;
+    let thumbnail = thumbnail(None, image_dir, path, cache_dir, size, hash)
+        .await?
+        .2;
 
     let orientation = task::block_in_place(|| {
         ExifMetadata::new_from_path(&thumbnail)
@@ -993,6 +1029,7 @@ async fn copy_from_offset(path: &Path, offset: i64) -> Result<TempFile> {
 }
 
 async fn video_preview(
+    image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     path: &str,
     offset: i64,
@@ -1002,6 +1039,8 @@ async fn video_preview(
 ) -> Result<(File, u64)> {
     let filename = format!("{}/video/{}/{}.mp4", cache_dir, size, hash);
 
+    let read = image_lock.read().await;
+
     let result = File::open(&filename).await;
 
     if let Ok(file) = result {
@@ -1009,6 +1048,10 @@ async fn video_preview(
 
         Ok((file, length))
     } else {
+        drop(read);
+
+        let _write = image_lock.write().await;
+
         if let Some(parent) = Path::new(&filename).parent() {
             let _ = fs::create_dir(parent).await;
         }
@@ -1124,6 +1167,7 @@ async fn video_preview(
 }
 
 async fn thumbnail(
+    image_lock: Option<&AsyncRwLock<()>>,
     image_dir: &str,
     path: &str,
     cache_dir: &str,
@@ -1132,6 +1176,12 @@ async fn thumbnail(
 ) -> Result<(File, u64, PathBuf)> {
     let filename = format!("{}/{}/{}.jpg", cache_dir, size, hash);
 
+    let read = if let Some(image_lock) = image_lock {
+        Some(image_lock.read().await)
+    } else {
+        None
+    };
+
     let result = File::open(&filename).await;
 
     Ok(if let Ok(file) = result {
@@ -1139,6 +1189,14 @@ async fn thumbnail(
 
         (file, length, filename.into())
     } else {
+        drop(read);
+
+        let _write = if let Some(image_lock) = image_lock {
+            Some(image_lock.write().await)
+        } else {
+            None
+        };
+
         let (image, format) = still_image(image_dir, path).await?;
 
         let original = image::load_from_memory_with_format(&image, format)?;
@@ -1259,7 +1317,7 @@ async fn visible(conn: &mut SqliteConnection, filter: &TagExpression, hash: &str
 #[allow(clippy::too_many_arguments)]
 async fn image(
     conn: &AsyncMutex<SqliteConnection>,
-    image_mutex: &AsyncMutex<()>,
+    image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
     hash: &str,
@@ -1275,14 +1333,8 @@ async fn image(
 
     let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
 
-    let (mut image, content_type, length) = {
-        // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
-        // concurrently.  However, it's way too conservative since it prevents more than one task from accessing
-        // any cache files concurrently -- even unrelated ones.  We should use separate locks per hash.
-        let _lock = image_mutex.lock().await;
-
-        get_variant(image_dir, &file_data, cache_dir, variant, hash).await
-    }?;
+    let (mut image, content_type, length) =
+        { get_variant(image_lock, image_dir, &file_data, cache_dir, variant, hash).await }?;
 
     let cache_control = "public, max-age=31536000, immutable";
 
@@ -1619,6 +1671,7 @@ impl FromStr for HttpDate {
 
 async fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
+    image_lock: &Arc<AsyncRwLock<()>>,
     options: &Arc<Options>,
     default_auth_key: [u8; 32],
     invalid_credential_delay: Duration,
@@ -1653,7 +1706,6 @@ async fn routes(
     };
 
     let auth_mutex = Arc::new(AsyncMutex::new(()));
-    let image_mutex = Arc::new(AsyncMutex::new(()));
 
     let auth = warp::header::optional::<Bearer>("authorization").and_then(
         move |authorization: Option<Bearer>| {
@@ -1765,6 +1817,7 @@ async fn routes(
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
+                            let image_lock = image_lock.clone();
 
                             move |variant: Variant,
                                   hash: String,
@@ -1776,12 +1829,12 @@ async fn routes(
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
-                                    let image_mutex = image_mutex.clone();
+                                    let image_lock = image_lock.clone();
 
                                     async move {
                                         image(
                                             &conn,
-                                            &image_mutex,
+                                            &image_lock,
                                             &options.image_directory,
                                             &options.cache_directory,
                                             &hash,
@@ -1863,11 +1916,13 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
 
 pub async fn serve(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
+    image_lock: &Arc<AsyncRwLock<()>>,
     options: &Arc<Options>,
     default_auth_key: [u8; 32],
 ) -> Result<()> {
     let routes = routes(
         conn,
+        image_lock,
         options,
         default_auth_key,
         Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS),
@@ -1998,8 +2053,11 @@ mod test {
         let mut auth_key = [0u8; 32];
         rand::thread_rng().fill(&mut auth_key);
 
+        let image_lock = Arc::new(AsyncRwLock::new(()));
+
         let routes = routes(
             &conn,
+            &image_lock,
             &Arc::new(Options {
                 address: "0.0.0.0:0".parse()?,
                 image_directory: image_dir.to_owned(),
@@ -2110,23 +2168,26 @@ mod test {
 
         for (&number, &color) in &colors {
             let mut path = image_tmp_dir.path().to_owned();
+
             path.push(format!("{}.jpg", number));
 
             task::block_in_place(|| {
                 ImageBuffer::from_pixel(image_width, image_height, color).save(&path)?;
 
                 let metadata = ExifMetadata::new_from_path(&path)?;
+
                 metadata.set_tag_string(
                     "Exif.Image.DateTimeOriginal",
                     &format!("2021:{:02}:01 00:00:00", number),
                 )?;
+
                 metadata.save_to_file(&path)?;
 
                 Ok::<_, Error>(())
             })?;
         }
 
-        sync(&conn, image_dir, cache_dir, false).await?;
+        sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
 
         // GET /images with no authorization header should yield `OK` with an empty body since no images have been
         // tagged "public" yet.

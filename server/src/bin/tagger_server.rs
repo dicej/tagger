@@ -11,7 +11,12 @@ use {
     std::{process, sync::Arc, time::Duration},
     structopt::StructOpt,
     tagger_server::Options,
-    tokio::{fs::File, io::AsyncReadExt, sync::Mutex as AsyncMutex, task, time},
+    tokio::{
+        fs::File,
+        io::AsyncReadExt,
+        sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
+        task, time,
+    },
     tracing::{error, info},
 };
 
@@ -31,6 +36,7 @@ async fn content(file_name: &str) -> Result<Vec<u8>> {
 async fn sync_loop(
     options: Arc<Options>,
     conn: Arc<AsyncMutex<SqliteConnection>>,
+    image_lock: Arc<AsyncRwLock<()>>,
     mut restart_tx: Sender<()>,
 ) -> Result<()> {
     let mut cert_and_key =
@@ -54,6 +60,7 @@ async fn sync_loop(
     loop {
         tagger_server::sync(
             &conn,
+            &image_lock,
             &options.image_directory,
             &options.cache_directory,
             options.preload_cache,
@@ -98,10 +105,21 @@ async fn main() -> Result<()> {
         tagger_server::open(&options.state_file).await?,
     ));
 
+    // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
+    // concurrently.  However, it's way too conservative since it prevents more than one task from writing any
+    // cache files concurrently -- even unrelated ones.  We should use separate locks per image hash.
+    let image_lock = Arc::new(AsyncRwLock::new(()));
+
     let (restart_tx, mut restart_rx) = mpsc::channel(2);
 
     task::spawn(
-        sync_loop(options.clone(), conn.clone(), restart_tx).map_err(|e| {
+        sync_loop(
+            options.clone(),
+            conn.clone(),
+            image_lock.clone(),
+            restart_tx,
+        )
+        .map_err(|e| {
             error!("sync error: {:?}", e);
             process::exit(-1)
         }),
@@ -112,7 +130,7 @@ async fn main() -> Result<()> {
 
     loop {
         future::select(
-            tagger_server::serve(&conn, &options, default_auth_key).boxed(),
+            tagger_server::serve(&conn, &image_lock, &options, default_auth_key).boxed(),
             restart_rx
                 .next()
                 .map(|o| o.ok_or_else(|| anyhow!("unexpected end of stream"))),
