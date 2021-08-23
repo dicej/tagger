@@ -23,8 +23,7 @@ serde = "1"
 serde_derive = "1"
 serde_json = "1"
 sha2 = "0.9"
-# See https://github.com/launchbadge/sqlx/issues/1300:
-sqlx = { git = "https://github.com/launchbadge/sqlx", branch = "ab/sqlite-segfaults", features = [ "runtime-tokio-native-tls", "sqlite" ] }
+sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 structopt = "0.3"
 thiserror = "1"
 ring = "0.16"
@@ -46,6 +45,5 @@ maplit = "1"
 [build-dependencies]
 anyhow = "1"
 schema = { path = "./schema" }
-# See https://github.com/launchbadge/sqlx/issues/1300:
-sqlx = { git = "https://github.com/launchbadge/sqlx", branch = "ab/sqlite-segfaults", features = [ "runtime-tokio-native-tls", "sqlite" ] }
+sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs" ] }

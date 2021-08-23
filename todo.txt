@@ -1,7 +1,5 @@
 tests
-  break them up
   video
-  anonymous login
   FE?
 document
 demo site?

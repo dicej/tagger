@@ -456,12 +456,21 @@ mod test {
     use {
         super::*,
         anyhow::Error,
+        futures::{future, TryStreamExt},
         image::ImageFormat,
         image::{ImageBuffer, Rgb},
+        jsonwebtoken::{self, Algorithm, EncodingKey, Header},
+        lazy_static::lazy_static,
         maplit::{hashmap, hashset},
         rand::{rngs::StdRng, Rng, SeedableRng},
         rexiv2::Metadata as ExifMetadata,
-        std::{collections::HashMap, iter},
+        std::{
+            collections::HashMap,
+            iter,
+            ops::Deref,
+            sync::Once,
+            time::{SystemTime, UNIX_EPOCH},
+        },
         tagger_shared::{
             tag_expression::Tag, Action, ImagesResponse, TagsResponse, TokenError, TokenSuccess,
         },
@@ -469,9 +478,27 @@ mod test {
         tokio::task,
     };
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn it_works() -> Result<()> {
-        pretty_env_logger::init_timed();
+    const IMAGE_COUNT: u32 = 10;
+    const IMAGE_WIDTH: u32 = 480;
+    const IMAGE_HEIGHT: u32 = 320;
+
+    struct TestState<F> {
+        conn: Arc<AsyncMutex<SqliteConnection>>,
+        routes: F,
+        auth_key: [u8; 32],
+        image_lock: Arc<AsyncRwLock<()>>,
+        image_dir: &'static str,
+        cache_dir: &'static str,
+        colors: Arc<HashMap<u32, Rgb<u8>>>,
+    }
+
+    async fn init(
+    ) -> Result<TestState<impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone>> {
+        {
+            static ONCE: Once = Once::new();
+
+            ONCE.call_once(pretty_env_logger::init_timed);
+        }
 
         let mut conn = "sqlite::memory:"
             .parse::<SqliteConnectOptions>()?
@@ -482,35 +509,62 @@ mod test {
             sqlx::query(statement).execute(&mut conn).await?;
         }
 
-        let user = "Jabberwocky";
-        let password = "Bandersnatch";
+        fn colors() -> HashMap<u32, Rgb<u8>> {
+            let mut random = StdRng::seed_from_u64(42);
 
-        {
-            let hash = auth::hash_password(user.as_bytes(), password.as_bytes());
-
-            sqlx::query!(
-                "INSERT INTO users (name, password_hash, may_patch) VALUES (?1, ?2, 1)",
-                user,
-                hash,
-            )
-            .execute(&mut conn)
-            .await?;
+            (1..=IMAGE_COUNT)
+                .map(|number| {
+                    (
+                        number,
+                        Rgb([random.gen::<u8>(), random.gen(), random.gen()]),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
         }
 
-        sqlx::query!("INSERT INTO users (filter) VALUES ('public')")
-            .execute(&mut conn)
-            .await?;
+        lazy_static! {
+            static ref IMAGE_LOCK: Arc<AsyncRwLock<()>> = Arc::new(AsyncRwLock::new(()));
+            static ref IMAGE_DIR: TempDir = TempDir::new().unwrap();
+            static ref CACHE_DIR: TempDir = TempDir::new().unwrap();
+            static ref COLORS: Arc<HashMap<u32, Rgb<u8>>> = Arc::new(colors());
+        }
+
+        {
+            static ONCE: Once = Once::new();
+
+            ONCE.call_once(|| {
+                for (&number, &color) in COLORS.deref().deref() {
+                    let mut path = IMAGE_DIR.path().to_owned();
+
+                    path.push(format!("{}.jpg", number));
+
+                    task::block_in_place(|| {
+                        ImageBuffer::from_pixel(IMAGE_WIDTH, IMAGE_HEIGHT, color).save(&path)?;
+
+                        let metadata = ExifMetadata::new_from_path(&path)?;
+
+                        metadata.set_tag_string(
+                            "Exif.Image.DateTimeOriginal",
+                            &format!("2021:{:02}:01 00:00:00", number),
+                        )?;
+
+                        metadata.save_to_file(&path)?;
+
+                        Ok::<_, Error>(())
+                    })
+                    .unwrap();
+                }
+            });
+        }
 
         let conn = Arc::new(AsyncMutex::new(conn));
 
-        let image_tmp_dir = TempDir::new()?;
-        let image_dir = image_tmp_dir
+        let image_dir = IMAGE_DIR
             .path()
             .to_str()
             .ok_or_else(|| anyhow!("invalid UTF-8"))?;
 
-        let cache_tmp_dir = TempDir::new()?;
-        let cache_dir = cache_tmp_dir
+        let cache_dir = CACHE_DIR
             .path()
             .to_str()
             .ok_or_else(|| anyhow!("invalid UTF-8"))?;
@@ -518,11 +572,29 @@ mod test {
         let mut auth_key = [0u8; 32];
         rand::thread_rng().fill(&mut auth_key);
 
-        let image_lock = Arc::new(AsyncRwLock::new(()));
+        let routes = make_routes(&conn, IMAGE_LOCK.deref(), image_dir, cache_dir, auth_key).await?;
 
-        let routes = routes(
-            &conn,
-            &image_lock,
+        Ok(TestState {
+            conn,
+            image_lock: IMAGE_LOCK.clone(),
+            auth_key,
+            routes,
+            image_dir,
+            cache_dir,
+            colors: COLORS.clone(),
+        })
+    }
+
+    async fn make_routes(
+        conn: &Arc<AsyncMutex<SqliteConnection>>,
+        image_lock: &Arc<AsyncRwLock<()>>,
+        image_dir: &str,
+        cache_dir: &str,
+        auth_key: [u8; 32],
+    ) -> Result<impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone> {
+        routes(
+            conn,
+            image_lock,
             &Arc::new(Options {
                 address: "0.0.0.0:0".parse()?,
                 image_directory: image_dir.to_owned(),
@@ -537,7 +609,56 @@ mod test {
             auth_key,
             Duration::from_secs(0),
         )
-        .await?;
+        .await
+    }
+
+    fn make_token(auth_key: &[u8]) -> Result<String> {
+        let expiration = (SystemTime::now() + Duration::from_secs(60 * 60))
+            .duration_since(UNIX_EPOCH)?
+            .as_secs();
+
+        Ok(jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &Authorization {
+                expiration: Some(expiration),
+                subject: Some("test".to_owned()),
+                filter: None,
+                may_patch: true,
+            },
+            &EncodingKey::from_secret(auth_key),
+        )?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn authentication() -> Result<()> {
+        let TestState { conn, routes, .. } = init().await?;
+
+        let user = "Jabberwocky";
+        let password = "Bandersnatch";
+
+        {
+            let hash = auth::hash_password(user.as_bytes(), password.as_bytes());
+
+            sqlx::query!(
+                "INSERT INTO users (name, password_hash, may_patch) VALUES (?1, ?2, 1)",
+                user,
+                hash,
+            )
+            .execute(conn.lock().await.deref_mut())
+            .await?;
+        }
+
+        // Anonymous request should yield `UNAUTHORIZED` from /token.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/token")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        serde_json::from_slice::<TokenError>(response.body())?;
 
         // Invalid user and password should yield `UNAUTHORIZED` from /token.
 
@@ -582,7 +703,48 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let token = serde_json::from_slice::<TokenSuccess>(response.body())?.access_token;
+        serde_json::from_slice::<TokenSuccess>(response.body())?;
+
+        // Let's add an anonymous user to to DB.
+
+        sqlx::query!("INSERT INTO users (filter) VALUES ('public')")
+            .execute(conn.lock().await.deref_mut())
+            .await?;
+
+        // Now that we've added an anonymous user to the DB, an anonymous request should yield `OK` from /token.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/token")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn get_images() -> Result<()> {
+        let TestState {
+            auth_key,
+            conn,
+            routes,
+            image_lock,
+            image_dir,
+            cache_dir,
+            ..
+        } = init().await?;
+
+        // Missing authorization header should yield `UNAUTHORIZED` from /images.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         // Invalid token should yield `UNAUTHORIZED` from /images.
 
@@ -594,6 +756,8 @@ mod test {
             .await;
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let token = make_token(&auth_key)?;
 
         // Valid token should yield `OK` from /images.
 
@@ -616,46 +780,20 @@ mod test {
         assert_eq!(response.earliest_start, None);
         assert!(response.images.is_empty());
 
-        // Let's add some images to `image_tmp_dir` and call `sync` to add them to the database.
-
-        let image_count = 10_u32;
-        let image_width = 480;
-        let image_height = 320;
-        let mut random = StdRng::seed_from_u64(42);
-        let colors = (1..=image_count)
-            .map(|number| {
-                (
-                    number,
-                    Rgb([random.gen::<u8>(), random.gen(), random.gen()]),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
-        for (&number, &color) in &colors {
-            let mut path = image_tmp_dir.path().to_owned();
-
-            path.push(format!("{}.jpg", number));
-
-            task::block_in_place(|| {
-                ImageBuffer::from_pixel(image_width, image_height, color).save(&path)?;
-
-                let metadata = ExifMetadata::new_from_path(&path)?;
-
-                metadata.set_tag_string(
-                    "Exif.Image.DateTimeOriginal",
-                    &format!("2021:{:02}:01 00:00:00", number),
-                )?;
-
-                metadata.save_to_file(&path)?;
-
-                Ok::<_, Error>(())
-            })?;
-        }
-
         sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
 
-        // GET /images with no authorization header should yield `OK` with an empty body since no images have been
-        // tagged "public" yet.
+        // Let's add an anonymous user to to DB.
+
+        sqlx::query!("INSERT INTO users (filter) VALUES ('public')")
+            .execute(conn.lock().await.deref_mut())
+            .await?;
+
+        // Re-generate routes since that's what checks the DB for an anonymous user.
+
+        let routes = make_routes(&conn, &image_lock, image_dir, cache_dir, auth_key).await?;
+
+        // Now that we've added an anonymous user to the DB, missing authorization header should `OK` yield from
+        // /images, but with an empty response since no images have been tagged "public" yet.
 
         let response = warp::test::request()
             .method("GET")
@@ -673,7 +811,7 @@ mod test {
         assert_eq!(response.earliest_start, None);
         assert_eq!(response.images.len(), 0);
 
-        // GET /images with no query parameters should yield all the images.
+        // GET /images with no query parameters and with a filter-less token should yield all the images.
 
         let response = warp::test::request()
             .method("GET")
@@ -687,7 +825,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, image_count);
+        assert_eq!(response.total, IMAGE_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(response.earliest_start, None);
 
@@ -703,7 +841,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=image_count)
+            (1..=IMAGE_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
@@ -725,7 +863,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, image_count);
+        assert_eq!(response.total, IMAGE_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(
             response.earliest_start.map(|key| key.datetime),
@@ -737,7 +875,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            ((image_count - 1)..=image_count)
+            ((IMAGE_COUNT - 1)..=IMAGE_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
@@ -759,7 +897,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 7);
-        assert_eq!(response.total, image_count);
+        assert_eq!(response.total, IMAGE_COUNT);
         assert_eq!(
             response.later_start.map(|key| key.datetime),
             Some("2021-06-01T00:00:00Z".parse()?)
@@ -784,78 +922,16 @@ mod test {
 
         // Let's add the "foo" tag to the third image.
 
-        let patches = vec![Patch {
-            hash: hashes
+        {
+            let hash = hashes
                 .get(&"2021-03-01T00:00:00Z".parse()?)
                 .unwrap()
-                .to_string(),
-            tag: "foo".parse()?,
-            action: Action::Add,
-        }];
+                .to_string();
 
-        // PATCH /tags with no authorization header should yield `UNAUTHORIZED`
-
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .json(&patches)
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // A PATCH /tags with an invalid authorization header should yield `UNAUTHORIZED`
-
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", "Bearer invalid")
-            .json(&patches)
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // PATCH /tags referencing an immutable category should yield `UNAUTHORIZED`
-
-        for &(category, tag, action) in &[
-            ("year", "2021", Action::Remove),
-            ("year", "2022", Action::Add),
-            ("month", "3", Action::Remove),
-            ("month", "4", Action::Add),
-        ] {
-            let response = warp::test::request()
-                .method("PATCH")
-                .path("/tags")
-                .header("authorization", format!("Bearer {}", token))
-                .json(&vec![Patch {
-                    hash: hashes
-                        .get(&"2021-03-01T00:00:00Z".parse()?)
-                        .unwrap()
-                        .to_string(),
-                    tag: Tag {
-                        value: tag.into(),
-                        category: Some(category.into()),
-                    },
-                    action,
-                }])
-                .reply(&routes)
-                .await;
-
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, 'foo')", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
         }
-
-        // PATCH /tags with a valid authorization header should yield `OK`
-
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(&patches)
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
 
         // Now GET /images should report the tag we added via the above patch.
 
@@ -871,7 +947,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, image_count);
+        assert_eq!(response.total, IMAGE_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(response.earliest_start, None);
         assert_eq!(
@@ -880,7 +956,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=image_count)
+            (1..=IMAGE_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
@@ -894,56 +970,6 @@ mod test {
                     }
                 )))
                 .collect::<Result<_>>()?
-        );
-
-        // GET /tags with no authorization header should yield no tags since no images have been tagged "public"
-        // yet.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags")
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse::default()
-        );
-
-        // GET /tags should yield the new tag with an image count of one.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: (1..=image_count).map(|n| (Arc::from(n.to_string()), 1)).collect()
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 10
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 1
-                ]
-            }
         );
 
         // GET /images with a "filter" parameter should yield only the image(s) matching that expression.
@@ -981,87 +1007,33 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // Let's add the "foo" tag to the second image.
+        // Let's add some more tags.
 
-        let patches = vec![Patch {
-            hash: hashes
+        {
+            let second = hashes
                 .get(&"2021-02-01T00:00:00Z".parse()?)
                 .unwrap()
-                .to_string(),
-            tag: "foo".parse()?,
-            action: Action::Add,
-        }];
+                .to_string();
 
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(&patches)
-            .reply(&routes)
-            .await;
+            let third = hashes
+                .get(&"2021-03-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
 
-        assert_eq!(response.status(), StatusCode::OK);
+            let fourth = hashes
+                .get(&"2021-04-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
 
-        // Let's add the "bar" tag to the third and fourth images.
-
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(
-                &(3..=4)
-                    .map(|number| {
-                        Ok(Patch {
-                            hash: hashes
-                                .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
-                                .unwrap()
-                                .to_string(),
-                            tag: "bar".parse()?,
-                            action: Action::Add,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
+            sqlx::query!(
+                "INSERT INTO tags (hash, tag) VALUES (?1, 'foo'), (?2, 'bar'), (?3, 'bar')",
+                second,
+                third,
+                fourth
             )
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // GET /tags should yield the newly-applied tags.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: (1..=image_count).map(|n| (Arc::from(n.to_string()), 1)).collect()
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 10
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 2,
-                    "bar".into() => 2,
-                ]
-            }
-        );
+            .execute(conn.lock().await.deref_mut())
+            .await?;
+        }
 
         // GET /images?filter=foo should yield all images with that tag.
 
@@ -1105,42 +1077,6 @@ mod test {
                     }
                 )))
                 .collect::<Result<_>>()?
-        );
-
-        // GET /tags?filter=foo should yield the tags and counts applied to images with that tag.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags?filter=foo")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: (2..=3).map(|n| (Arc::from(n.to_string()), 1)).collect()
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 2
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 2,
-                    "bar".into() => 1,
-                ]
-            }
         );
 
         // GET /images?filter=bar should yield all images with that tag.
@@ -1187,42 +1123,6 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /tags?filter=bar should yield the tags and counts applied to images with that tag.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags?filter=bar")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: (3..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 2
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 1,
-                    "bar".into() => 2,
-                ]
-            }
-        );
-
         // GET "/images?filter=foo and bar" should yield only the image that has both tags.
 
         let response = warp::test::request()
@@ -1257,44 +1157,6 @@ mod test {
                     ]
                 )))
                 .collect::<Result<_>>()?
-        );
-
-        // GET "/tags?filter=foo and bar" should yield the tags and counts applied to images with both tags.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags?filter=foo%20and%20bar")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: hashmap![
-                                    "3".into() => 1
-                                ]
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 1
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 1,
-                    "bar".into() => 1
-                ]
-            }
         );
 
         // GET "/images?filter=foo or bar" should yield the images with either tag.
@@ -1346,48 +1208,12 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // GET /tags?filter=foo or bar should yield the tags and counts applied to images with either tag.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags?filter=foo%20or%20bar")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: (2..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 3
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 2,
-                    "bar".into() => 2
-                ]
-            }
-        );
-
         // A GET /images with a "limit" parameter should still give us the same most recent images, including the
         // tags we've added.
 
         let response = warp::test::request()
             .method("GET")
-            .path(&format!("/images?limit={}", image_count - 1))
+            .path(&format!("/images?limit={}", IMAGE_COUNT - 1))
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1397,7 +1223,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, image_count);
+        assert_eq!(response.total, IMAGE_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(
             response.earliest_start.map(|key| key.datetime),
@@ -1409,7 +1235,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (2..=image_count)
+            (2..=IMAGE_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
@@ -1437,24 +1263,16 @@ mod test {
 
         // Let's add the "baz" tag to the fourth image.
 
-        let patches = vec![Patch {
-            hash: hashes
+        {
+            let hash = hashes
                 .get(&"2021-04-01T00:00:00Z".parse()?)
                 .unwrap()
-                .to_string(),
-            tag: "baz".parse()?,
-            action: Action::Add,
-        }];
+                .to_string();
 
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(&patches)
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, 'baz')", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
 
         // GET "/images?filter=bar and (foo or baz)" should yield the images which match that expression.
 
@@ -1499,44 +1317,6 @@ mod test {
                     }
                 )))
                 .collect::<Result<_>>()?
-        );
-
-        // GET "/tags?filter=bar and (foo or baz)" should yield the tags and counts applied to images which match
-        // that expression.
-
-        let response = warp::test::request()
-            .method("GET")
-            .path("/tags?filter=bar%20and%20%28foo%20or%20baz%29")
-            .header("authorization", format!("Bearer {}", token))
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<TagsResponse>(response.body())?,
-            TagsResponse {
-                immutable: None,
-                categories: hashmap![
-                    "year".into() => TagsResponse {
-                        immutable: Some(true),
-                        categories: hashmap![
-                            "month".into() => TagsResponse {
-                                immutable: Some(true),
-                                categories: HashMap::new(),
-                                tags: (3..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
-                            }
-                        ],
-                        tags: hashmap![
-                            "2021".into() => 2
-                        ]
-                    }
-                ],
-                tags: hashmap![
-                    "foo".into() => 1,
-                    "bar".into() => 2,
-                    "baz".into() => 1
-                ]
-            }
         );
 
         // GET "/images?filter=bar and (foo or baz)&limit=1" should yield just the fourth image.
@@ -1619,25 +1399,16 @@ mod test {
 
         // Let's remove the "bar" tag from the third image.
 
-        let patches = vec![Patch {
-            hash: hashes
+        {
+            let hash = hashes
                 .get(&"2021-03-01T00:00:00Z".parse()?)
                 .unwrap()
-                .to_string(),
-            tag: "bar".parse()?,
+                .to_string();
 
-            action: Action::Remove,
-        }];
-
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(&patches)
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
+            sqlx::query!("DELETE FROM tags WHERE hash = ?1 AND tag = 'bar'", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
 
         // GET /images?filter=bar should yield just the fourth image now.
 
@@ -1689,7 +1460,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, image_count);
+        assert_eq!(response.total, IMAGE_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(response.earliest_start, None);
         assert_eq!(
@@ -1698,7 +1469,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=image_count)
+            (1..=IMAGE_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
@@ -1750,52 +1521,18 @@ mod test {
                 .collect::<Result<_>>()?
         );
 
-        // A PATCH /tags that tries to change the year or month should yield `UNAUTHORIZED`
-
-        for &category in &["year", "month"] {
-            for &action in &[Action::Add, Action::Remove] {
-                let response = warp::test::request()
-                    .method("PATCH")
-                    .path("/tags")
-                    .header("authorization", format!("Bearer {}", token))
-                    .json(&vec![Patch {
-                        hash: hashes
-                            .get(&"2021-04-01T00:00:00Z".parse()?)
-                            .unwrap()
-                            .to_string(),
-                        tag: Tag {
-                            value: "baz".into(),
-                            category: Some(category.into()),
-                        },
-                        action,
-                    }])
-                    .reply(&routes)
-                    .await;
-
-                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-            }
-        }
-
         // Let's add the "public" tag to the fourth image.
 
-        let patches = vec![Patch {
-            hash: hashes
+        {
+            let hash = hashes
                 .get(&"2021-04-01T00:00:00Z".parse()?)
                 .unwrap()
-                .to_string(),
-            tag: "public".parse()?,
-            action: Action::Add,
-        }];
+                .to_string();
 
-        let response = warp::test::request()
-            .method("PATCH")
-            .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
-            .json(&patches)
-            .reply(&routes)
-            .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, 'public')", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
 
         // GET /images with no authorization header should yield any images tagged "public".
 
@@ -1832,6 +1569,570 @@ mod test {
                 )))
                 .collect::<Result<_>>()?
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn patch_tags() -> Result<()> {
+        let TestState {
+            auth_key,
+            conn,
+            routes,
+            image_lock,
+            image_dir,
+            cache_dir,
+            ..
+        } = init().await?;
+
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+
+        let token = make_token(&auth_key)?;
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hashes = serde_json::from_slice::<ImagesResponse>(response.body())?
+            .images
+            .iter()
+            .map(|data| (data.datetime, data.hash.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // Let's add the "foo" tag to the third image.
+
+        let patches = vec![Patch {
+            hash: hashes
+                .get(&"2021-03-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string(),
+            tag: "foo".parse()?,
+            action: Action::Add,
+        }];
+
+        // PATCH /tags with no authorization header should yield `UNAUTHORIZED`
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .json(&patches)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // A PATCH /tags with an invalid authorization header should yield `UNAUTHORIZED`
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", "Bearer invalid")
+            .json(&patches)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // PATCH /tags referencing an immutable category should yield `UNAUTHORIZED`
+
+        for &(category, tag, action) in &[
+            ("year", "2021", Action::Remove),
+            ("year", "2022", Action::Add),
+            ("month", "3", Action::Remove),
+            ("month", "4", Action::Add),
+        ] {
+            let response = warp::test::request()
+                .method("PATCH")
+                .path("/tags")
+                .header("authorization", format!("Bearer {}", token))
+                .json(&vec![Patch {
+                    hash: hashes
+                        .get(&"2021-03-01T00:00:00Z".parse()?)
+                        .unwrap()
+                        .to_string(),
+                    tag: Tag {
+                        value: tag.into(),
+                        category: Some(category.into()),
+                    },
+                    action,
+                }])
+                .reply(&routes)
+                .await;
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // PATCH /tags with a valid authorization header should yield `OK`
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&patches)
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            vec![(
+                hashes
+                    .get(&"2021-03-01T00:00:00Z".parse()?)
+                    .unwrap()
+                    .to_string(),
+                "foo".to_owned()
+            )],
+            sqlx::query!("SELECT hash, tag FROM tags WHERE category IS NULL")
+                .fetch(conn.lock().await.deref_mut())
+                .and_then(|row| future::ok((row.hash, row.tag)))
+                .try_collect::<Vec<_>>()
+                .await?
+        );
+
+        let response = warp::test::request()
+            .method("PATCH")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .json(&vec![Patch {
+                hash: hashes
+                    .get(&"2021-03-01T00:00:00Z".parse()?)
+                    .unwrap()
+                    .to_string(),
+                tag: "foo".parse()?,
+                action: Action::Remove,
+            }])
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            sqlx::query!("SELECT hash, category, tag FROM tags WHERE category IS NULL")
+                .fetch_optional(conn.lock().await.deref_mut())
+                .await?
+                .is_none()
+        );
+
+        // A PATCH /tags that tries to change the year or month should yield `UNAUTHORIZED`
+
+        for &category in &["year", "month"] {
+            for &action in &[Action::Add, Action::Remove] {
+                let response = warp::test::request()
+                    .method("PATCH")
+                    .path("/tags")
+                    .header("authorization", format!("Bearer {}", token))
+                    .json(&vec![Patch {
+                        hash: hashes
+                            .get(&"2021-04-01T00:00:00Z".parse()?)
+                            .unwrap()
+                            .to_string(),
+                        tag: Tag {
+                            value: "baz".into(),
+                            category: Some(category.into()),
+                        },
+                        action,
+                    }])
+                    .reply(&routes)
+                    .await;
+
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn get_tags() -> Result<()> {
+        let TestState {
+            auth_key,
+            conn,
+            routes,
+            image_lock,
+            image_dir,
+            cache_dir,
+            ..
+        } = init().await?;
+
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+
+        let token = make_token(&auth_key)?;
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hashes = serde_json::from_slice::<ImagesResponse>(response.body())?
+            .images
+            .iter()
+            .map(|data| (data.datetime, data.hash.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // GET /tags with no authorization header should yield `UNAUTHORIZED`.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Let's add the "foo" tag to the third image.
+
+        {
+            let hash = hashes
+                .get(&"2021-03-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, 'foo')", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
+
+        // Let's add an anonymous user to to DB.
+
+        sqlx::query!("INSERT INTO users (filter) VALUES ('public')")
+            .execute(conn.lock().await.deref_mut())
+            .await?;
+
+        // Re-generate routes since that's what checks the DB for an anonymous user.
+
+        let routes = make_routes(&conn, &image_lock, image_dir, cache_dir, auth_key).await?;
+
+        // Now that we've added an anonymous user to the DB, GET /tags with no authorization header should yield
+        // `OK` but no tags since no images have been tagged "public" yet.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags")
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse::default()
+        );
+
+        // GET /tags should yield the new tag with an image count of one.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (1..=IMAGE_COUNT).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 10
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1
+                ]
+            }
+        );
+
+        // Let's add some more tags.
+
+        {
+            let second = hashes
+                .get(&"2021-02-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
+
+            let third = hashes
+                .get(&"2021-03-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
+
+            let fourth = hashes
+                .get(&"2021-04-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
+
+            sqlx::query!(
+                "INSERT INTO tags (hash, tag) VALUES (?1, 'foo'), (?2, 'bar'), (?3, 'bar')",
+                second,
+                third,
+                fourth
+            )
+            .execute(conn.lock().await.deref_mut())
+            .await?;
+        }
+
+        // GET /tags should yield the newly-applied tags.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (1..=IMAGE_COUNT).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 10
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 2,
+                    "bar".into() => 2,
+                ]
+            }
+        );
+
+        // GET /tags?filter=foo should yield the tags and counts applied to images with that tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags?filter=foo")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (2..=3).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 2
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 2,
+                    "bar".into() => 1,
+                ]
+            }
+        );
+
+        // GET /tags?filter=bar should yield the tags and counts applied to images with that tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags?filter=bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (3..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 2
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1,
+                    "bar".into() => 2,
+                ]
+            }
+        );
+
+        // GET "/tags?filter=foo and bar" should yield the tags and counts applied to images with both tags.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags?filter=foo%20and%20bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: hashmap![
+                                    "3".into() => 1
+                                ]
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 1
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1,
+                    "bar".into() => 1
+                ]
+            }
+        );
+
+        // GET /tags?filter=foo or bar should yield the tags and counts applied to images with either tag.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags?filter=foo%20or%20bar")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (2..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 3
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 2,
+                    "bar".into() => 2
+                ]
+            }
+        );
+
+        // Let's add the "baz" tag to the fourth image.
+
+        {
+            let hash = hashes
+                .get(&"2021-04-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
+
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, 'baz')", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
+
+        // GET "/tags?filter=bar and (foo or baz)" should yield the tags and counts applied to images which match
+        // that expression.
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/tags?filter=bar%20and%20%28foo%20or%20baz%29")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<TagsResponse>(response.body())?,
+            TagsResponse {
+                immutable: None,
+                categories: hashmap![
+                    "year".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: hashmap![
+                            "month".into() => TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (3..=4).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                            }
+                        ],
+                        tags: hashmap![
+                            "2021".into() => 2
+                        ]
+                    }
+                ],
+                tags: hashmap![
+                    "foo".into() => 1,
+                    "bar".into() => 2,
+                    "baz".into() => 1
+                ]
+            }
+        );
+
+        // Let's add the "public" tag to the fourth image.
+
+        {
+            let hash = hashes
+                .get(&"2021-04-01T00:00:00Z".parse()?)
+                .unwrap()
+                .to_string();
+
+            sqlx::query!("INSERT INTO tags (hash, tag) VALUES (?1, 'public')", hash)
+                .execute(conn.lock().await.deref_mut())
+                .await?;
+        }
 
         // GET /tags with no authorization header should yield the tags applied to any images tagged "public".
 
@@ -1871,7 +2172,41 @@ mod test {
             }
         );
 
-        // The images and thumbnails should contain the colors we specified above.
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn get_image() -> Result<()> {
+        let TestState {
+            auth_key,
+            conn,
+            routes,
+            image_lock,
+            image_dir,
+            cache_dir,
+            colors,
+        } = init().await?;
+
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+
+        let token = make_token(&auth_key)?;
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let hashes = serde_json::from_slice::<ImagesResponse>(response.body())?
+            .images
+            .iter()
+            .map(|data| (data.datetime, data.hash.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // The images and thumbnails should contain the colors we specified in `init`.
 
         enum Size {
             Small,
@@ -1887,11 +2222,12 @@ mod test {
                 .all(|(&a, &b)| ((a as i32) - (b as i32)).abs() < EPSILON)
         }
 
-        for (&number, &color) in &colors {
+        let mut random = StdRng::seed_from_u64(7322);
+
+        for (&number, &color) in colors.deref() {
             for size in &[Size::Small, Size::Large, Size::Original] {
                 let response = warp::test::request()
                     .method("GET")
-                    .header("authorization", format!("Bearer {}", token))
                     .path(&format!(
                         "/image/{}/{}",
                         match size {
@@ -1917,7 +2253,7 @@ mod test {
                     match size {
                         Size::Small => media::SMALL_BOUNDS,
                         Size::Large => media::LARGE_BOUNDS,
-                        Size::Original => (image_width, image_height),
+                        Size::Original => (IMAGE_WIDTH, IMAGE_HEIGHT),
                     }
                 );
 
