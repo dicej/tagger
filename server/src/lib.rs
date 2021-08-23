@@ -1,84 +1,98 @@
 #![deny(warnings)]
 
 use {
-    anyhow::{anyhow, Error, Result},
-    bytes::{Bytes, BytesMut},
-    chrono::{DateTime, Datelike, NaiveDateTime, Utc},
-    futures::{
-        future::{BoxFuture, FutureExt, TryFutureExt},
-        stream::{Stream, TryStreamExt},
-    },
+    crate::warp_util::{Bearer, HttpDate, HttpError, Ranges},
+    anyhow::{anyhow, Result},
+    futures::future::{FutureExt, TryFutureExt},
     http::{
         header,
         response::{self, Response},
         status::StatusCode,
     },
     hyper::Body,
-    image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat},
-    jsonwebtoken::{self, Algorithm, DecodingKey, EncodingKey, Header, Validation},
-    lazy_static::lazy_static,
-    mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType},
-    regex::Regex,
-    rexiv2::{Metadata as ExifMetadata, Orientation},
-    sha2::{Digest, Sha256},
     sqlx::{
         query::Query,
         sqlite::{SqliteArguments, SqliteConnectOptions},
-        ConnectOptions, Connection, Row, Sqlite, SqliteConnection,
+        ConnectOptions, Sqlite, SqliteConnection,
     },
     std::{
-        collections::{HashMap, HashSet, VecDeque},
-        convert::{Infallible, TryFrom, TryInto},
-        fmt::Write as _,
-        io::{BufReader, Seek, SeekFrom, Write},
-        mem,
+        convert::Infallible,
         net::SocketAddrV4,
-        num::NonZeroU32,
-        ops::{Deref, DerefMut},
+        ops::DerefMut,
         panic::{self, AssertUnwindSafe},
-        path::{Path, PathBuf},
-        str::FromStr,
         sync::Arc,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::Duration,
     },
     structopt::StructOpt,
     tagger_shared::{
-        tag_expression::{Tag, TagExpression},
-        Action, Authorization, ImageData, ImageKey, ImagesQuery, ImagesResponse, Medium, Patch,
-        Size, TagsQuery, TagsResponse, TokenError, TokenErrorType, TokenRequest, TokenSuccess,
-        TokenType, Variant,
+        tag_expression::TagExpression, Authorization, ImagesQuery, Patch, TagsQuery, TokenRequest,
+        Variant,
     },
-    tempfile::NamedTempFile,
     tokio::{
-        fs::{self, File},
-        io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
-        process::Command,
+        fs::File as AsyncFile,
+        io::AsyncReadExt,
         sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
-        task, time,
     },
-    tokio_util::codec::{BytesCodec, FramedRead},
     tracing::{info, warn},
     warp::{Filter, Rejection, Reply},
-    warp_util::HttpError,
 };
 
+pub use {
+    auth::hash_password,
+    media::{preload_cache, FileData},
+    sync::sync,
+};
+
+mod auth;
+mod images;
+mod media;
+mod sync;
+mod tags;
 mod warp_util;
-
-const SMALL_BOUNDS: (u32, u32) = (480, 320);
-
-const LARGE_BOUNDS: (u32, u32) = (1920, 1280);
-
-const JPEG_QUALITY: u8 = 90;
 
 const INVALID_CREDENTIAL_DELAY_SECS: u64 = 5;
 
-const TOKEN_EXPIRATION_SECS: u64 = 24 * 60 * 60;
-
-const DEFAULT_LIMIT: u32 = 1000;
-
-const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
-
 const BUFFER_SIZE: usize = 16 * 1024;
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
+pub struct Options {
+    /// Address to which to bind
+    #[structopt(long)]
+    pub address: SocketAddrV4,
+
+    /// Directory containing source image and video files
+    #[structopt(long)]
+    pub image_directory: String,
+
+    /// Directory in which to cache lazily generated image and video variants
+    #[structopt(long)]
+    pub cache_directory: String,
+
+    /// SQLite database to create or reuse
+    #[structopt(long)]
+    pub state_file: String,
+
+    /// Directory containing static resources
+    #[structopt(long)]
+    pub public_directory: String,
+
+    /// File containing TLS certificate to use
+    #[structopt(long)]
+    pub cert_file: Option<String>,
+
+    /// File containing TLS key to use
+    #[structopt(long)]
+    pub key_file: Option<String>,
+
+    /// File containing HS256 key for signing and verifying JWTs
+    #[structopt(long)]
+    pub auth_key_file: Option<String>,
+
+    /// If set, pre-generate thumnail cache files for newly-discovered images and videos when syncing
+    #[structopt(long)]
+    pub preload_cache: bool,
+}
 
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
@@ -92,351 +106,6 @@ pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     }
 
     Ok(conn)
-}
-
-async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<String> {
-    let mut hasher = Sha256::default();
-
-    let mut buffer = vec![0; BUFFER_SIZE];
-
-    loop {
-        let count = input.read(&mut buffer[..]).await?;
-        if count == 0 {
-            break;
-        } else {
-            hasher.update(&buffer[0..count]);
-        }
-    }
-
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<Vec<_>>()
-        .concat())
-}
-
-#[derive(Debug)]
-struct Metadata {
-    datetime: DateTime<Utc>,
-    video_offset: Option<i64>,
-}
-
-fn exif_metadata(path: &Path) -> Result<Metadata> {
-    let length = i64::try_from(std::fs::File::open(path)?.metadata()?.len()).unwrap();
-
-    let metadata = ExifMetadata::new_from_path(path)?;
-
-    let datetime = metadata
-        .get_tag_string("Exif.Image.DateTimeOriginal")
-        .or_else(|_| metadata.get_tag_string("Exif.Image.DateTime"))?;
-
-    lazy_static! {
-        static ref DATE_TIME_PATTERN: Regex =
-            Regex::new(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})").unwrap();
-    };
-
-    Ok(Metadata {
-        datetime: DATE_TIME_PATTERN
-            .captures(&datetime)
-            .map(|c| {
-                format!(
-                    "{}-{}-{}T{}:{}:{}Z",
-                    &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
-                )
-            })
-            .ok_or_else(|| anyhow!("unrecognized DateTime format: {}", datetime))?
-            .parse()?,
-
-        video_offset: if metadata
-            .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Mime")
-            .ok()
-            .as_deref()
-            == Some("video/mp4")
-        {
-            metadata
-                .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Length")
-                .ok()
-        } else {
-            metadata.get_tag_string("Xmp.GCamera.MicroVideoOffset").ok()
-        }
-        .and_then(|video_length| video_length.parse::<i64>().ok())
-        .map(|video_length| length - video_length),
-    })
-}
-
-fn mp4_metadata(path: &Path) -> Result<Metadata> {
-    const SECONDS_FROM_1904_TO_1970: u64 = 2_082_844_800;
-
-    Ok(Metadata {
-        datetime: DateTime::<Utc>::from_utc(
-            NaiveDateTime::from_timestamp(
-                mp4parse::read_mp4(&mut std::fs::File::open(path)?)?
-                    .creation
-                    .ok_or_else(|| anyhow!("missing creation time"))?
-                    .0
-                    .saturating_sub(SECONDS_FROM_1904_TO_1970)
-                    .try_into()
-                    .unwrap(),
-                0,
-            ),
-            Utc,
-        ),
-        video_offset: Some(0),
-    })
-}
-
-fn find_new<'a>(
-    conn: &'a AsyncMutex<SqliteConnection>,
-    root: &'a str,
-    result: &'a mut Vec<(String, Option<Metadata>)>,
-    dir: impl AsRef<Path> + 'a + Send,
-) -> BoxFuture<'a, Result<()>> {
-    let dir_buf = dir.as_ref().to_path_buf();
-
-    async move {
-        let mut dir = fs::read_dir(dir).await?;
-
-        while let Some(entry) = dir.next_entry().await? {
-            let path = entry.path();
-
-            if path.is_file() {
-                if let Some(name) = entry.file_name().to_str() {
-                    let lowercase = name.to_lowercase();
-
-                    if !lowercase.starts_with(".trashed-")
-                        && (lowercase.ends_with(".jpg")
-                            || lowercase.ends_with(".jpeg")
-                            || lowercase.ends_with(".mp4")
-                            || lowercase.ends_with(".mov"))
-                    {
-                        let mut path = dir_buf.clone();
-                        path.push(name);
-
-                        let stripped = path
-                            .strip_prefix(root)?
-                            .to_str()
-                            .ok_or_else(|| anyhow!("bad utf8"))?;
-
-                        let found =
-                            sqlx::query!("SELECT 1 as x FROM paths WHERE path = ?1", stripped)
-                                .fetch_optional(conn.lock().await.deref_mut())
-                                .await?
-                                .is_some();
-
-                        if !found {
-                            let found_bad = sqlx::query!(
-                                "SELECT 1 as x FROM bad_paths WHERE path = ?1",
-                                stripped
-                            )
-                            .fetch_optional(conn.lock().await.deref_mut())
-                            .await?
-                            .is_some();
-
-                            if !found_bad {
-                                let metadata = task::block_in_place(|| {
-                                    if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
-                                        mp4_metadata(&path)
-                                    } else {
-                                        exif_metadata(&path)
-                                    }
-                                });
-
-                                result.push((
-                                    stripped.to_string(),
-                                    match metadata {
-                                        Ok(data) => Some(data),
-                                        Err(e) => {
-                                            warn!(
-                                                "unable to get metadata for {}: {:?}",
-                                                path.to_string_lossy(),
-                                                e
-                                            );
-
-                                            None
-                                        }
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else if path.is_dir() {
-                find_new(conn, root, result, path).await?;
-            }
-        }
-
-        Ok(())
-    }
-    .boxed()
-}
-
-pub async fn sync(
-    conn: &AsyncMutex<SqliteConnection>,
-    image_lock: &AsyncRwLock<()>,
-    image_dir: &str,
-    cache_dir: &str,
-    preload: bool,
-) -> Result<()> {
-    info!("starting sync");
-
-    let then = Instant::now();
-
-    let obsolete = {
-        let mut lock = conn.lock().await;
-        let mut rows = sqlx::query!("SELECT path FROM paths").fetch(lock.deref_mut());
-
-        let mut obsolete = Vec::new();
-
-        while let Some(row) = rows.try_next().await? {
-            if ![image_dir, &row.path].iter().collect::<PathBuf>().is_file() {
-                obsolete.push(row.path)
-            }
-        }
-
-        obsolete
-    };
-
-    let obsolete_len = obsolete.len();
-
-    let new = {
-        let mut new = Vec::new();
-
-        find_new(conn, image_dir, &mut new, image_dir).await?;
-
-        new
-    };
-
-    let new_len = new.len();
-
-    for (index, (path, data)) in new.into_iter().enumerate() {
-        if let Some(data) = data {
-            let hash = hash(&mut File::open([image_dir, &path].iter().collect::<PathBuf>()).await?)
-                .await?;
-
-            info!(
-                "({} of {}) insert {} (hash {}; data {:?})",
-                index + 1,
-                new_len,
-                path,
-                hash,
-                data
-            );
-
-            conn.lock()
-            .await
-            .transaction(|conn| {
-                let path = path.clone();
-                let hash = hash.clone();
-                let year = data.datetime.year();
-                let month = data.datetime.month();
-                let datetime = data.datetime.to_string();
-                let video_offset = data.video_offset;
-
-                async move {
-                    sqlx::query!("INSERT INTO paths (path, hash) VALUES (?1, ?2)", path, hash)
-                        .execute(&mut *conn)
-                        .await?;
-
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO images (hash, datetime, video_offset) VALUES (?1, ?2, ?3)",
-                        hash,
-                        datetime,
-                        video_offset
-                    )
-                    .execute(&mut *conn)
-                    .await?;
-
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'year', ?2)",
-                        hash,
-                        year
-                    )
-                    .execute(&mut *conn)
-                    .await?;
-
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'month', ?2)",
-                        hash,
-                        month
-                    )
-                    .execute(&mut *conn)
-                    .await
-                }
-                .boxed()
-            })
-                .await?;
-
-            if preload {
-                if let Err(e) = preload_cache(
-                    image_lock,
-                    image_dir,
-                    &FileData {
-                        path,
-                        video_offset: data.video_offset,
-                    },
-                    cache_dir,
-                    &hash,
-                )
-                .await
-                {
-                    warn!("error preloading cache for {}: {:?}", hash, e);
-                }
-            }
-        } else {
-            info!("({} of {}) insert bad path {}", index + 1, new_len, path);
-
-            sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
-                .execute(conn.lock().await.deref_mut())
-                .await?;
-        }
-    }
-
-    for (index, path) in obsolete.into_iter().enumerate() {
-        info!("({} of {}) delete {}", index + 1, obsolete_len, path);
-
-        conn.lock()
-            .await
-            .transaction(|conn| {
-                async move {
-                    if let Some(row) = sqlx::query!("SELECT hash FROM paths WHERE path = ?1", path)
-                        .fetch_optional(&mut *conn)
-                        .await?
-                    {
-                        sqlx::query!("DELETE FROM paths WHERE path = ?1", path)
-                            .execute(&mut *conn)
-                            .await?;
-
-                        if sqlx::query!("SELECT 1 as x FROM paths WHERE hash = ?1", row.hash)
-                            .fetch_optional(&mut *conn)
-                            .await?
-                            .is_none()
-                        {
-                            sqlx::query!("DELETE FROM images WHERE hash = ?1", row.hash)
-                                .execute(&mut *conn)
-                                .await?;
-                        }
-                    } else {
-                        sqlx::query!("DELETE FROM bad_paths WHERE path = ?1", path)
-                            .execute(&mut *conn)
-                            .await?;
-                    }
-
-                    Ok::<_, Error>(())
-                }
-                .boxed()
-            })
-            .await?;
-    }
-
-    info!(
-        "sync took {:?} (added {}; deleted {})",
-        then.elapsed(),
-        new_len,
-        obsolete_len
-    );
-
-    Ok(())
 }
 
 fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
@@ -480,1165 +149,6 @@ fn bind_filter_clause<'a>(
     })
 }
 
-fn build_images_query<'a>(
-    buffer: &'a mut String,
-    filter: Option<&TagExpression>,
-) -> Query<'a, Sqlite, SqliteArguments<'a>> {
-    write!(
-        buffer,
-        "SELECT \
-         hash, \
-         datetime, \
-         video_offset, \
-         (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END) \
-          FROM tags WHERE hash = i.hash) \
-         FROM images i WHERE {}",
-        if let Some(filter) = filter {
-            let mut buffer = String::new();
-            append_filter_clause(&mut buffer, filter);
-            buffer
-        } else {
-            "1".into()
-        }
-    )
-    .unwrap();
-
-    let mut select = sqlx::query(buffer);
-
-    if let Some(filter) = filter {
-        select = bind_filter_clause(filter, select);
-    }
-
-    select
-}
-
-async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<ImagesResponse> {
-    let limit = usize::try_from(query.limit.unwrap_or(DEFAULT_LIMIT)).unwrap();
-
-    let mut buffer = String::new();
-    let mut rows = build_images_query(&mut buffer, query.filter.as_ref()).fetch(&mut *conn);
-
-    let mut sorted = Vec::new();
-
-    while let Some(row) = rows.try_next().await? {
-        sorted.push((
-            ImageKey {
-                datetime: row.get::<&str, _>(1).parse()?,
-                hash: Some(Arc::from(row.get::<&str, _>(0))),
-            },
-            row,
-        ));
-    }
-
-    sorted.sort_by(|(a, _), (b, _)| b.cmp(a));
-
-    let mut images = Vec::with_capacity(limit);
-    let mut later = VecDeque::with_capacity(limit + 1);
-    let mut total = 0;
-    let mut start = 0;
-    let mut previous = None;
-    let mut earliest_start = None;
-    let mut earlier_count = 0;
-
-    for (key, row) in sorted.into_iter() {
-        total += 1;
-
-        if query
-            .start
-            .as_ref()
-            .map(|start| &key < start)
-            .unwrap_or(true)
-        {
-            if images.len() < limit {
-                images.push(ImageData {
-                    hash: key.hash.clone().unwrap(),
-                    datetime: key.datetime,
-                    medium: match row.get::<Option<i64>, _>(2) {
-                        Some(0) => Medium::Video,
-                        Some(_) => Medium::ImageWithVideo,
-                        None => Medium::Image,
-                    },
-                    tags: row
-                        .get::<&str, _>(3)
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(Tag::from_str)
-                        .collect::<Result<HashSet<_>>>()?,
-                });
-            } else {
-                if earlier_count == 0 {
-                    earliest_start = previous;
-                }
-
-                earlier_count = (earlier_count + 1) % limit;
-            }
-        } else {
-            start += 1;
-
-            if later.len() > limit {
-                later.pop_front();
-            }
-
-            later.push_back(key.clone());
-        }
-
-        previous = Some(key);
-    }
-
-    Ok(ImagesResponse {
-        start,
-        total,
-        later_start: if later.len() > limit {
-            later.pop_front()
-        } else {
-            None
-        },
-        earliest_start,
-        images,
-    })
-}
-
-async fn apply(
-    auth: &Authorization,
-    conn: &mut SqliteConnection,
-    patches: &[Patch],
-) -> Result<Response<Body>> {
-    if !auth.may_patch {
-        return Ok(response()
-            .status(StatusCode::UNAUTHORIZED)
-            .body(Body::empty())?);
-    }
-
-    if let Some(filter) = &auth.filter {
-        for patch in patches {
-            if !(filter.evaluate(&patch.tag) && visible(conn, filter, &patch.hash).await?) {
-                return Ok(response()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .body(Body::empty())?);
-            }
-        }
-    }
-
-    for patch in patches {
-        if let Some(category) = &patch.tag.category {
-            let category = category.deref();
-
-            if let Some(row) =
-                sqlx::query!("SELECT immutable FROM categories WHERE name = ?1", category)
-                    .fetch_optional(&mut *conn)
-                    .await?
-            {
-                if row.immutable != 0 {
-                    return Ok(response()
-                        .status(StatusCode::UNAUTHORIZED)
-                        .body(Body::empty())?);
-                }
-            }
-        }
-    }
-
-    for patch in patches {
-        let value = patch.tag.value.deref();
-
-        match patch.action {
-            Action::Add => {
-                let category = patch.tag.category.as_deref();
-
-                sqlx::query!(
-                    "INSERT OR IGNORE INTO tags (hash, tag, category) VALUES (?1, ?2, ?3)",
-                    patch.hash,
-                    value,
-                    category
-                )
-                .execute(&mut *conn)
-                .await?;
-            }
-
-            Action::Remove => {
-                if let Some(category) = &patch.tag.category {
-                    let category = category.deref();
-
-                    sqlx::query!(
-                        "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category = ?3",
-                        patch.hash,
-                        value,
-                        category
-                    )
-                    .execute(&mut *conn)
-                    .await?;
-                } else {
-                    sqlx::query!(
-                        "DELETE FROM tags WHERE hash = ?1 AND tag = ?2 AND category IS NULL",
-                        patch.hash,
-                        value
-                    )
-                    .execute(&mut *conn)
-                    .await?;
-                }
-            }
-        }
-    }
-
-    Ok(response().body(Body::empty())?)
-}
-
-pub struct FileData {
-    pub path: String,
-    pub video_offset: Option<i64>,
-}
-
-#[allow(clippy::eval_order_dependence)]
-async fn file_data(conn: &mut SqliteConnection, path: &str) -> Result<FileData> {
-    if let (Some(path), Some(image)) = (
-        sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
-            .fetch_optional(&mut *conn)
-            .await?,
-        sqlx::query!(
-            "SELECT video_offset FROM images WHERE hash = ?1 LIMIT 1",
-            path
-        )
-        .fetch_optional(&mut *conn)
-        .await?,
-    ) {
-        Ok(FileData {
-            path: path.path,
-            video_offset: image.video_offset,
-        })
-    } else {
-        Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
-    }
-}
-
-fn orthagonal(orientation: Orientation) -> bool {
-    matches!(
-        orientation,
-        Orientation::Rotate90HorizontalFlip
-            | Orientation::Rotate90
-            | Orientation::Rotate90VerticalFlip
-            | Orientation::Rotate270
-    )
-}
-
-fn bound(
-    (native_width, native_height): (u32, u32),
-    (mut bound_width, mut bound_height): (u32, u32),
-    orientation: Orientation,
-) -> (u32, u32) {
-    if orthagonal(orientation) {
-        mem::swap(&mut bound_width, &mut bound_height);
-    }
-
-    let (w, h) = if native_width * bound_height > bound_width * native_height {
-        (bound_width, (native_height * bound_width) / native_width)
-    } else {
-        ((native_width * bound_height) / native_height, bound_height)
-    };
-
-    (w, h)
-}
-
-async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
-    let full_path = [image_dir, path].iter().collect::<PathBuf>();
-
-    let lowercase = path.to_lowercase();
-
-    if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
-        let output = Command::new("ffmpeg")
-            .arg("-i")
-            .arg(full_path)
-            .arg("-ss")
-            .arg("00:00:00")
-            .arg("-frames:v")
-            .arg("1")
-            .arg("-f")
-            .arg("singlejpeg")
-            .arg("-")
-            .output()
-            .await?;
-
-        if output.status.success() {
-            Ok((output.stdout, ImageFormat::Jpeg))
-        } else {
-            Err(anyhow!(
-                "error running ffmpeg: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    } else {
-        let mut file = File::open(full_path).await?;
-
-        let mut buffer = Vec::new();
-
-        file.read_to_end(&mut buffer).await?;
-
-        Ok((buffer, ImageFormat::Jpeg))
-    }
-}
-
-pub async fn preload_cache(
-    image_lock: &AsyncRwLock<()>,
-    image_dir: &str,
-    file_data: &FileData,
-    cache_dir: &str,
-    hash: &str,
-) -> Result<()> {
-    for size in &[Size::Small, Size::Large] {
-        get_variant(
-            image_lock,
-            image_dir,
-            file_data,
-            cache_dir,
-            Variant::Still(*size),
-            hash,
-        )
-        .await?;
-
-        if file_data.video_offset.is_some() {
-            get_variant(
-                image_lock,
-                image_dir,
-                file_data,
-                cache_dir,
-                Variant::Video(*size),
-                hash,
-            )
-            .await?;
-        }
-    }
-
-    Ok(())
-}
-
-async fn get_variant(
-    image_lock: &AsyncRwLock<()>,
-    image_dir: &str,
-    file_data: &FileData,
-    cache_dir: &str,
-    variant: Variant,
-    hash: &str,
-) -> Result<(File, &'static str, u64)> {
-    match variant {
-        Variant::Still(size) => {
-            let (thumbnail, length, _) = thumbnail(
-                Some(image_lock),
-                image_dir,
-                &file_data.path,
-                cache_dir,
-                size,
-                hash,
-            )
-            .await?;
-
-            Ok((thumbnail, "image/jpeg", length))
-        }
-
-        Variant::Video(size) => {
-            if let Some(offset) = file_data.video_offset {
-                let (preview, length) = video_preview(
-                    image_lock,
-                    image_dir,
-                    &file_data.path,
-                    offset,
-                    cache_dir,
-                    size,
-                    hash,
-                )
-                .await?;
-
-                Ok((preview, "video/mp4", length))
-            } else {
-                Err(HttpError::from_slice(StatusCode::NOT_FOUND, "not found").into())
-            }
-        }
-
-        Variant::Original => {
-            let lowercase = file_data.path.to_lowercase();
-
-            let file = File::open([image_dir, &file_data.path].iter().collect::<PathBuf>()).await?;
-            let length = file.metadata().await?.len();
-
-            Ok((
-                file,
-                if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
-                    "video/mp4"
-                } else {
-                    "image/jpeg"
-                },
-                length,
-            ))
-        }
-    }
-}
-
-async fn video_scale(
-    image_dir: &str,
-    path: &str,
-    cache_dir: &str,
-    size: Size,
-    hash: &str,
-) -> Result<String> {
-    let thumbnail = thumbnail(None, image_dir, path, cache_dir, size, hash)
-        .await?
-        .2;
-
-    let orientation = task::block_in_place(|| {
-        ExifMetadata::new_from_path(&thumbnail)
-            .map(|metadata| metadata.get_orientation())
-            .unwrap_or(Orientation::Normal)
-    });
-
-    let (mut width, mut height) = task::block_in_place(|| {
-        image::load(
-            BufReader::new(std::fs::File::open(&thumbnail)?),
-            ImageFormat::Jpeg,
-        )
-        .map_err(Error::from)
-    })?
-    .dimensions();
-
-    if width % 2 != 0 {
-        width -= 1;
-    }
-
-    if height % 2 != 0 {
-        height -= 1;
-    }
-
-    if orthagonal(orientation) {
-        mem::swap(&mut width, &mut height);
-    }
-
-    Ok(format!("scale={}:{},setsar=1:1", width, height))
-}
-
-fn audio_supported(entry: &SampleEntry) -> bool {
-    static SUPPORTED_AUDIO_CODECS: &[CodecType] = &[CodecType::AAC, CodecType::MP3];
-
-    if let SampleEntry::Audio(entry) = entry {
-        SUPPORTED_AUDIO_CODECS
-            .iter()
-            .any(|&codec| codec == entry.codec_type)
-    } else {
-        false
-    }
-}
-
-struct VideoData {
-    need_audio_transcode: bool,
-    pick_video_stream: Option<usize>,
-}
-
-fn get_video_data(context: MediaContext) -> VideoData {
-    let mut audio = None;
-    let mut video = None;
-    let mut video_track_count = 0;
-
-    for track in context.tracks {
-        match track.track_type {
-            TrackType::Audio => {
-                audio = audio
-                    .and_then(|audio: Track| {
-                        if let Some(audio_descriptions) = &audio.stsd {
-                            if audio_descriptions.descriptions.iter().any(audio_supported)
-                                || track.stsd.is_none()
-                            {
-                                Some(audio)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .or(Some(track))
-            }
-
-            TrackType::Video => {
-                video_track_count += 1;
-
-                video = video
-                    .and_then(|video: Track| {
-                        if let Some(video_duration) = &video.duration {
-                            if let Some(track_duration) = &track.duration {
-                                if video_duration.0 >= track_duration.0 {
-                                    Some(video)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                Some(video)
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .or(Some(track))
-            }
-            _ => (),
-        }
-    }
-
-    VideoData {
-        need_audio_transcode: if let Some(audio) = audio {
-            if let Some(audio_descriptions) = &audio.stsd {
-                !audio_descriptions.descriptions.iter().any(audio_supported)
-            } else {
-                false
-            }
-        } else {
-            false
-        },
-
-        pick_video_stream: if video_track_count > 1 {
-            video.map(|video| video.id)
-        } else {
-            None
-        },
-    }
-}
-
-struct TempFile(Option<NamedTempFile>);
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        task::block_in_place(|| drop(self.0.take()))
-    }
-}
-
-async fn copy_from_offset(path: &Path, offset: i64) -> Result<TempFile> {
-    let mut original = File::open(path).await?;
-
-    original
-        .seek(SeekFrom::Start(offset.try_into().unwrap()))
-        .await?;
-
-    let mut tmp = TempFile(Some(task::block_in_place(NamedTempFile::new)?));
-
-    let mut buffer = vec![0; BUFFER_SIZE];
-
-    loop {
-        let count = original.read(&mut buffer[..]).await?;
-        if count == 0 {
-            break;
-        } else {
-            task::block_in_place(|| tmp.0.as_mut().unwrap().write_all(&buffer[0..count]))?;
-        }
-    }
-
-    Ok(tmp)
-}
-
-async fn video_preview(
-    image_lock: &AsyncRwLock<()>,
-    image_dir: &str,
-    path: &str,
-    offset: i64,
-    cache_dir: &str,
-    size: Size,
-    hash: &str,
-) -> Result<(File, u64)> {
-    let filename = format!("{}/video/{}/{}.mp4", cache_dir, size, hash);
-
-    let read = image_lock.read().await;
-
-    let result = File::open(&filename).await;
-
-    if let Ok(file) = result {
-        let length = file.metadata().await?.len();
-
-        Ok((file, length))
-    } else {
-        drop(read);
-
-        let _write = image_lock.write().await;
-
-        if let Some(parent) = Path::new(&filename).parent() {
-            let _ = fs::create_dir(parent).await;
-        }
-
-        let full_path = [image_dir, path].iter().collect::<PathBuf>();
-
-        let video_data = get_video_data(task::block_in_place(|| {
-            let mut file = std::fs::File::open(&full_path)?;
-
-            file.seek(SeekFrom::Start(offset.try_into().unwrap()))?;
-
-            mp4parse::read_mp4(&mut file).map_err(Error::from)
-        })?);
-
-        let output = match size {
-            Size::Small => {
-                let scale = video_scale(image_dir, path, cache_dir, Size::Small, hash).await?;
-
-                if offset == 0 {
-                    Command::new("ffmpeg")
-                        .arg("-i")
-                        .arg(&full_path)
-                        .arg("-ss")
-                        .arg("00:00:00")
-                        .arg("-to")
-                        .arg(VIDEO_PREVIEW_LENGTH_HMS)
-                        .arg("-vf")
-                        .arg(&scale)
-                        .arg("-an")
-                        .arg(&filename)
-                        .output()
-                        .await
-                } else {
-                    let tmp = copy_from_offset(&full_path, offset).await?;
-
-                    let mut command = Command::new("ffmpeg");
-
-                    command.arg("-i").arg(tmp.0.as_ref().unwrap().path());
-
-                    if let Some(id) = video_data.pick_video_stream {
-                        command.arg("-map").arg(format!("0:{}", id));
-                    }
-
-                    command
-                        .arg("-vf")
-                        .arg(&scale)
-                        .arg("-an")
-                        .arg(&filename)
-                        .output()
-                        .await
-                }
-            }
-
-            Size::Large => {
-                if offset == 0 {
-                    if video_data.need_audio_transcode {
-                        Command::new("ffmpeg")
-                            .arg("-i")
-                            .arg(&full_path)
-                            .arg("-vcodec")
-                            .arg("copy")
-                            .arg("-acodec")
-                            .arg("mp3")
-                            .arg(&filename)
-                            .output()
-                            .await
-                    } else {
-                        let file = File::open(&full_path).await?;
-                        let length = file.metadata().await?.len();
-
-                        return Ok((file, length));
-                    }
-                } else if let Some(id) = video_data.pick_video_stream {
-                    let tmp = copy_from_offset(&full_path, offset).await?;
-
-                    Command::new("ffmpeg")
-                        .arg("-i")
-                        .arg(tmp.0.as_ref().unwrap().path())
-                        .arg("-map")
-                        .arg(format!("0:{}", id))
-                        .arg("-vcodec")
-                        .arg("copy")
-                        .arg("-an")
-                        .arg(&filename)
-                        .output()
-                        .await
-                } else {
-                    let mut file = File::open(&full_path).await?;
-                    let offset = offset.try_into().unwrap();
-                    let length = file.metadata().await?.len() - offset;
-
-                    file.seek(SeekFrom::Start(offset)).await?;
-
-                    return Ok((file, length));
-                }
-            }
-        }?;
-
-        if output.status.success() {
-            let file = File::open(&filename).await?;
-            let length = file.metadata().await?.len();
-
-            Ok((file, length))
-        } else {
-            let _ = fs::remove_file(&filename).await;
-
-            Err(anyhow!(
-                "error running ffmpeg: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-}
-
-async fn thumbnail(
-    image_lock: Option<&AsyncRwLock<()>>,
-    image_dir: &str,
-    path: &str,
-    cache_dir: &str,
-    size: Size,
-    hash: &str,
-) -> Result<(File, u64, PathBuf)> {
-    let filename = format!("{}/{}/{}.jpg", cache_dir, size, hash);
-
-    let read = if let Some(image_lock) = image_lock {
-        Some(image_lock.read().await)
-    } else {
-        None
-    };
-
-    let result = File::open(&filename).await;
-
-    Ok(if let Ok(file) = result {
-        let length = file.metadata().await?.len();
-
-        (file, length, filename.into())
-    } else {
-        drop(read);
-
-        let _write = if let Some(image_lock) = image_lock {
-            Some(image_lock.write().await)
-        } else {
-            None
-        };
-
-        let (image, format) = still_image(image_dir, path).await?;
-
-        let original = image::load_from_memory_with_format(&image, format)?;
-
-        if let Some(parent) = Path::new(&filename).parent() {
-            let _ = fs::create_dir(parent).await;
-        }
-
-        {
-            let metadata = ExifMetadata::new_from_buffer(&image)
-                .map(|metadata| {
-                    let orientation = metadata.get_orientation();
-                    metadata.clear();
-                    metadata.set_orientation(orientation);
-                    metadata
-                })
-                .ok();
-
-            let (width, height) = bound(
-                original.dimensions(),
-                match size {
-                    Size::Small => SMALL_BOUNDS,
-                    Size::Large => LARGE_BOUNDS,
-                },
-                metadata
-                    .as_ref()
-                    .map(|m| m.get_orientation())
-                    .unwrap_or(Orientation::Normal),
-            );
-
-            task::block_in_place(|| {
-                original
-                    .resize(width, height, FilterType::Lanczos3)
-                    .write_to(
-                        &mut std::fs::File::create(&filename)?,
-                        ImageOutputFormat::Jpeg(JPEG_QUALITY),
-                    )?;
-
-                if let Some(metadata) = &metadata {
-                    metadata.save_to_file(&filename)?;
-                }
-
-                Ok::<_, Error>(())
-            })?;
-        }
-
-        let file = File::open(&filename).await?;
-        let length = file.metadata().await?.len();
-
-        (file, length, filename.into())
-    })
-}
-
-fn as_stream(input: impl AsyncRead + Send) -> impl Stream<Item = Result<Bytes>> + Send {
-    FramedRead::new(input, BytesCodec::new())
-        .map_ok(BytesMut::freeze)
-        .map_err(Error::from)
-}
-
-struct Range {
-    start: Option<u64>,
-    end: Option<u64>,
-}
-
-struct Ranges(Vec<Range>);
-
-impl FromStr for Ranges {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parse = |s: Option<&str>| {
-            let s = s.ok_or_else(|| anyhow!("missing separator"))?;
-            Ok::<_, Error>(if s.is_empty() {
-                None
-            } else {
-                Some(u64::from_str(s)?)
-            })
-        };
-
-        let prefix = "bytes=";
-        if let Some(body) = s.strip_prefix(prefix) {
-            Ok(Ranges(
-                body.split(',')
-                    .map(|s| {
-                        let mut split = s.trim().split('-');
-
-                        let start = parse(split.next())?;
-                        let end = parse(split.next())?;
-
-                        Ok(Range { start, end })
-                    })
-                    .collect::<Result<_>>()?,
-            ))
-        } else {
-            Err(anyhow!("expected prefix \"{}\"", prefix))
-        }
-    }
-}
-
-async fn visible(conn: &mut SqliteConnection, filter: &TagExpression, hash: &str) -> Result<bool> {
-    Ok(bind_filter_clause(
-        filter,
-        sqlx::query(&format!(
-            "SELECT 1 as x FROM tags WHERE hash = ?1 AND {}",
-            {
-                let mut buffer = String::new();
-                append_filter_clause(&mut buffer, filter);
-                buffer
-            }
-        ))
-        .bind(hash),
-    )
-    .fetch_optional(&mut *conn)
-    .await?
-    .is_some())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn image(
-    conn: &AsyncMutex<SqliteConnection>,
-    image_lock: &AsyncRwLock<()>,
-    image_dir: &str,
-    cache_dir: &str,
-    hash: &str,
-    variant: Variant,
-    if_modified_since: Option<HttpDate>,
-    ranges: Option<&Ranges>,
-) -> Result<Response<Body>> {
-    if if_modified_since.is_some() {
-        return Ok(response()
-            .status(StatusCode::NOT_MODIFIED)
-            .body(Body::empty())?);
-    }
-
-    let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
-
-    let (mut image, content_type, length) =
-        { get_variant(image_lock, image_dir, &file_data, cache_dir, variant, hash).await }?;
-
-    let cache_control = "public, max-age=31536000, immutable";
-
-    Ok(if let Some(ranges) = ranges {
-        if ranges.0.len() == 1 {
-            let range = &ranges.0[0];
-
-            let (start, end) = match (range.start, range.end) {
-                (Some(start), Some(end)) => (start, end + 1),
-                (Some(start), None) => (start, length),
-                (None, Some(end)) => (length - end, length),
-                _ => (0, length),
-            };
-
-            if start > length
-                || end > length
-                || start > end
-                || i64::try_from(start).is_err()
-                || end == 0
-            {
-                return Err(HttpError::from_slice(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "range not satisfiable",
-                )
-                .into());
-            }
-
-            image
-                .seek(SeekFrom::Current(start.try_into().unwrap()))
-                .await?;
-
-            response()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end - 1, length),
-                )
-                .header(header::CONTENT_LENGTH, end - start)
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::CACHE_CONTROL, cache_control)
-                .body(Body::wrap_stream(as_stream(image.take(end - start))))?
-        } else {
-            return Err(HttpError::from_slice(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "multiple ranges not yet supported",
-            )
-            .into());
-        }
-    } else {
-        response()
-            .header(header::CONTENT_LENGTH, length)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CACHE_CONTROL, cache_control)
-            .body(Body::wrap_stream(as_stream(image)))?
-    })
-}
-
-fn entry<'a>(
-    response: &'a mut TagsResponse,
-    parents: &HashMap<Arc<str>, Arc<str>>,
-    category: &Arc<str>,
-) -> &'a mut TagsResponse {
-    if let Some(parent) = parents.get(category) {
-        entry(response, parents, parent)
-    } else {
-        response
-    }
-    .categories
-    .entry(category.clone())
-    .or_insert_with(TagsResponse::default)
-}
-
-async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResponse> {
-    let select = format!(
-        "SELECT (SELECT parent from categories where name = t.category), \
-                (SELECT immutable from categories where name = t.category), \
-                t.category, \
-                t.tag, \
-                count(i.hash) \
-         FROM images i \
-         LEFT JOIN tags t \
-         ON i.hash = t.hash \
-         WHERE {} AND t.hash IS NOT NULL \
-         GROUP BY t.category, t.tag",
-        if let Some(filter) = &query.filter {
-            let mut buffer = String::new();
-            append_filter_clause(&mut buffer, filter);
-            buffer
-        } else {
-            "1".into()
-        }
-    );
-
-    let mut select = sqlx::query(&select);
-
-    if let Some(filter) = &query.filter {
-        select = bind_filter_clause(filter, select);
-    }
-
-    let mut parents = HashMap::new();
-    let mut category_tags = HashMap::new();
-    let mut category_immutable = HashMap::new();
-    let mut tags = HashMap::new();
-
-    let mut rows = select.fetch(&mut *conn);
-
-    while let Some(row) = rows.try_next().await? {
-        let tag = Arc::from(row.get::<&str, _>(3));
-        let count = row.get(4);
-
-        if let Some(category) = row.get::<Option<&str>, _>(2) {
-            let category = Arc::<str>::from(category);
-
-            if let Some(immutable) = row.get::<Option<bool>, _>(1) {
-                category_immutable.insert(category.clone(), immutable);
-            }
-
-            if let Some(parent) = row.get::<Option<&str>, _>(0) {
-                parents.insert(category.clone(), Arc::from(parent));
-            }
-
-            category_tags
-                .entry(category)
-                .or_insert_with(HashMap::new)
-                .insert(tag, count);
-        } else {
-            tags.insert(tag, count);
-        }
-    }
-
-    let mut response = TagsResponse {
-        immutable: None,
-        categories: HashMap::new(),
-        tags,
-    };
-
-    for (category, tags) in category_tags {
-        let entry = entry(&mut response, &parents, &category);
-
-        entry.tags = tags;
-        entry.immutable = category_immutable.get(&category).cloned();
-    }
-
-    Ok(response)
-}
-
-pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
-    let iterations = NonZeroU32::new(100_000).unwrap();
-    const SIZE: usize = ring::digest::SHA256_OUTPUT_LEN;
-    let mut hash: [u8; SIZE] = [0u8; SIZE];
-    ring::pbkdf2::derive(
-        ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
-        salt,
-        secret,
-        &mut hash,
-    );
-    base64::encode(&hash)
-}
-
-async fn authenticate(
-    conn: &AsyncMutex<SqliteConnection>,
-    request: &TokenRequest,
-    key: &[u8],
-    mutex: &AsyncMutex<()>,
-    invalid_credential_delay: Duration,
-) -> Result<Response<Body>> {
-    let _lock = mutex.lock().await;
-
-    let hash = hash_password(request.username.as_bytes(), request.password.as_bytes());
-
-    let permissions = sqlx::query!(
-        "SELECT filter, may_patch FROM users WHERE name = ?1 AND password_hash = ?2",
-        request.username,
-        hash
-    )
-    .fetch_optional(conn.lock().await.deref_mut())
-    .await?;
-
-    Ok(if let Some(permissions) = permissions {
-        let expiration = (SystemTime::now() + Duration::from_secs(TOKEN_EXPIRATION_SECS))
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-
-        let success = TokenSuccess {
-            access_token: jsonwebtoken::encode(
-                &Header::new(Algorithm::HS256),
-                &Authorization {
-                    expiration: Some(expiration),
-                    subject: Some(request.username.clone()),
-                    filter: permissions.filter.map(|s| s.parse()).transpose()?,
-                    may_patch: permissions.may_patch != 0,
-                },
-                &EncodingKey::from_secret(key),
-            )?,
-            token_type: TokenType::Jwt,
-        };
-
-        let json = serde_json::to_vec(&success)?;
-
-        response()
-            .header(header::CONTENT_LENGTH, json.len())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json))?
-    } else {
-        warn!("received invalid credentials; delaying response");
-
-        time::sleep(invalid_credential_delay).await;
-
-        let error = serde_json::to_vec(&TokenError {
-            error: TokenErrorType::UnauthorizedClient,
-            error_description: None,
-        })?;
-
-        response()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(header::CONTENT_LENGTH, error.len())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(error))?
-    })
-}
-
-async fn authenticate_anonymous(
-    conn: &AsyncMutex<SqliteConnection>,
-    key: &[u8],
-) -> Result<Response<Body>> {
-    let permissions = sqlx::query!(
-        "SELECT filter, may_patch FROM users WHERE name IS NULL AND password_hash IS NULL"
-    )
-    .fetch_optional(conn.lock().await.deref_mut())
-    .await?;
-
-    Ok(if let Some(permissions) = permissions {
-        let expiration = (SystemTime::now() + Duration::from_secs(TOKEN_EXPIRATION_SECS))
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
-
-        let success = TokenSuccess {
-            access_token: jsonwebtoken::encode(
-                &Header::new(Algorithm::HS256),
-                &Authorization {
-                    expiration: Some(expiration),
-                    subject: None,
-                    filter: permissions.filter.map(|s| s.parse()).transpose()?,
-                    may_patch: permissions.may_patch != 0,
-                },
-                &EncodingKey::from_secret(key),
-            )?,
-            token_type: TokenType::Jwt,
-        };
-
-        let json = serde_json::to_vec(&success)?;
-
-        response()
-            .header(header::CONTENT_LENGTH, json.len())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json))?
-    } else {
-        let error = serde_json::to_vec(&TokenError {
-            error: TokenErrorType::UnauthorizedClient,
-            error_description: None,
-        })?;
-
-        response()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(header::CONTENT_LENGTH, error.len())
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(error))?
-    })
-}
-
-struct Bearer {
-    pub body: String,
-}
-
-impl FromStr for Bearer {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let prefix = "Bearer ";
-        if let Some(body) = s.strip_prefix(prefix) {
-            Ok(Self { body: body.into() })
-        } else {
-            Err(anyhow!("expected prefix \"{}\"", prefix))
-        }
-    }
-}
-
-fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpError> {
-    Ok(Arc::new(
-        jsonwebtoken::decode::<Authorization>(
-            token,
-            &DecodingKey::from_secret(key),
-            &Validation::new(Algorithm::HS256),
-        )
-        .map_err(|e| {
-            warn!("received invalid token: {}: {:?}", token, e);
-
-            HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
-        })?
-        .claims,
-    ))
-}
-
 fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
     if let Some(user_filter) = &auth.filter {
         if let Some(inner) = filter.take() {
@@ -1654,19 +164,6 @@ fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
 
 fn response() -> response::Builder {
     Response::builder()
-}
-
-#[derive(Copy, Clone)]
-struct HttpDate(DateTime<Utc>);
-
-impl FromStr for HttpDate {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(HttpDate(DateTime::<Utc>::from(
-            DateTime::parse_from_rfc2822(s)?,
-        )))
-    }
 }
 
 async fn routes(
@@ -1695,7 +192,7 @@ async fn routes(
     let auth_key = if let Some(auth_key_file) = &options.auth_key_file {
         let mut key = [0u8; 32];
 
-        File::open(auth_key_file)
+        AsyncFile::open(auth_key_file)
             .await?
             .read_exact(&mut key)
             .await?;
@@ -1713,7 +210,7 @@ async fn routes(
 
             async move {
                 if let Some(token) = authorization.as_ref().map(|h| &h.body) {
-                    Ok(authorize(token, &auth_key)?)
+                    Ok(auth::authorize(token, &auth_key)?)
                 } else if let Some(default_auth) = &default_auth {
                     Ok(default_auth.clone())
                 } else {
@@ -1737,7 +234,7 @@ async fn routes(
                 let auth_mutex = auth_mutex.clone();
 
                 async move {
-                    authenticate(
+                    auth::authenticate(
                         &conn,
                         &body,
                         &auth_key,
@@ -1768,7 +265,7 @@ async fn routes(
 
                             async move {
                                 let state = serde_json::to_vec(
-                                    &images(conn.lock().await.deref_mut(), &query).await?,
+                                    &images::images(conn.lock().await.deref_mut(), &query).await?,
                                 )?;
 
                                 Ok(response()
@@ -1796,7 +293,7 @@ async fn routes(
 
                                 async move {
                                     let tags = serde_json::to_vec(
-                                        &tags(conn.lock().await.deref_mut(), &query).await?,
+                                        &tags::tags(conn.lock().await.deref_mut(), &query).await?,
                                     )?;
 
                                     Ok(response()
@@ -1832,7 +329,7 @@ async fn routes(
                                     let image_lock = image_lock.clone();
 
                                     async move {
-                                        image(
+                                        media::image(
                                             &conn,
                                             &image_lock,
                                             &options.image_directory,
@@ -1858,7 +355,7 @@ async fn routes(
                         move || {
                             let conn = conn.clone();
 
-                            async move { authenticate_anonymous(&conn, &auth_key).await }
+                            async move { auth::authenticate_anonymous(&conn, &auth_key).await }
                                 .map_err(|e| Rejection::from(HttpError::from(e)))
                         }
                     }))
@@ -1879,7 +376,8 @@ async fn routes(
                                 let conn = conn.clone();
 
                                 async move {
-                                    apply(&auth, conn.lock().await.deref_mut(), &patches).await
+                                    tags::apply(&auth, conn.lock().await.deref_mut(), &patches)
+                                        .await
                                 }
                             }
                             .map_err(move |e| {
@@ -1953,55 +451,22 @@ pub async fn serve(
     Ok(())
 }
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
-pub struct Options {
-    /// Address to which to bind
-    #[structopt(long)]
-    pub address: SocketAddrV4,
-
-    /// Directory containing source image and video files
-    #[structopt(long)]
-    pub image_directory: String,
-
-    /// Directory in which to cache lazily generated image and video variants
-    #[structopt(long)]
-    pub cache_directory: String,
-
-    /// SQLite database to create or reuse
-    #[structopt(long)]
-    pub state_file: String,
-
-    /// Directory containing static resources
-    #[structopt(long)]
-    pub public_directory: String,
-
-    /// File containing TLS certificate to use
-    #[structopt(long)]
-    pub cert_file: Option<String>,
-
-    /// File containing TLS key to use
-    #[structopt(long)]
-    pub key_file: Option<String>,
-
-    /// File containing HS256 key for signing and verifying JWTs
-    #[structopt(long)]
-    pub auth_key_file: Option<String>,
-
-    /// If set, pre-generate thumnail cache files for newly-discovered images and videos when syncing
-    #[structopt(long)]
-    pub preload_cache: bool,
-}
-
 #[cfg(test)]
 mod test {
     use {
         super::*,
+        anyhow::Error,
+        image::ImageFormat,
         image::{ImageBuffer, Rgb},
         maplit::{hashmap, hashset},
         rand::{rngs::StdRng, Rng, SeedableRng},
-        std::iter,
+        rexiv2::Metadata as ExifMetadata,
+        std::{collections::HashMap, iter},
+        tagger_shared::{
+            tag_expression::Tag, Action, ImagesResponse, TagsResponse, TokenError, TokenSuccess,
+        },
         tempfile::TempDir,
+        tokio::task,
     };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -2021,7 +486,7 @@ mod test {
         let password = "Bandersnatch";
 
         {
-            let hash = hash_password(user.as_bytes(), password.as_bytes());
+            let hash = auth::hash_password(user.as_bytes(), password.as_bytes());
 
             sqlx::query!(
                 "INSERT INTO users (name, password_hash, may_patch) VALUES (?1, ?2, 1)",
@@ -2187,7 +652,7 @@ mod test {
             })?;
         }
 
-        sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
 
         // GET /images with no authorization header should yield `OK` with an empty body since no images have been
         // tagged "public" yet.
@@ -3450,8 +1915,8 @@ mod test {
                 assert_eq!(
                     (image.width(), image.height()),
                     match size {
-                        Size::Small => SMALL_BOUNDS,
-                        Size::Large => LARGE_BOUNDS,
+                        Size::Small => media::SMALL_BOUNDS,
+                        Size::Large => media::LARGE_BOUNDS,
                         Size::Original => (image_width, image_height),
                     }
                 );

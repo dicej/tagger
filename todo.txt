@@ -1,7 +1,3 @@
-clean up
-  modularize FE and BE
-  componentize FE and minimize main
-  reduce inline template code in FE
 tests
   break them up
   video
@@ -13,9 +9,9 @@ demo site?
   run it in a docker container for isolation
 announce
 
-
-
 future improvements
+  duplicate detection (using e.g. img_hash)
+    and elimination (e.g. picking the higher-res version)
   more auto-tags
     video vs. image vs. motion photo
     gps

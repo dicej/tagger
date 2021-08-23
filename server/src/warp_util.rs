@@ -1,10 +1,11 @@
 #![deny(warnings)]
 
 use {
-    anyhow::Error,
+    anyhow::{anyhow, Error, Result},
+    chrono::{DateTime, Utc},
     hyper::StatusCode,
     serde_derive::Serialize,
-    std::{borrow::Cow, convert::Infallible},
+    std::{borrow::Cow, convert::Infallible, str::FromStr},
     warp::{
         reject::{MethodNotAllowed, Reject},
         reply, Rejection, Reply,
@@ -49,6 +50,76 @@ impl HttpError {
 }
 
 impl Reject for HttpError {}
+
+pub struct Bearer {
+    pub body: String,
+}
+
+impl FromStr for Bearer {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let prefix = "Bearer ";
+        if let Some(body) = s.strip_prefix(prefix) {
+            Ok(Self { body: body.into() })
+        } else {
+            Err(anyhow!("expected prefix \"{}\"", prefix))
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct HttpDate(DateTime<Utc>);
+
+impl FromStr for HttpDate {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(HttpDate(DateTime::<Utc>::from(
+            DateTime::parse_from_rfc2822(s)?,
+        )))
+    }
+}
+
+pub struct Range {
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+}
+
+pub struct Ranges(pub Vec<Range>);
+
+impl FromStr for Ranges {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parse = |s: Option<&str>| {
+            let s = s.ok_or_else(|| anyhow!("missing separator"))?;
+            Ok::<_, Error>(if s.is_empty() {
+                None
+            } else {
+                Some(u64::from_str(s)?)
+            })
+        };
+
+        let prefix = "bytes=";
+        if let Some(body) = s.strip_prefix(prefix) {
+            Ok(Ranges(
+                body.split(',')
+                    .map(|s| {
+                        let mut split = s.trim().split('-');
+
+                        let start = parse(split.next())?;
+                        let end = parse(split.next())?;
+
+                        Ok(Range { start, end })
+                    })
+                    .collect::<Result<_>>()?,
+            ))
+        } else {
+            Err(anyhow!("expected prefix \"{}\"", prefix))
+        }
+    }
+}
 
 pub async fn handle_rejection(rejection: Rejection) -> Result<impl Reply, Infallible> {
     let error = if rejection.is_not_found() {
