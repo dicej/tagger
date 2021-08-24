@@ -455,6 +455,7 @@ pub async fn serve(
 mod test {
     use {
         super::*,
+        crate::media::TempFile,
         anyhow::Error,
         futures::{future, TryStreamExt},
         image::ImageFormat,
@@ -466,16 +467,19 @@ mod test {
         rexiv2::Metadata as ExifMetadata,
         std::{
             collections::HashMap,
+            io::Write,
             iter,
             ops::Deref,
+            path::Path,
             sync::Once,
             time::{SystemTime, UNIX_EPOCH},
         },
         tagger_shared::{
-            tag_expression::Tag, Action, ImagesResponse, TagsResponse, TokenError, TokenSuccess,
+            tag_expression::Tag, Action, ImagesResponse, Medium, Size, TagsResponse, TokenError,
+            TokenSuccess,
         },
-        tempfile::TempDir,
-        tokio::task,
+        tempfile::{NamedTempFile, TempDir},
+        tokio::{fs, process::Command, sync::OnceCell, task},
     };
 
     const IMAGE_COUNT: u32 = 10;
@@ -490,6 +494,61 @@ mod test {
         image_dir: &'static str,
         cache_dir: &'static str,
         colors: Arc<HashMap<u32, Rgb<u8>>>,
+    }
+
+    async fn generate_media(image_dir: &Path, colors: &HashMap<u32, Rgb<u8>>) -> Result<()> {
+        for (&number, &color) in colors.deref().deref() {
+            let mut path = image_dir.to_owned();
+
+            path.push(format!("{}.jpg", number));
+
+            task::block_in_place(|| {
+                ImageBuffer::from_pixel(IMAGE_WIDTH, IMAGE_HEIGHT, color).save(&path)?;
+
+                let metadata = ExifMetadata::new_from_path(&path)?;
+
+                metadata.set_tag_string(
+                    "Exif.Image.DateTimeOriginal",
+                    &format!("2021:{:02}:01 00:00:00", number),
+                )?;
+
+                metadata.save_to_file(&path)?;
+
+                Ok::<_, Error>(())
+            })?;
+
+            if number % 2 == 0 {
+                let mut video = image_dir.to_owned();
+
+                video.push(format!("{}.mp4", number));
+
+                let output = Command::new("ffmpeg")
+                    .arg("-loop")
+                    .arg("1")
+                    .arg("-i")
+                    .arg(&path)
+                    .arg("-t")
+                    .arg("10")
+                    .arg("-timestamp")
+                    .arg(format!("2021-{:02}-01T00:00:00Z", number))
+                    .arg(&video)
+                    .output()
+                    .await?;
+
+                fs::remove_file(&path).await?;
+
+                if !output.status.success() {
+                    let _ = fs::remove_file(&video).await;
+
+                    return Err(anyhow!(
+                        "error running ffmpeg: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn init(
@@ -527,35 +586,13 @@ mod test {
             static ref IMAGE_DIR: TempDir = TempDir::new().unwrap();
             static ref CACHE_DIR: TempDir = TempDir::new().unwrap();
             static ref COLORS: Arc<HashMap<u32, Rgb<u8>>> = Arc::new(colors());
+            static ref ONCE: OnceCell<Result<()>> = OnceCell::new();
         }
 
-        {
-            static ONCE: Once = Once::new();
-
-            ONCE.call_once(|| {
-                for (&number, &color) in COLORS.deref().deref() {
-                    let mut path = IMAGE_DIR.path().to_owned();
-
-                    path.push(format!("{}.jpg", number));
-
-                    task::block_in_place(|| {
-                        ImageBuffer::from_pixel(IMAGE_WIDTH, IMAGE_HEIGHT, color).save(&path)?;
-
-                        let metadata = ExifMetadata::new_from_path(&path)?;
-
-                        metadata.set_tag_string(
-                            "Exif.Image.DateTimeOriginal",
-                            &format!("2021:{:02}:01 00:00:00", number),
-                        )?;
-
-                        metadata.save_to_file(&path)?;
-
-                        Ok::<_, Error>(())
-                    })
-                    .unwrap();
-                }
-            });
-        }
+        ONCE.get_or_init(|| generate_media(IMAGE_DIR.path(), COLORS.deref().deref()))
+            .await
+            .as_ref()
+            .unwrap();
 
         let conn = Arc::new(AsyncMutex::new(conn));
 
@@ -2189,6 +2226,9 @@ mod test {
 
         sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
 
+        // tracing::info!("image_dir is {}; sleeping...", image_dir);
+        // tokio::time::sleep(Duration::from_secs(600)).await;
+
         let token = make_token(&auth_key)?;
 
         let response = warp::test::request()
@@ -2200,22 +2240,16 @@ mod test {
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let hashes = serde_json::from_slice::<ImagesResponse>(response.body())?
+        let images = serde_json::from_slice::<ImagesResponse>(response.body())?
             .images
-            .iter()
-            .map(|data| (data.datetime, data.hash.clone()))
+            .into_iter()
+            .map(|data| (data.datetime, data))
             .collect::<HashMap<_, _>>();
 
         // The images and thumbnails should contain the colors we specified in `init`.
 
-        enum Size {
-            Small,
-            Large,
-            Original,
-        }
-
         fn close_enough(a: Rgb<u8>, b: Rgb<u8>) -> bool {
-            const EPSILON: i32 = 5;
+            const EPSILON: i32 = 10;
 
             a.0.iter()
                 .zip(b.0.iter())
@@ -2225,46 +2259,94 @@ mod test {
         let mut random = StdRng::seed_from_u64(7322);
 
         for (&number, &color) in colors.deref() {
-            for size in &[Size::Small, Size::Large, Size::Original] {
-                let response = warp::test::request()
-                    .method("GET")
-                    .path(&format!(
-                        "/image/{}/{}",
-                        match size {
-                            Size::Small => "small",
-                            Size::Large => "large",
-                            Size::Original => "original",
-                        },
-                        hashes
-                            .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
-                            .unwrap()
-                    ))
-                    .reply(&routes)
-                    .await;
+            for variant in &[
+                Variant::Still(Size::Small),
+                Variant::Still(Size::Large),
+                Variant::Video(Size::Small),
+                Variant::Video(Size::Large),
+                Variant::Original,
+            ] {
+                let data = images
+                    .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
+                    .unwrap();
 
-                assert_eq!(response.status(), StatusCode::OK);
+                if matches!(variant, Variant::Still(_) | Variant::Original)
+                    || matches!(data.medium, Medium::ImageWithVideo | Medium::Video)
+                {
+                    let response = warp::test::request()
+                        .method("GET")
+                        .path(&format!("/image/{}/{}", variant, data.hash))
+                        .reply(&routes)
+                        .await;
 
-                let image =
-                    image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)?
-                        .to_rgb8();
+                    assert_eq!(response.status(), StatusCode::OK);
 
-                assert_eq!(
-                    (image.width(), image.height()),
-                    match size {
-                        Size::Small => media::SMALL_BOUNDS,
-                        Size::Large => media::LARGE_BOUNDS,
-                        Size::Original => (IMAGE_WIDTH, IMAGE_HEIGHT),
-                    }
-                );
+                    let image = if matches!(variant, Variant::Still(_))
+                        || (matches!(variant, Variant::Original)
+                            && matches!(data.medium, Medium::Image | Medium::ImageWithVideo))
+                    {
+                        image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)
+                    } else {
+                        tracing::info!("body size is {}", response.body().len());
 
-                for _ in 0..10 {
-                    assert!(close_enough(
-                        *image.get_pixel(
+                        let mut tmp = TempFile(Some(task::block_in_place(NamedTempFile::new)?));
+
+                        task::block_in_place(|| {
+                            tmp.0.as_mut().unwrap().write_all(response.body())
+                        })?;
+
+                        let output = Command::new("ffmpeg")
+                            .arg("-i")
+                            .arg(tmp.0.as_ref().unwrap().path())
+                            .arg("-ss")
+                            .arg(format!("00:00:0{}", random.gen_range(0..4)))
+                            .arg("-frames:v")
+                            .arg("1")
+                            .arg("-f")
+                            .arg("singlejpeg")
+                            .arg("-")
+                            .output()
+                            .await?;
+
+                        if output.status.success() {
+                            tracing::info!("ffmpeg result size is {}", output.stdout.len());
+
+                            image::load_from_memory_with_format(&output.stdout, ImageFormat::Jpeg)
+                        } else {
+                            return Err(anyhow!(
+                                "error running ffmpeg: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            ));
+                        }
+                    }?
+                    .to_rgb8();
+
+                    assert_eq!(
+                        (image.width(), image.height()),
+                        match variant {
+                            Variant::Still(Size::Small) | Variant::Video(Size::Small) =>
+                                media::SMALL_BOUNDS,
+
+                            Variant::Still(Size::Large) => media::LARGE_BOUNDS,
+
+                            Variant::Original | Variant::Video(Size::Large) =>
+                                (IMAGE_WIDTH, IMAGE_HEIGHT),
+                        }
+                    );
+
+                    for _ in 0..10 {
+                        let pixel = *image.get_pixel(
                             random.gen_range(0..image.width()),
-                            random.gen_range(0..image.height())
-                        ),
-                        color
-                    ));
+                            random.gen_range(0..image.height()),
+                        );
+
+                        assert!(
+                            close_enough(pixel, color),
+                            "expected {:?}; got {:?}",
+                            color,
+                            pixel
+                        );
+                    }
                 }
             }
         }

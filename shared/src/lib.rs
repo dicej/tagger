@@ -215,6 +215,18 @@ impl FromStr for Variant {
     }
 }
 
+impl Display for Variant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Still(Size::Small) => write!(f, "small"),
+            Self::Still(Size::Large) => write!(f, "large"),
+            Self::Video(Size::Small) => write!(f, "small-video"),
+            Self::Video(Size::Large) => write!(f, "large-video"),
+            Self::Original => write!(f, "original"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Copy, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {

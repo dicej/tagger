@@ -349,7 +349,7 @@ fn get_video_data(context: MediaContext) -> VideoData {
     }
 }
 
-struct TempFile(Option<NamedTempFile>);
+pub struct TempFile(pub Option<NamedTempFile>);
 
 impl Drop for TempFile {
     fn drop(&mut self) {
@@ -405,6 +405,9 @@ async fn video_preview(
         let _write = image_lock.write().await;
 
         if let Some(parent) = Path::new(&filename).parent() {
+            if let Some(parent) = parent.parent() {
+                let _ = fs::create_dir(parent).await;
+            }
             let _ = fs::create_dir(parent).await;
         }
 
