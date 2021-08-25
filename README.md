@@ -39,6 +39,7 @@ they are added to the filesystem.
   instead)
 * User account management within the app (use the `tagger_admin` tool and/or
   SQLite CLI instead)
+* Simple image and video editing (e.g. crop, rotate, trim)
 
 ## Supported platform(s)
 
