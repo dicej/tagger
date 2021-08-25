@@ -477,7 +477,7 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
                 } else {
                     template! {
                         em {
-                            "Click images to select them"
+                            "Click images to select them (use Shift key to select an interval)"
                         }
                     }
                 })
