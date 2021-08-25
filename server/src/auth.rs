@@ -18,19 +18,19 @@ use {
     tracing::warn,
 };
 
-const TOKEN_EXPIRATION_SECS: u64 = 24 * 60 * 60;
+const TOKEN_EXPIRATION_SECS: u64 = 7 * 24 * 60 * 60;
 
 pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
-    let iterations = NonZeroU32::new(100_000).unwrap();
-    const SIZE: usize = ring::digest::SHA256_OUTPUT_LEN;
-    let mut hash: [u8; SIZE] = [0u8; SIZE];
+    let mut hash = [0u8; ring::digest::SHA256_OUTPUT_LEN];
+
     ring::pbkdf2::derive(
         ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
+        NonZeroU32::new(100_000).unwrap(),
         salt,
         secret,
         &mut hash,
     );
+
     base64::encode(&hash)
 }
 
