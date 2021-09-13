@@ -150,8 +150,8 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                         template! {
                             video(src=video_url,
                                   poster=url,
-                                  autoplay="true",
-                                  controls="true")
+                                  autoplay=true,
+                                  controls=true)
                         }
                     } else {
                         template! {

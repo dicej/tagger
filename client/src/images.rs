@@ -150,8 +150,8 @@ pub fn images(props: ImagesProps) -> Template<G> {
                         template! {
                             video(src=video_url,
                                   poster=url,
-                                  muted="true",
-                                  playsinline="true",
+                                  muted=true,
+                                  playsinline=true,
                                   class=if *selected.get() { "thumbnail selected" } else { "thumbnail" },
                                   on:mouseenter=play_video,
                                   on:mouseleave=reset_video,

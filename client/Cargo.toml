@@ -11,7 +11,7 @@ tagger-shared = { path = "../shared" }
 wasm-bindgen-futures = "0.4"
 wasm-bindgen-console-logger = "0.1"
 reqwest = { version = "0.11", features = ["json"] }
-sycamore = { git = "https://github.com/sycamore-rs/sycamore" }
+sycamore = "0.6"
 log = "0.4"
 futures = "0.3"
 anyhow = "1"

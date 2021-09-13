@@ -462,23 +462,27 @@ async fn video_preview(
 
             Size::Large => {
                 if offset == 0 {
-                    if video_data.need_audio_transcode {
-                        Command::new("ffmpeg")
-                            .arg("-i")
-                            .arg(&full_path)
-                            .arg("-vcodec")
-                            .arg("copy")
-                            .arg("-acodec")
-                            .arg("mp3")
-                            .arg(&filename)
-                            .output()
-                            .await
-                    } else {
-                        let file = AsyncFile::open(&full_path).await?;
-                        let length = file.metadata().await?.len();
-
-                        return Ok((file, length));
-                    }
+                    // Transcode video to reduce file size.
+                    //
+                    // TODO: We should first check whether the original file is already a reasonable size
+                    // (i.e. given its dimensions and duration), in which case we can skip this step and just serve
+                    // up the original file.
+                    Command::new("ffmpeg")
+                        .arg("-i")
+                        .arg(&full_path)
+                        .arg("-vcodec")
+                        .arg("libx264")
+                        .arg("-crf")
+                        .arg("24") // see https://trac.ffmpeg.org/wiki/Encode/H.264#crf
+                        .arg("-acodec")
+                        .arg(if video_data.need_audio_transcode {
+                            "mp3"
+                        } else {
+                            "copy"
+                        })
+                        .arg(&filename)
+                        .output()
+                        .await
                 } else if let Some(id) = video_data.pick_video_stream {
                     let tmp = copy_from_offset(&full_path, offset).await?;
 
