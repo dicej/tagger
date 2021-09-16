@@ -5,6 +5,8 @@ use {
         self as syc, component, template, Indexed, IndexedProps, Signal, StateHandle, Template,
     },
     tagger_shared::{ImagesResponse, Medium},
+    wasm_bindgen::JsCast,
+    web_sys::HtmlVideoElement,
 };
 
 pub enum Direction {
@@ -144,11 +146,24 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                         Medium::Image => false
                     };
 
+                    // Removing the old video from the DOM is not enough to make it stop loading and/or playing, so
+                    // we need to clear it out explicitly.  See https://stackoverflow.com/a/28060352/5327218.
+                    if let Some(video) = web_sys::window()
+                        .and_then(|w| w.document())
+                        .and_then(|d| d.get_element_by_id("video"))
+                        .and_then(|e| e.dyn_into::<HtmlVideoElement>().ok())
+                    {
+                        let _ = video.pause();
+                        let _ = video.remove_attribute("src");
+                        video.load();
+                    }
+
                     let image = if show_video {
                         let video_url = format!("{}/image/large-video/{}", root, image.hash);
 
                         template! {
                             video(src=video_url,
+                                  id="video",
                                   poster=url,
                                   autoplay=true,
                                   controls=true)
