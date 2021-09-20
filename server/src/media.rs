@@ -5,7 +5,7 @@ use {
     futures::{Stream, TryStreamExt},
     http::{header, status::StatusCode, Response},
     hyper::Body,
-    image::{imageops::FilterType, GenericImageView, ImageFormat, ImageOutputFormat},
+    image::{imageops::FilterType, GenericImageView, ImageFormat},
     mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType},
     rexiv2::{Metadata as ExifMetadata, Orientation},
     sqlx::SqliteConnection,
@@ -33,7 +33,7 @@ pub const SMALL_BOUNDS: (u32, u32) = (480, 320);
 
 pub const LARGE_BOUNDS: (u32, u32) = (1920, 1280);
 
-const JPEG_QUALITY: u8 = 90;
+const WEBP_QUALITY: f32 = 85.0;
 
 const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
 
@@ -83,13 +83,11 @@ fn bound(
         mem::swap(&mut bound_width, &mut bound_height);
     }
 
-    let (w, h) = if native_width * bound_height > bound_width * native_height {
+    if native_width * bound_height > bound_width * native_height {
         (bound_width, (native_height * bound_width) / native_width)
     } else {
         ((native_width * bound_height) / native_height, bound_height)
-    };
-
-    (w, h)
+    }
 }
 
 async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
@@ -128,6 +126,21 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
 
         Ok((buffer, ImageFormat::Jpeg))
     }
+}
+
+pub async fn preload_cache_all(
+    image_lock: &AsyncRwLock<()>,
+    image_dir: &str,
+    cache_dir: &str,
+    mut images: impl Stream<Item = Result<(String, FileData), sqlx::Error>> + Unpin,
+) -> Result<()> {
+    while let Some((hash, file_data)) = images.try_next().await? {
+        if let Err(e) = preload_cache(image_lock, image_dir, &file_data, cache_dir, &hash).await {
+            tracing::warn!("error preloading cache for {}: {:?}", hash, e);
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn preload_cache(
@@ -184,7 +197,7 @@ async fn get_variant(
             )
             .await?;
 
-            Ok((thumbnail, "image/jpeg", length))
+            Ok((thumbnail, "image/webp", length))
         }
 
         Variant::Video(size) => {
@@ -533,7 +546,7 @@ async fn thumbnail(
     size: Size,
     hash: &str,
 ) -> Result<(AsyncFile, u64, PathBuf)> {
-    let filename = format!("{}/{}/{}.jpg", cache_dir, size, hash);
+    let filename = format!("{}/{}/{}.webp", cache_dir, size, hash);
 
     let read = if let Some(image_lock) = image_lock {
         Some(image_lock.read().await)
@@ -565,14 +578,16 @@ async fn thumbnail(
         }
 
         {
-            let metadata = ExifMetadata::new_from_buffer(&image)
+            let orientation = ExifMetadata::new_from_buffer(&image)
                 .map(|metadata| {
                     let orientation = metadata.get_orientation();
                     metadata.clear();
                     metadata.set_orientation(orientation);
                     metadata
                 })
-                .ok();
+                .as_ref()
+                .map(|m| m.get_orientation())
+                .unwrap_or(Orientation::Normal);
 
             let (width, height) = bound(
                 original.dimensions(),
@@ -580,23 +595,25 @@ async fn thumbnail(
                     Size::Small => SMALL_BOUNDS,
                     Size::Large => LARGE_BOUNDS,
                 },
-                metadata
-                    .as_ref()
-                    .map(|m| m.get_orientation())
-                    .unwrap_or(Orientation::Normal),
+                orientation,
             );
 
             task::block_in_place(|| {
-                original
-                    .resize(width, height, FilterType::Lanczos3)
-                    .write_to(
-                        &mut File::create(&filename)?,
-                        ImageOutputFormat::Jpeg(JPEG_QUALITY),
-                    )?;
+                let transformed = original.resize(width, height, FilterType::Lanczos3);
 
-                if let Some(metadata) = &metadata {
-                    metadata.save_to_file(&filename)?;
-                }
+                let transformed = match orientation {
+                    Orientation::Rotate90 => transformed.rotate90(),
+                    Orientation::Rotate180 => transformed.rotate180(),
+                    Orientation::Rotate270 => transformed.rotate270(),
+                    Orientation::Normal | Orientation::Unspecified => transformed,
+                    _ => return Err(anyhow!("unsupported orientation: {:?}", orientation)),
+                };
+
+                File::create(&filename)?.write_all(
+                    &webp::Encoder::from_image(&transformed)
+                        .map_err(|e| anyhow!("{}", e))?
+                        .encode(WEBP_QUALITY),
+                )?;
 
                 Ok::<_, Error>(())
             })?;

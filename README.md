@@ -125,7 +125,7 @@ RUST_LOG=tagger=info,tagger_server=info ./target/release/tagger_server \
   --public-directory client/dist/ \
   --state-file ~/tagger/database.dat \
   --cache-directory ~/tagger/cache \
-  --preload-cache
+  --preload-policy new
 ```
 
 Then open http://localhost.com:8080 in your browser and log in using the

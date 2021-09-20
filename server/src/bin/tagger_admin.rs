@@ -1,12 +1,8 @@
 #![deny(warnings)]
 
 use {
-    anyhow::Result,
-    futures::stream::{Stream, TryStreamExt},
-    structopt::StructOpt,
-    tagger_server::FileData,
-    tagger_shared::tag_expression::TagExpression,
-    tokio::sync::RwLock as AsyncRwLock,
+    anyhow::Result, futures::stream::TryStreamExt, structopt::StructOpt, tagger_server::FileData,
+    tagger_shared::tag_expression::TagExpression, tokio::sync::RwLock as AsyncRwLock,
 };
 
 #[derive(StructOpt, Debug)]
@@ -46,31 +42,6 @@ enum Command {
         /// Image hash to generate cache files for.  If not specified, cache files are generated for all images.
         hash: Option<String>,
     },
-}
-
-async fn preload_cache(
-    image_lock: &AsyncRwLock<()>,
-    image_directory: &str,
-    cache_directory: &str,
-    mut images: impl Stream<Item = Result<(String, Option<i64>, String), sqlx::Error>> + Unpin,
-) -> Result<()> {
-    while let Some((hash, video_offset, path)) = images.try_next().await? {
-        let file_data = FileData { path, video_offset };
-
-        if let Err(e) = tagger_server::preload_cache(
-            image_lock,
-            image_directory,
-            &file_data,
-            cache_directory,
-            &hash,
-        )
-        .await
-        {
-            tracing::warn!("error preloading cache for {}: {:?}", hash, e);
-        }
-    }
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -113,7 +84,7 @@ async fn main() -> Result<()> {
             let image_lock = AsyncRwLock::new(());
 
             if let Some(hash) = hash {
-                preload_cache(
+                tagger_server::preload_cache_all(
                     &image_lock,
                     &image_directory,
                     &cache_directory,
@@ -126,11 +97,19 @@ async fn main() -> Result<()> {
                         hash
                     )
                     .fetch(&mut conn)
-                    .map_ok(|row| (row.hash, row.video_offset, row.path)),
+                    .map_ok(|row| {
+                        (
+                            row.hash,
+                            FileData {
+                                video_offset: row.video_offset,
+                                path: row.path,
+                            },
+                        )
+                    }),
                 )
                 .await
             } else {
-                preload_cache(
+                tagger_server::preload_cache_all(
                     &image_lock,
                     &image_directory,
                     &cache_directory,
@@ -141,7 +120,15 @@ async fn main() -> Result<()> {
                          ON i.hash = p.hash"
                     )
                     .fetch(&mut conn)
-                    .map_ok(|row| (row.hash, row.video_offset, row.path)),
+                    .map_ok(|row| {
+                        (
+                            row.hash,
+                            FileData {
+                                video_offset: row.video_offset,
+                                path: row.path,
+                            },
+                        )
+                    }),
                 )
                 .await
             }?;

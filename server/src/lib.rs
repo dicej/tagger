@@ -2,7 +2,7 @@
 
 use {
     crate::warp_util::{Bearer, HttpDate, HttpError, Ranges},
-    anyhow::{anyhow, Result},
+    anyhow::{anyhow, Error, Result},
     futures::future::{FutureExt, TryFutureExt},
     http::{
         header,
@@ -17,9 +17,11 @@ use {
     },
     std::{
         convert::Infallible,
+        fmt::{self, Display},
         net::SocketAddrV4,
         ops::DerefMut,
         panic::{self, AssertUnwindSafe},
+        str::FromStr,
         sync::Arc,
         time::Duration,
     },
@@ -39,7 +41,7 @@ use {
 
 pub use {
     auth::hash_password,
-    media::{preload_cache, FileData},
+    media::{preload_cache, preload_cache_all, FileData},
     sync::sync,
 };
 
@@ -53,6 +55,51 @@ mod warp_util;
 const INVALID_CREDENTIAL_DELAY_SECS: u64 = 5;
 
 const BUFFER_SIZE: usize = 16 * 1024;
+
+#[derive(Debug)]
+pub enum PreloadPolicy {
+    /// Never pre-generate thumbnails
+    None,
+
+    /// Pre-generate thumbnails for newly-discovered images only
+    New,
+
+    /// Pre-generate thumbnails for both existing and newly-discovered images
+    All,
+}
+
+impl Default for PreloadPolicy {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl Display for PreloadPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::None => "none",
+                Self::New => "new",
+                Self::All => "all",
+            }
+        )
+    }
+}
+
+impl FromStr for PreloadPolicy {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "none" => Self::None,
+            "new" => Self::New,
+            "all" => Self::All,
+            _ => return Err(anyhow!("unknown preload policy: {}", s)),
+        })
+    }
+}
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
@@ -89,9 +136,9 @@ pub struct Options {
     #[structopt(long)]
     pub auth_key_file: Option<String>,
 
-    /// If set, pre-generate thumnail cache files for newly-discovered images and videos when syncing
-    #[structopt(long)]
-    pub preload_cache: bool,
+    /// Specify whether to pre-generate thumbnails and stills
+    #[structopt(long, default_value)]
+    pub preload_policy: PreloadPolicy,
 }
 
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
@@ -641,7 +688,7 @@ mod test {
                 cert_file: None,
                 key_file: None,
                 auth_key_file: None,
-                preload_cache: false,
+                preload_policy: PreloadPolicy::None,
             }),
             auth_key,
             Duration::from_secs(0),

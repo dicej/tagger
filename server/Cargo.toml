@@ -36,6 +36,7 @@ tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time",
 tokio-util = "0.6"
 tracing = { version = "0.1", features = [ "log" ] }
 warp = { version = "0.3", features = [ "tls" ] }
+webp = "0.2"
 tagger-shared = { path = "../shared" }
 mp4parse = { git = "https://github.com/dicej/mp4parse-rust", branch = "creation_and_modification_times" }
 

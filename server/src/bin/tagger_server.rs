@@ -4,13 +4,13 @@ use {
     anyhow::{anyhow, Result},
     futures::{
         channel::mpsc::{self, Sender},
-        future, FutureExt, SinkExt, StreamExt, TryFutureExt,
+        future, stream, FutureExt, SinkExt, StreamExt, TryFutureExt, TryStreamExt,
     },
     rand::Rng,
     sqlx::SqliteConnection,
-    std::{process, sync::Arc, time::Duration},
+    std::{ops::DerefMut, process, sync::Arc, time::Duration},
     structopt::StructOpt,
-    tagger_server::Options,
+    tagger_server::{FileData, Options, PreloadPolicy},
     tokio::{
         fs::File,
         io::AsyncReadExt,
@@ -63,7 +63,10 @@ async fn sync_loop(
             &image_lock,
             &options.image_directory,
             &options.cache_directory,
-            options.preload_cache,
+            match options.preload_policy {
+                PreloadPolicy::None => false,
+                PreloadPolicy::New | PreloadPolicy::All => true,
+            },
         )
         .await?;
 
@@ -97,7 +100,7 @@ async fn sync_loop(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    pretty_env_logger::init_timed();
+    pretty_env_logger::init();
 
     let options = Arc::new(Options::from_args());
 
@@ -113,12 +116,44 @@ async fn main() -> Result<()> {
     let (restart_tx, mut restart_rx) = mpsc::channel(2);
 
     task::spawn(
-        sync_loop(
-            options.clone(),
-            conn.clone(),
-            image_lock.clone(),
-            restart_tx,
-        )
+        {
+            let conn = conn.clone();
+            let options = options.clone();
+            let image_lock = image_lock.clone();
+
+            async move {
+                if let PreloadPolicy::All = options.preload_policy {
+                    let images = sqlx::query!(
+                        "SELECT i.hash, i.video_offset, p.path \
+                             FROM images i \
+                             INNER JOIN paths p \
+                             ON i.hash = p.hash"
+                    )
+                    .fetch(conn.lock().await.deref_mut())
+                    .map_ok(|row| {
+                        (
+                            row.hash,
+                            FileData {
+                                video_offset: row.video_offset,
+                                path: row.path,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .await;
+
+                    tagger_server::preload_cache_all(
+                        &image_lock,
+                        &options.image_directory,
+                        &options.cache_directory,
+                        stream::iter(images),
+                    )
+                    .await?;
+                }
+
+                sync_loop(options, conn, image_lock, restart_tx).await
+            }
+        }
         .map_err(|e| {
             error!("sync error: {:?}", e);
             process::exit(-1)
