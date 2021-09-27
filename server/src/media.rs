@@ -254,15 +254,19 @@ async fn video_scale(
     size: Size,
     hash: &str,
 ) -> Result<String> {
-    let mut thumbnail = thumbnail(None, image_dir, path, cache_dir, size, hash)
-        .await?
-        .0;
+    let image = webp::Decoder::new(
+        &content(
+            &mut thumbnail(None, image_dir, path, cache_dir, size, hash)
+                .await?
+                .0,
+        )
+        .await?,
+    )
+    .decode()
+    .ok_or_else(|| anyhow!("invalid WebP image"))?;
 
-    let (mut width, mut height) = webp::Decoder::new(&content(&mut thumbnail).await?)
-        .decode()
-        .map(|image| image.to_image())
-        .ok_or_else(|| anyhow!("invalid WebP image"))?
-        .dimensions();
+    let mut width = image.width();
+    let mut height = image.height();
 
     if width % 2 != 0 {
         width -= 1;
