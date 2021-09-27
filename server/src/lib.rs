@@ -2273,9 +2273,6 @@ mod test {
 
         sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
 
-        // tracing::info!("image_dir is {}; sleeping...", image_dir);
-        // tokio::time::sleep(Duration::from_secs(600)).await;
-
         let token = make_token(&auth_key)?;
 
         let response = warp::test::request()
@@ -2332,7 +2329,15 @@ mod test {
                         || (matches!(variant, Variant::Original)
                             && matches!(data.medium, Medium::Image | Medium::ImageWithVideo))
                     {
-                        image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)
+                        if matches!(variant, Variant::Original) {
+                            image::load_from_memory_with_format(response.body(), ImageFormat::Jpeg)
+                                .map_err(Error::from)
+                        } else {
+                            webp::Decoder::new(response.body())
+                                .decode()
+                                .map(|image| image.to_image())
+                                .ok_or_else(|| anyhow!("invalid WebP image"))
+                        }
                     } else {
                         tracing::info!("body size is {}", response.body().len());
 
@@ -2359,6 +2364,7 @@ mod test {
                             tracing::info!("ffmpeg result size is {}", output.stdout.len());
 
                             image::load_from_memory_with_format(&output.stdout, ImageFormat::Jpeg)
+                                .map_err(Error::from)
                         } else {
                             return Err(anyhow!(
                                 "error running ffmpeg: {}",
@@ -2382,16 +2388,20 @@ mod test {
                     );
 
                     for _ in 0..10 {
-                        let pixel = *image.get_pixel(
-                            random.gen_range(0..image.width()),
-                            random.gen_range(0..image.height()),
-                        );
+                        let x = random.gen_range(0..image.width());
+                        let y = random.gen_range(0..image.height());
+
+                        let pixel = *image.get_pixel(x, y);
 
                         assert!(
                             close_enough(pixel, color),
-                            "expected {:?}; got {:?}",
+                            "expected {:?}; got {:?} for {}/{} at ({},{})",
                             color,
-                            pixel
+                            pixel,
+                            variant,
+                            data.hash,
+                            x,
+                            y
                         );
                     }
                 }

@@ -12,7 +12,7 @@ use {
     std::{
         convert::{TryFrom, TryInto},
         fs::File,
-        io::{BufReader, Seek, SeekFrom, Write},
+        io::{Seek, SeekFrom, Write},
         mem,
         ops::DerefMut,
         path::{Path, PathBuf},
@@ -239,6 +239,14 @@ async fn get_variant(
     }
 }
 
+async fn content(file: &mut AsyncFile) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+
+    file.read_to_end(&mut buffer).await?;
+
+    Ok(buffer)
+}
+
 async fn video_scale(
     image_dir: &str,
     path: &str,
@@ -246,20 +254,15 @@ async fn video_scale(
     size: Size,
     hash: &str,
 ) -> Result<String> {
-    let thumbnail = thumbnail(None, image_dir, path, cache_dir, size, hash)
+    let mut thumbnail = thumbnail(None, image_dir, path, cache_dir, size, hash)
         .await?
-        .2;
+        .0;
 
-    let orientation = task::block_in_place(|| {
-        ExifMetadata::new_from_path(&thumbnail)
-            .map(|metadata| metadata.get_orientation())
-            .unwrap_or(Orientation::Normal)
-    });
-
-    let (mut width, mut height) = task::block_in_place(|| {
-        image::load(BufReader::new(File::open(&thumbnail)?), ImageFormat::Jpeg).map_err(Error::from)
-    })?
-    .dimensions();
+    let (mut width, mut height) = webp::Decoder::new(&content(&mut thumbnail).await?)
+        .decode()
+        .map(|image| image.to_image())
+        .ok_or_else(|| anyhow!("invalid WebP image"))?
+        .dimensions();
 
     if width % 2 != 0 {
         width -= 1;
@@ -267,10 +270,6 @@ async fn video_scale(
 
     if height % 2 != 0 {
         height -= 1;
-    }
-
-    if orthagonal(orientation) {
-        mem::swap(&mut width, &mut height);
     }
 
     Ok(format!("scale={}:{},setsar=1:1", width, height))
