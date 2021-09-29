@@ -655,7 +655,7 @@ pub async fn image(
     let file_data = file_data(conn.lock().await.deref_mut(), hash).await?;
 
     let (mut image, content_type, length) =
-        { get_variant(image_lock, image_dir, &file_data, cache_dir, variant, hash).await }?;
+        get_variant(image_lock, image_dir, &file_data, cache_dir, variant, hash).await?;
 
     let cache_control = "public, max-age=31536000, immutable";
 
