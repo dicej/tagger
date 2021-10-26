@@ -120,7 +120,7 @@ Finally, run the server, e.g.
 
 ```bash
 RUST_LOG=tagger=info,tagger_server=info ./target/release/tagger_server \
-  --address 127.0.0.1:8080 \
+  --http-address 127.0.0.1:8080 \
   --image-directory ~/directory_containing_my_image_collection \
   --public-directory client/dist/ \
   --state-file ~/tagger/database.dat \

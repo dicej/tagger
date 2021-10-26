@@ -3,11 +3,12 @@
 use {
     crate::warp_util::{Bearer, HttpDate, HttpError, Ranges},
     anyhow::{anyhow, Error, Result},
-    futures::future::{FutureExt, TryFutureExt},
+    futures::future::{self, FutureExt, TryFutureExt},
     http::{
         header,
         response::{self, Response},
         status::StatusCode,
+        Uri,
     },
     hyper::Body,
     sqlx::{
@@ -36,7 +37,7 @@ use {
         sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
     },
     tracing::{info, warn},
-    warp::{Filter, Rejection, Reply},
+    warp::{host::Authority, path::FullPath, Filter, Rejection, Reply},
 };
 
 pub use {
@@ -104,9 +105,15 @@ impl FromStr for PreloadPolicy {
 #[derive(StructOpt, Debug)]
 #[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
 pub struct Options {
-    /// Address to which to bind
+    /// Address on which to listen for HTTP requests
     #[structopt(long)]
-    pub address: SocketAddrV4,
+    pub http_address: Option<SocketAddrV4>,
+
+    /// Address on which to listen for HTTPS requests
+    ///
+    /// If both `http_address` and `https_address` are set, all HTTP requests will be redirected to HTTPS.
+    #[structopt(long)]
+    pub https_address: Option<SocketAddrV4>,
 
     /// Directory containing source image and video files
     #[structopt(long)]
@@ -474,24 +481,75 @@ pub async fn serve(
     )
     .await?;
 
-    let (address, future) = if let (Some(cert), Some(key)) = (&options.cert_file, &options.key_file)
-    {
-        let server = warp::serve(routes).tls().cert_path(cert).key_path(key);
+    let (http_address, https_address, future) =
+        if let (Some(cert), Some(key), Some(https_address)) =
+            (&options.cert_file, &options.key_file, options.https_address)
+        {
+            let server = warp::serve(routes).tls().cert_path(cert).key_path(key);
 
-        // As of this writing, warp::TlsServer does not have a try_bind_ephemeral method, so we must catch panics
-        // explicitly.
-        let (address, future) = catch_unwind(AssertUnwindSafe(move || {
-            server.bind_ephemeral(options.address)
-        }))?;
+            // As of this writing, warp::TlsServer does not have a try_bind_ephemeral method, so we must catch panics
+            // explicitly.
+            let (https_address, https_future) = catch_unwind(AssertUnwindSafe(move || {
+                server.bind_ephemeral(https_address)
+            }))?;
 
-        (address, future.boxed())
-    } else {
-        let (address, future) = warp::serve(routes).try_bind_ephemeral(options.address)?;
+            if let Some(http_address) = options.http_address {
+                let redirect_all = warp::path::full().and(warp::host::optional()).and_then(
+                    |path: FullPath, authority: Option<Authority>| async move {
+                        if let Some(authority) = authority {
+                            Ok(warp::redirect(
+                                Uri::builder()
+                                    .scheme("https")
+                                    .authority(authority.host())
+                                    .path_and_query(path.as_str())
+                                    .build()
+                                    .map_err(move |e| {
+                                        warn!(
+                                            "error redirecting http://{}/{} to HTTPS: {:?}",
+                                            authority.host(),
+                                            path.as_str(),
+                                            e
+                                        );
 
-        (address, future.boxed())
-    };
+                                        Rejection::from(HttpError::from(e.into()))
+                                    })?,
+                            ))
+                        } else {
+                            Err(warp::reject::not_found())
+                        }
+                    },
+                );
 
-    info!("listening on {}", address);
+                let (http_address, http_future) =
+                    warp::serve(redirect_all).try_bind_ephemeral(http_address)?;
+
+                (
+                    Some(http_address),
+                    Some(https_address),
+                    future::select(http_future, https_future)
+                        .map(|result| result.factor_first().0)
+                        .boxed(),
+                )
+            } else {
+                (None, Some(https_address), https_future.boxed())
+            }
+        } else if let Some(http_address) = options.http_address {
+            let (http_address, future) = warp::serve(routes).try_bind_ephemeral(http_address)?;
+
+            (Some(http_address), None, future.boxed())
+        } else {
+            return Err(anyhow!(
+                "either `http_address` or `https_address` must be specified"
+            ));
+        };
+
+    if let Some(address) = http_address {
+        info!("listening on http://{}", address);
+    }
+
+    if let Some(address) = https_address {
+        info!("listening on https://{}", address);
+    }
 
     future.await;
 
@@ -680,7 +738,8 @@ mod test {
             conn,
             image_lock,
             &Arc::new(Options {
-                address: "0.0.0.0:0".parse()?,
+                http_address: Some("0.0.0.0:0".parse()?),
+                https_address: None,
                 image_directory: image_dir.to_owned(),
                 cache_directory: cache_dir.to_owned(),
                 state_file: "does-not-exist-2a1dad1c-e044-4b95-be08-3a3f72d5ac0a".to_string(),
