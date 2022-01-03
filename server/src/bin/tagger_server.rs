@@ -10,7 +10,7 @@ use {
     sqlx::SqliteConnection,
     std::{ops::DerefMut, process, sync::Arc, time::Duration},
     structopt::StructOpt,
-    tagger_server::{FileData, Options, PreloadPolicy},
+    tagger_server::{FileData, ItemData, Options, PreloadPolicy},
     tokio::{
         fs::File,
         io::AsyncReadExt,
@@ -67,6 +67,7 @@ async fn sync_loop(
                 PreloadPolicy::None => false,
                 PreloadPolicy::New | PreloadPolicy::All => true,
             },
+            options.deduplicate,
         )
         .await?;
 
@@ -124,20 +125,19 @@ async fn main() -> Result<()> {
             async move {
                 if let PreloadPolicy::All = options.preload_policy {
                     let images = sqlx::query!(
-                        "SELECT i.hash, i.video_offset, p.path \
-                             FROM images i \
-                             INNER JOIN paths p \
-                             ON i.hash = p.hash"
+                        "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
+                         FROM images i \
+                         INNER JOIN paths p \
+                         ON i.hash = p.hash \
+                         GROUP BY i.hash"
                     )
                     .fetch(conn.lock().await.deref_mut())
-                    .map_ok(|row| {
-                        (
-                            row.hash,
-                            FileData {
-                                video_offset: row.video_offset,
-                                path: row.path,
-                            },
-                        )
+                    .map_ok(|row| ItemData {
+                        hash: row.hash,
+                        file: FileData {
+                            video_offset: row.video_offset,
+                            path: row.path,
+                        },
                     })
                     .collect::<Vec<_>>()
                     .await;

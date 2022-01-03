@@ -157,6 +157,7 @@ pub struct ImageData {
     pub hash: Arc<str>,
     pub datetime: DateTime<Utc>,
     pub medium: Medium,
+    pub duplicates: Vec<Arc<str>>,
     pub tags: HashSet<Tag>,
 }
 

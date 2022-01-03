@@ -2,20 +2,22 @@ use {
     crate::warp_util::{HttpDate, HttpError, Ranges},
     anyhow::{anyhow, Error, Result},
     bytes::{Bytes, BytesMut},
-    futures::{Stream, TryStreamExt},
+    futures::{stream, Stream, StreamExt, TryStreamExt},
     http::{header, status::StatusCode, Response},
     hyper::Body,
-    image::{imageops::FilterType, GenericImageView, ImageFormat},
+    image::{imageops::FilterType, GenericImageView, ImageFormat, Rgba},
     mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType},
     rexiv2::{Metadata as ExifMetadata, Orientation},
     sqlx::SqliteConnection,
     std::{
+        collections::VecDeque,
         convert::{TryFrom, TryInto},
         fs::File,
         io::{Seek, SeekFrom, Write},
         mem,
         ops::DerefMut,
         path::{Path, PathBuf},
+        time::Duration,
     },
     tagger_shared::{Size, Variant},
     tempfile::NamedTempFile,
@@ -36,6 +38,13 @@ pub const LARGE_BOUNDS: (u32, u32) = (1920, 1280);
 const WEBP_QUALITY: f32 = 85.0;
 
 const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
+
+const MAX_AVERAGE_ABSOLUTE_DIFFERENCE: usize = 5;
+
+pub struct ItemData {
+    pub hash: String,
+    pub file: FileData,
+}
 
 pub struct FileData {
     pub path: String,
@@ -118,25 +127,208 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
             ))
         }
     } else {
-        let mut file = AsyncFile::open(full_path).await?;
-
-        let mut buffer = Vec::new();
-
-        file.read_to_end(&mut buffer).await?;
-
-        Ok((buffer, ImageFormat::Jpeg))
+        Ok((
+            content(&mut AsyncFile::open(full_path).await?).await?,
+            ImageFormat::Jpeg,
+        ))
     }
+}
+
+async fn video_track_data(path: &Path, offset: i64) -> Result<VideoTrackData> {
+    get_video_data(task::block_in_place(|| {
+        let mut file = File::open(path)?;
+
+        file.seek(SeekFrom::Start(offset.try_into().unwrap()))?;
+
+        mp4parse::read_mp4(&mut file).map_err(Error::from)
+    })?)
+    .track_data
+    .ok_or_else(|| {
+        anyhow!(
+            "unable to get video track data for {}",
+            path.to_string_lossy()
+        )
+    })
+}
+
+fn average_absolute_difference(a: &[u8], b: &[u8]) -> usize {
+    // For speed, look at only every Nth sample
+    let step = 17;
+
+    let (sum, count) = a
+        .iter()
+        .step_by(step)
+        .zip(b.iter().step_by(step))
+        .fold((0, 0), |(sum, count), (&a, &b)| {
+            ((sum + ((a as i32) - (b as i32)).abs() as usize), count + 1)
+        });
+
+    sum / count
+}
+
+async fn quality(image_dir: &str, path: &str) -> Result<u64> {
+    let full_path = [image_dir, path].iter().collect::<PathBuf>();
+
+    let lowercase = path.to_lowercase();
+
+    let (width, height) = if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
+        video_track_data(&full_path, 0).await?.dimensions
+    } else {
+        image::load_from_memory_with_format(
+            &content(&mut AsyncFile::open(full_path).await?).await?,
+            ImageFormat::Jpeg,
+        )?
+        .dimensions()
+    };
+
+    Ok(width as u64 * height as u64)
+}
+
+pub async fn deduplicate<'a>(
+    image_lock: &AsyncRwLock<()>,
+    image_dir: &str,
+    cache_dir: &str,
+    potential_duplicates: &'a [ItemData],
+) -> Result<Vec<Vec<&'a ItemData>>> {
+    if potential_duplicates.len() == 1 {
+        return Ok(vec![potential_duplicates.iter().collect()]);
+    }
+
+    let mut images = stream::iter(potential_duplicates)
+        .then(|item| async move {
+            Ok::<_, Error>((
+                item,
+                quality(image_dir, &item.file.path).await?,
+                Vec::from(
+                    &webp::Decoder::new(
+                        &content(
+                            &mut thumbnail(
+                                Some(image_lock),
+                                image_dir,
+                                &item.file.path,
+                                cache_dir,
+                                Size::Small,
+                                &item.hash,
+                            )
+                            .await?
+                            .0,
+                        )
+                        .await?,
+                    )
+                    .decode()
+                    .ok_or_else(|| anyhow!("unable to decode {}", &item.file.path))?
+                        as &[u8],
+                ),
+            ))
+        })
+        .try_collect::<VecDeque<_>>()
+        .await?;
+
+    let mut duplicates = Vec::new();
+    let mut group = Vec::new();
+
+    loop {
+        if let Some((item, quality, image)) = images.pop_front() {
+            group.push((item, quality));
+
+            let mut new_images = VecDeque::new();
+
+            loop {
+                if let Some((my_item, my_quality, my_image)) = images.pop_front() {
+                    // We calculate the average absolute difference between each channel value of each pixel to
+                    // determine whether the images are duplicates.  This is crude compared to more sophisticated
+                    // algorithms such as https://ece.uwaterloo.ca/~z70wang/research/ssim/.
+                    //
+                    // TODO: Use https://crates.io/crates/dssim-core instead of AAD here, but note that dssim-core
+                    // is licensed under the AGPL, which may be an issue for some, so it should probably only be
+                    // enabled as an optional feature.
+
+                    if average_absolute_difference(&image, &my_image)
+                        <= MAX_AVERAGE_ABSOLUTE_DIFFERENCE
+                    {
+                        group.push((my_item, my_quality));
+                    } else {
+                        new_images.push_front((my_item, my_quality, my_image));
+                    }
+                } else {
+                    group.sort_by(|(_, a), (_, b)| b.cmp(a));
+                    duplicates.push(group.iter().map(|(a, _)| *a).collect::<Vec<_>>());
+                    group = Vec::new();
+                    images = new_images;
+                    break;
+                }
+            }
+        } else {
+            break Ok(duplicates);
+        }
+    }
+}
+
+pub async fn perceptual_hash(
+    image_lock: &AsyncRwLock<()>,
+    image_dir: &str,
+    cache_dir: &str,
+    hash: &str,
+    path: &str,
+    video_offset: Option<i64>,
+) -> Result<String> {
+    const HASH_WIDTH: u32 = 8;
+    const HASH_HEIGHT: u32 = 8;
+
+    let perceptual_hash = webp::Decoder::new(
+        &content(
+            &mut thumbnail(
+                Some(image_lock),
+                image_dir,
+                path,
+                cache_dir,
+                Size::Small,
+                hash,
+            )
+            .await?
+            .0,
+        )
+        .await?,
+    )
+    .decode()
+    .ok_or_else(|| anyhow!("unable to decode {}", path))?
+    .to_image()
+    .resize_exact(HASH_WIDTH, HASH_HEIGHT, FilterType::Lanczos3)
+    .pixels()
+    .map(|(_, _, Rgba(color))| {
+        format!(
+            "{:02x}",
+            (color[0] & 0b1110_0000) | ((color[1] & 0b1110_0000) >> 3) | (color[2] >> 6)
+        )
+    })
+    .collect::<Vec<_>>()
+    .concat();
+
+    Ok(if video_offset == Some(0) {
+        format!(
+            "{}-{}",
+            perceptual_hash,
+            video_track_data(&[image_dir, path].iter().collect::<PathBuf>(), 0)
+                .await?
+                .duration
+                .as_secs()
+        )
+    } else {
+        perceptual_hash
+    })
 }
 
 pub async fn preload_cache_all(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
-    mut images: impl Stream<Item = Result<(String, FileData), sqlx::Error>> + Unpin,
+    mut images: impl Stream<Item = Result<ItemData, sqlx::Error>> + Unpin,
 ) -> Result<()> {
-    while let Some((hash, file_data)) = images.try_next().await? {
-        if let Err(e) = preload_cache(image_lock, image_dir, &file_data, cache_dir, &hash).await {
-            tracing::warn!("error preloading cache for {}: {:?}", hash, e);
+    while let Some(item) = images.try_next().await? {
+        if let Err(e) =
+            preload_cache(image_lock, image_dir, &item.file, cache_dir, &item.hash).await
+        {
+            tracing::warn!("error preloading cache for {}: {:?}", item.hash, e);
         }
     }
 
@@ -291,15 +483,20 @@ fn audio_supported(entry: &SampleEntry) -> bool {
     }
 }
 
+struct VideoTrackData {
+    dimensions: (u32, u32),
+    duration: Duration,
+    id: usize,
+}
+
 struct VideoData {
     need_audio_transcode: bool,
-    pick_video_stream: Option<usize>,
+    track_data: Option<VideoTrackData>,
 }
 
 fn get_video_data(context: MediaContext) -> VideoData {
     let mut audio = None;
     let mut video = None;
-    let mut video_track_count = 0;
 
     for track in context.tracks {
         match track.track_type {
@@ -322,8 +519,6 @@ fn get_video_data(context: MediaContext) -> VideoData {
             }
 
             TrackType::Video => {
-                video_track_count += 1;
-
                 video = video
                     .and_then(|video: Track| {
                         if let Some(video_duration) = &video.duration {
@@ -342,6 +537,7 @@ fn get_video_data(context: MediaContext) -> VideoData {
                     })
                     .or(Some(track))
             }
+
             _ => (),
         }
     }
@@ -357,11 +553,24 @@ fn get_video_data(context: MediaContext) -> VideoData {
             false
         },
 
-        pick_video_stream: if video_track_count > 1 {
-            video.map(|video| video.id)
-        } else {
-            None
-        },
+        track_data: video.map(|video| VideoTrackData {
+            dimensions: video
+                .tkhd
+                .map(|tkhd| (tkhd.width, tkhd.height))
+                .unwrap_or((0, 0)),
+
+            duration: Duration::from_nanos(
+                video
+                    .duration
+                    .zip(video.timescale)
+                    .and_then(|(duration, timescale)| {
+                        duration.0.checked_mul(1_000_000_000 / timescale.0)
+                    })
+                    .unwrap_or(0),
+            ),
+
+            id: video.id,
+        }),
     }
 }
 
@@ -462,8 +671,8 @@ async fn video_preview(
 
                     command.arg("-i").arg(tmp.0.as_ref().unwrap().path());
 
-                    if let Some(id) = video_data.pick_video_stream {
-                        command.arg("-map").arg(format!("0:{}", id));
+                    if let Some(track_data) = video_data.track_data {
+                        command.arg("-map").arg(format!("0:{}", track_data.id));
                     }
 
                     command
@@ -499,14 +708,14 @@ async fn video_preview(
                         .arg(&filename)
                         .output()
                         .await
-                } else if let Some(id) = video_data.pick_video_stream {
+                } else if let Some(track_data) = video_data.track_data {
                     let tmp = copy_from_offset(&full_path, offset).await?;
 
                     Command::new("ffmpeg")
                         .arg("-i")
                         .arg(tmp.0.as_ref().unwrap().path())
                         .arg("-map")
-                        .arg(format!("0:{}", id))
+                        .arg(format!("0:{}", track_data.id))
                         .arg("-vcodec")
                         .arg("copy")
                         .arg("-an")
@@ -659,9 +868,9 @@ pub async fn image(
 
     let cache_control = "public, max-age=31536000, immutable";
 
-    Ok(if let Some(ranges) = ranges {
-        if ranges.0.len() == 1 {
-            let range = &ranges.0[0];
+    Ok(if let Some(Ranges(ranges)) = ranges {
+        if ranges.len() == 1 {
+            let range = &ranges[0];
 
             let (start, end) = match (range.start, range.end) {
                 (Some(start), Some(end)) => (start, end + 1),

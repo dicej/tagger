@@ -26,13 +26,12 @@ they are added to the filesystem.
  * UI supports bulk tag/untag operations on many items at once
 * Supports multiple user accounts, each with access control based on tags
 * Automatically transcodes to web-standard codecs
-* Deduplicates identical files
+* Consolidates exact and inexact (e.g. resampled) duplicate items
 * Supports HTTP Range headers for efficient video buffering in modern browsers
 * Mobile-friendly
 
 ## Not yet supported (but maybe someday)
 
-* Inexact deduplication (e.g. resampled duplicates)
 * Automatic location tagging based on embedded GPS coordinates
 * Automatic tagging based on face recognition
 * Uploading images within the app (use e.g. [Syncthing](https://syncthing.net/)
@@ -125,7 +124,8 @@ RUST_LOG=tagger=info,tagger_server=info ./target/release/tagger_server \
   --public-directory client/dist/ \
   --state-file ~/tagger/database.dat \
   --cache-directory ~/tagger/cache \
-  --preload-policy new
+  --preload-policy new \
+  --deduplicate
 ```
 
 Then open http://localhost.com:8080 in your browser and log in using the

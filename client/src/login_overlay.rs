@@ -3,7 +3,7 @@ use {
     futures::TryFutureExt,
     reqwest::{Client, StatusCode},
     std::{ops::Deref, rc::Rc},
-    sycamore::prelude::{component, template, Signal, Template},
+    sycamore::prelude::{component, view, Signal, View},
     tagger_shared::{GrantType, TokenRequest, TokenSuccess},
     wasm_bindgen::JsCast,
     web_sys::{Event, KeyboardEvent},
@@ -20,7 +20,7 @@ pub struct LoginOverlayProps {
 }
 
 #[component(LoginOverlay<G>)]
-pub fn login_overlay(props: LoginOverlayProps) -> Template<G> {
+pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
     let LoginOverlayProps {
         root,
         client,
@@ -103,7 +103,7 @@ pub fn login_overlay(props: LoginOverlayProps) -> Template<G> {
 
     let log_in_error2 = log_in_error.clone();
 
-    template! {
+    view! {
         div(class="log-in",
             style=format!("height:{};", if *show_log_in.get() { "100%" } else { "0" }))
         {

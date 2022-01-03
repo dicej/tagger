@@ -14,7 +14,7 @@ use {
     reqwest::{Client, StatusCode},
     serde_derive::{Deserialize, Serialize},
     std::{cell::Cell, convert::TryFrom, ops::Deref, panic, rc::Rc},
-    sycamore::prelude::{self as syc, template, Signal, StateHandle},
+    sycamore::prelude::{self as syc, view, ReadSignal, Signal},
     tagger_shared::{
         tag_expression::{TagExpression, TagTree},
         Authorization, ImageKey, ImagesQuery, ImagesResponse, TokenSuccess,
@@ -33,13 +33,13 @@ mod toolbar;
 const DEFAULT_ITEMS_PER_PAGE: u32 = 100;
 
 pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'static>(
-    uri: StateHandle<String>,
+    uri: ReadSignal<String>,
     client: Client,
     token: Signal<Option<String>>,
     root: Rc<str>,
-    filter: StateHandle<TagTree>,
+    filter: ReadSignal<TagTree>,
     on_unauthorized: F,
-) -> StateHandle<T> {
+) -> ReadSignal<T> {
     let signal = Signal::new(T::default());
 
     syc::create_effect({
@@ -67,7 +67,7 @@ pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 's
                                 format!(
                                     "{}filter={}",
                                     if uri.contains('?') { '&' } else { '?' },
-                                    filter.to_string()
+                                    filter
                                 )
                             } else {
                                 String::new()
@@ -100,7 +100,7 @@ pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 's
     signal.into_handle()
 }
 
-fn watch_changes<A: Eq>(handle: StateHandle<A>, fun: impl Fn(&Rc<A>, &Rc<A>) + 'static) {
+fn watch_changes<A: Eq>(handle: ReadSignal<A>, fun: impl Fn(&Rc<A>, &Rc<A>) + 'static) {
     let mut old = handle.get();
 
     wasm_bindgen_futures::spawn_local(async move {
@@ -117,7 +117,7 @@ fn watch_changes<A: Eq>(handle: StateHandle<A>, fun: impl Fn(&Rc<A>, &Rc<A>) + '
 }
 
 fn fold_changes<A: Eq, B>(
-    handle: StateHandle<A>,
+    handle: ReadSignal<A>,
     signal: Signal<B>,
     fun: impl Fn(Rc<B>, Rc<A>) -> B + 'static,
 ) {
@@ -127,10 +127,10 @@ fn fold_changes<A: Eq, B>(
 }
 
 fn fold<A, B>(
-    handle: StateHandle<A>,
+    handle: ReadSignal<A>,
     init: B,
     fun: impl Fn(Rc<B>, Rc<A>) -> B + 'static,
-) -> StateHandle<B> {
+) -> ReadSignal<B> {
     let signal = Signal::new(init);
 
     syc::create_effect({
@@ -576,7 +576,7 @@ fn main() -> Result<()> {
     };
 
     sycamore::render(move || {
-        template! {
+        view! {
             ImageOverlay(image_overlay)
 
             LoginOverlay(login_overlay)

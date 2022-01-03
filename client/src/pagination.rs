@@ -1,7 +1,7 @@
 use {
     crate::images::ImagesState,
     std::convert::TryFrom,
-    sycamore::prelude::{component, template, Signal, StateHandle, Template},
+    sycamore::prelude::{component, view, ReadSignal, Signal, View},
     tagger_shared::{ImageKey, ImagesResponse},
 };
 
@@ -35,14 +35,14 @@ fn page_end(props: &PaginationProps) {
 
 #[derive(Clone)]
 pub struct PaginationProps {
-    pub images: StateHandle<ImagesState>,
+    pub images: ReadSignal<ImagesState>,
     pub start: Signal<Option<ImageKey>>,
     pub show_message_on_zero: bool,
 }
 
 #[component(Pagination<G>)]
-pub fn pagination(props: PaginationProps) -> Template<G> {
-    template! {
+pub fn pagination(props: PaginationProps) -> View<G> {
+    view! {
         span(class="pagination") {
             ({
                 let images = props.images.get();
@@ -50,13 +50,13 @@ pub fn pagination(props: PaginationProps) -> Template<G> {
 
                 if total == 0 {
                     if props.show_message_on_zero {
-                        template! {
+                        view! {
                             em {
                                 "No images match current filter"
                             }
                         }
                     } else {
-                        template! { }
+                        view! { }
                     }
                 } else {
                     let count = u32::try_from(images.response.images.len()).unwrap();
@@ -78,7 +78,7 @@ pub fn pagination(props: PaginationProps) -> Template<G> {
                     let props3 = props.clone();
                     let props4 = props.clone();
 
-                    template! {
+                    view! {
                         i(class="fa fa-angle-double-left big start",
                           on:click=move |_| page_start(&props1),
                           style=left_style) " "

@@ -1,8 +1,12 @@
 #![deny(warnings)]
 
 use {
-    anyhow::Result, futures::stream::TryStreamExt, structopt::StructOpt, tagger_server::FileData,
-    tagger_shared::tag_expression::TagExpression, tokio::sync::RwLock as AsyncRwLock,
+    anyhow::Result,
+    futures::stream::TryStreamExt,
+    structopt::StructOpt,
+    tagger_server::{FileData, ItemData},
+    tagger_shared::tag_expression::TagExpression,
+    tokio::sync::RwLock as AsyncRwLock,
 };
 
 #[derive(StructOpt, Debug)]
@@ -89,22 +93,21 @@ async fn main() -> Result<()> {
                     &image_directory,
                     &cache_directory,
                     sqlx::query!(
-                        "SELECT i.hash, i.video_offset, p.path \
+                        "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
                          FROM images i \
                          INNER JOIN paths p \
                          ON i.hash = p.hash \
-                         WHERE i.hash = ?1",
+                         WHERE i.hash = ?1 \
+                         GROUP BY i.hash",
                         hash
                     )
                     .fetch(&mut conn)
-                    .map_ok(|row| {
-                        (
-                            row.hash,
-                            FileData {
-                                video_offset: row.video_offset,
-                                path: row.path,
-                            },
-                        )
+                    .map_ok(|row| ItemData {
+                        hash: row.hash,
+                        file: FileData {
+                            video_offset: row.video_offset,
+                            path: row.path,
+                        },
                     }),
                 )
                 .await
@@ -114,20 +117,19 @@ async fn main() -> Result<()> {
                     &image_directory,
                     &cache_directory,
                     sqlx::query!(
-                        "SELECT i.hash, i.video_offset, p.path \
+                        "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
                          FROM images i \
                          INNER JOIN paths p \
-                         ON i.hash = p.hash"
+                         ON i.hash = p.hash \
+                         GROUP BY i.hash"
                     )
                     .fetch(&mut conn)
-                    .map_ok(|row| {
-                        (
-                            row.hash,
-                            FileData {
-                                video_offset: row.video_offset,
-                                path: row.path,
-                            },
-                        )
+                    .map_ok(|row| ItemData {
+                        hash: row.hash,
+                        file: FileData {
+                            video_offset: row.video_offset,
+                            path: row.path,
+                        },
                     }),
                 )
                 .await

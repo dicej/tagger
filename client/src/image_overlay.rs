@@ -2,7 +2,7 @@ use {
     crate::images::ImagesState,
     std::{convert::TryFrom, rc::Rc},
     sycamore::prelude::{
-        self as syc, component, template, Indexed, IndexedProps, Signal, StateHandle, Template,
+        self as syc, component, view, Indexed, IndexedProps, ReadSignal, Signal, View,
     },
     tagger_shared::{ImagesResponse, Medium},
     wasm_bindgen::JsCast,
@@ -24,12 +24,12 @@ pub enum Select {
 pub struct ImageOverlayProps {
     pub root: Rc<str>,
     pub overlay_image: Signal<Option<usize>>,
-    pub images: StateHandle<ImagesState>,
+    pub images: ReadSignal<ImagesState>,
     pub next_overlay_image: Rc<dyn Fn(Direction)>,
 }
 
 #[component(ImageOverlay<G>)]
-pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
+pub fn image_overlay(props: ImageOverlayProps) -> View<G> {
     let ImageOverlayProps {
         root,
         overlay_image,
@@ -68,7 +68,7 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
         }
     });
 
-    template! {
+    view! {
         div(class="overlay",
             style=format!("height:{};", if *overlay_image_visible.get() { "100%" } else { "0" }))
         {
@@ -90,7 +90,7 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                         iterable: Signal::new(vec).into_handle(),
 
                         template: |tag| {
-                            template! {
+                            view! {
                                 span(class="tag") {
                                     (tag)
                                 }
@@ -102,12 +102,12 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
 
                     let play_button = match medium {
                         Medium::ImageWithVideo => {
-                            template! {
+                            view! {
                                 i(class=format!("big play fa {}", if playing { "fa-stop" } else { "fa-play" }),
                                   on:click=toggle_playing.clone())
                             }
                         }
-                        Medium::Image | Medium::Video => template! {}
+                        Medium::Image | Medium::Video => view! {}
                     };
 
                     let count = u32::try_from(images.response.images.len()).unwrap();
@@ -119,23 +119,23 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                     let left = if have_left {
                         let next_overlay_image = next_overlay_image.clone();
 
-                        template! {
+                        view! {
                             i(class="fa fa-angle-left big left",
                               on:click=move |_| next_overlay_image(Direction::Left))
                         }
                     } else {
-                        template! {}
+                        view! {}
                     };
 
                     let right = if have_right {
                         let next_overlay_image = next_overlay_image.clone();
 
-                        template! {
+                        view! {
                             i(class="fa fa-angle-right big right",
                               on:click=move |_| next_overlay_image(Direction::Right))
                         }
                     } else {
-                        template! {}
+                        view! {}
                     };
 
                     let original_url = format!("{}/image/original/{}", root, image.hash);
@@ -161,7 +161,7 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                     let image = if show_video {
                         let video_url = format!("{}/image/large-video/{}", root, image.hash);
 
-                        template! {
+                        view! {
                             video(src=video_url,
                                   id="video",
                                   poster=url,
@@ -169,12 +169,12 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                                   controls=true)
                         }
                     } else {
-                        template! {
+                        view! {
                             img(src=url)
                         }
                     };
 
-                    template! {
+                    view! {
                         (left) (right) (play_button) (image) span(class="tags") {
                             Indexed(tags)
                         }
@@ -184,10 +184,10 @@ pub fn image_overlay(props: ImageOverlayProps) -> Template<G> {
                         }
                     }
                 } else {
-                    template! {}
+                    view! {}
                 }
             } else {
-                template! {}
+                view! {}
             })
         }
     }

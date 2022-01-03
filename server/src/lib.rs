@@ -1,3 +1,24 @@
+//! Tagger server
+//!
+//! This crate contains the Tagger server, which is responsible for:
+//!
+//!  * Authenticating and authorizing client HTTPS requests: [auth]
+//!
+//!  * Handling tag queries and updates: [tags]
+//!
+//!  * Handling media item metadata queries based on tag expressions: [images]
+//!
+//!  * Periodically syncing the media database with the filesystem: [sync]
+//!
+//!  * Generating and caching preview images and video clips: [media]
+//!
+//!  * Detecting duplicate media items: [media] and [sync::deduplicate]
+//!
+//!  * Handling media item content requests: [media::image]
+//!
+//! This top-level module ties all of the above together and hosts the [Warp](https://crates.io/crates/warp)
+//! routing rules, configuration options, tests, et cetera.
+
 #![deny(warnings)]
 
 use {
@@ -42,7 +63,7 @@ use {
 
 pub use {
     auth::hash_password,
-    media::{preload_cache, preload_cache_all, FileData},
+    media::{preload_cache, preload_cache_all, FileData, ItemData},
     sync::sync,
 };
 
@@ -146,6 +167,12 @@ pub struct Options {
     /// Specify whether to pre-generate thumbnails and stills
     #[structopt(long, default_value)]
     pub preload_policy: PreloadPolicy,
+
+    /// Specify whether to identify inexact duplicates (e.g. resampled images and videos)
+    ///
+    /// Note that exact duplicates (files which match byte-for-byte) are always automatically deduplicated.
+    #[structopt(long)]
+    pub deduplicate: bool,
 }
 
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
@@ -587,9 +614,23 @@ mod test {
         tokio::{fs, process::Command, sync::OnceCell, task},
     };
 
-    const IMAGE_COUNT: u32 = 10;
-    const IMAGE_WIDTH: u32 = 480;
-    const IMAGE_HEIGHT: u32 = 320;
+    const MEDIA_COUNT: u32 = 10;
+    const DUPLICATE_IMAGE_COUNT: u32 = 3;
+    const DUPLICATE_VIDEO_COUNT: u32 = 3;
+    const BASE_IMAGE_WIDTH: u32 = 480;
+    const BASE_IMAGE_HEIGHT: u32 = 320;
+
+    #[derive(Copy, Clone)]
+    enum TestMedium {
+        Image,
+        Video,
+    }
+
+    #[derive(Copy, Clone)]
+    struct MediumInfo {
+        medium: TestMedium,
+        color: Rgb<u8>,
+    }
 
     struct TestState<F> {
         conn: Arc<AsyncMutex<SqliteConnection>>,
@@ -598,17 +639,26 @@ mod test {
         image_lock: Arc<AsyncRwLock<()>>,
         image_dir: &'static str,
         cache_dir: &'static str,
-        colors: Arc<HashMap<u32, Rgb<u8>>>,
+        info: Arc<HashMap<u32, MediumInfo>>,
     }
 
-    async fn generate_media(image_dir: &Path, colors: &HashMap<u32, Rgb<u8>>) -> Result<()> {
-        for (&number, &color) in colors.deref().deref() {
+    fn dimensions(number: u32) -> (u32, u32) {
+        (
+            BASE_IMAGE_WIDTH + ((BASE_IMAGE_WIDTH * number) / 40),
+            BASE_IMAGE_HEIGHT + ((BASE_IMAGE_HEIGHT * number) / 40),
+        )
+    }
+
+    async fn generate_media(image_dir: &Path, info: &HashMap<u32, MediumInfo>) -> Result<()> {
+        for (&number, info) in info {
             let mut path = image_dir.to_owned();
 
             path.push(format!("{}.jpg", number));
 
             task::block_in_place(|| {
-                ImageBuffer::from_pixel(IMAGE_WIDTH, IMAGE_HEIGHT, color).save(&path)?;
+                let (width, height) = dimensions(number);
+
+                ImageBuffer::from_pixel(width, height, info.color).save(&path)?;
 
                 let metadata = ExifMetadata::new_from_path(&path)?;
 
@@ -622,7 +672,7 @@ mod test {
                 Ok::<_, Error>(())
             })?;
 
-            if number % 2 == 0 {
+            if let TestMedium::Video = info.medium {
                 let mut video = image_dir.to_owned();
 
                 video.push(format!("{}.mp4", number));
@@ -673,28 +723,56 @@ mod test {
             sqlx::query(statement).execute(&mut conn).await?;
         }
 
-        fn colors() -> HashMap<u32, Rgb<u8>> {
+        fn info() -> HashMap<u32, MediumInfo> {
             let mut random = StdRng::seed_from_u64(42);
 
-            (1..=IMAGE_COUNT)
-                .map(|number| {
-                    (
-                        number,
-                        Rgb([random.gen::<u8>(), random.gen(), random.gen()]),
-                    )
+            let mut random_color = || Rgb([random.gen::<u8>(), random.gen(), random.gen()]);
+
+            let duplicate_color = random_color();
+
+            iter::repeat_with(random_color)
+                .enumerate()
+                .map(|(index, color)| MediumInfo {
+                    medium: if index % 2 == 0 {
+                        TestMedium::Image
+                    } else {
+                        TestMedium::Video
+                    },
+                    color,
                 })
-                .collect::<HashMap<_, _>>()
+                .take(
+                    (MEDIA_COUNT - (DUPLICATE_IMAGE_COUNT + DUPLICATE_VIDEO_COUNT))
+                        .try_into()
+                        .unwrap(),
+                )
+                .chain(
+                    iter::repeat(MediumInfo {
+                        medium: TestMedium::Image,
+                        color: duplicate_color,
+                    })
+                    .take(DUPLICATE_IMAGE_COUNT.try_into().unwrap()),
+                )
+                .chain(
+                    iter::repeat(MediumInfo {
+                        medium: TestMedium::Video,
+                        color: duplicate_color,
+                    })
+                    .take(DUPLICATE_VIDEO_COUNT.try_into().unwrap()),
+                )
+                .enumerate()
+                .map(|(index, info)| ((index + 1).try_into().unwrap(), info))
+                .collect()
         }
 
         lazy_static! {
             static ref IMAGE_LOCK: Arc<AsyncRwLock<()>> = Arc::new(AsyncRwLock::new(()));
             static ref IMAGE_DIR: TempDir = TempDir::new().unwrap();
             static ref CACHE_DIR: TempDir = TempDir::new().unwrap();
-            static ref COLORS: Arc<HashMap<u32, Rgb<u8>>> = Arc::new(colors());
+            static ref INFO: Arc<HashMap<u32, MediumInfo>> = Arc::new(info());
             static ref ONCE: OnceCell<Result<()>> = OnceCell::new();
         }
 
-        ONCE.get_or_init(|| generate_media(IMAGE_DIR.path(), COLORS.deref().deref()))
+        ONCE.get_or_init(|| generate_media(IMAGE_DIR.path(), INFO.deref().deref()))
             .await
             .as_ref()
             .unwrap();
@@ -723,7 +801,7 @@ mod test {
             routes,
             image_dir,
             cache_dir,
-            colors: COLORS.clone(),
+            info: INFO.clone(),
         })
     }
 
@@ -748,6 +826,7 @@ mod test {
                 key_file: None,
                 auth_key_file: None,
                 preload_policy: PreloadPolicy::None,
+                deduplicate: false,
             }),
             auth_key,
             Duration::from_secs(0),
@@ -923,7 +1002,7 @@ mod test {
         assert_eq!(response.earliest_start, None);
         assert!(response.images.is_empty());
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
 
         // Let's add an anonymous user to to DB.
 
@@ -968,7 +1047,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, IMAGE_COUNT);
+        assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(response.earliest_start, None);
 
@@ -984,7 +1063,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=IMAGE_COUNT)
+            (1..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
@@ -1006,7 +1085,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, IMAGE_COUNT);
+        assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(
             response.earliest_start.map(|key| key.datetime),
@@ -1018,7 +1097,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            ((IMAGE_COUNT - 1)..=IMAGE_COUNT)
+            ((MEDIA_COUNT - 1)..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
@@ -1040,7 +1119,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 7);
-        assert_eq!(response.total, IMAGE_COUNT);
+        assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(
             response.later_start.map(|key| key.datetime),
             Some("2021-06-01T00:00:00Z".parse()?)
@@ -1090,7 +1169,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, IMAGE_COUNT);
+        assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(response.earliest_start, None);
         assert_eq!(
@@ -1099,7 +1178,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=IMAGE_COUNT)
+            (1..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     if number == 3 {
@@ -1356,7 +1435,7 @@ mod test {
 
         let response = warp::test::request()
             .method("GET")
-            .path(&format!("/images?limit={}", IMAGE_COUNT - 1))
+            .path(&format!("/images?limit={}", MEDIA_COUNT - 1))
             .header("authorization", format!("Bearer {}", token))
             .reply(&routes)
             .await;
@@ -1366,7 +1445,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, IMAGE_COUNT);
+        assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(
             response.earliest_start.map(|key| key.datetime),
@@ -1378,7 +1457,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (2..=IMAGE_COUNT)
+            (2..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
@@ -1603,7 +1682,7 @@ mod test {
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
         assert_eq!(response.start, 0);
-        assert_eq!(response.total, IMAGE_COUNT);
+        assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(response.later_start, None);
         assert_eq!(response.earliest_start, None);
         assert_eq!(
@@ -1612,7 +1691,7 @@ mod test {
                 .into_iter()
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
-            (1..=IMAGE_COUNT)
+            (1..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{:02}-01T00:00:00Z", number).parse()?,
                     match number {
@@ -1717,6 +1796,178 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn get_images_deduplicated() -> Result<()> {
+        let TestState {
+            auth_key,
+            conn,
+            routes,
+            image_lock,
+            image_dir,
+            cache_dir,
+            ..
+        } = init().await?;
+
+        let token = make_token(&auth_key)?;
+
+        // Sync with the filesystem, specifying `deduplicate = false`
+
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
+
+        // GET /images with no query parameters and with a filter-less token should yield all the images, with no
+        // images marked as duplicates
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(response.total, MEDIA_COUNT);
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
+
+        let hashes = response
+            .images
+            .iter()
+            .map(|data| (data.datetime, data.hash.clone()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            response
+                .images
+                .into_iter()
+                .map(|data| (data.datetime, (data.tags, data.duplicates)))
+                .collect::<HashMap<_, _>>(),
+            (1..=MEDIA_COUNT)
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    (
+                        hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
+                        Vec::new()
+                    )
+                )))
+                .collect::<Result<_>>()?
+        );
+
+        // Sync with the filesystem again, specifying `deduplicate = true` this time
+
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, true).await?;
+
+        // This time, GET /images should yield all the images, with the last `DUPLICATE_IMAGE_COUNT +
+        // DUPLICATE_VIDEO_COUNT` items deduplicated (i.e. all duplicates with lower resolutions become subordinate
+        // to the duplicate with the highest resolution).
+
+        let response = warp::test::request()
+            .method("GET")
+            .path("/images")
+            .header("authorization", format!("Bearer {}", token))
+            .reply(&routes)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
+
+        assert_eq!(response.start, 0);
+        assert_eq!(
+            response.total,
+            MEDIA_COUNT + 2 - (DUPLICATE_IMAGE_COUNT + DUPLICATE_VIDEO_COUNT)
+        );
+        assert_eq!(response.later_start, None);
+        assert_eq!(response.earliest_start, None);
+
+        let primary_duplicate_image = MEDIA_COUNT - DUPLICATE_VIDEO_COUNT;
+        let primary_duplicate_video = MEDIA_COUNT;
+
+        assert_eq!(
+            response
+                .images
+                .into_iter()
+                .map(|data| (data.datetime, (data.tags, data.duplicates)))
+                .collect::<HashMap<_, _>>(),
+            (1..=(MEDIA_COUNT - (DUPLICATE_IMAGE_COUNT + DUPLICATE_VIDEO_COUNT)))
+                .map(|number| Ok((
+                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    (
+                        hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
+                        Vec::new()
+                    )
+                )))
+                .chain(iter::once(Ok((
+                    format!("2021-{:02}-01T00:00:00Z", primary_duplicate_image).parse()?,
+                    (
+                        hashset![
+                            "year:2021".parse()?,
+                            format!("month:{}", primary_duplicate_image).parse()?
+                        ],
+                        vec![
+                            hashes
+                                .get(
+                                    &format!(
+                                        "2021-{:02}-01T00:00:00Z",
+                                        primary_duplicate_image - 1
+                                    )
+                                    .parse()?
+                                )
+                                .unwrap()
+                                .clone(),
+                            hashes
+                                .get(
+                                    &format!(
+                                        "2021-{:02}-01T00:00:00Z",
+                                        primary_duplicate_image - 2
+                                    )
+                                    .parse()?
+                                )
+                                .unwrap()
+                                .clone()
+                        ]
+                    )
+                ))))
+                .chain(iter::once(Ok((
+                    format!("2021-{:02}-01T00:00:00Z", primary_duplicate_video).parse()?,
+                    (
+                        hashset![
+                            "year:2021".parse()?,
+                            format!("month:{}", primary_duplicate_video).parse()?
+                        ],
+                        vec![
+                            hashes
+                                .get(
+                                    &format!(
+                                        "2021-{:02}-01T00:00:00Z",
+                                        primary_duplicate_video - 1
+                                    )
+                                    .parse()?
+                                )
+                                .unwrap()
+                                .clone(),
+                            hashes
+                                .get(
+                                    &format!(
+                                        "2021-{:02}-01T00:00:00Z",
+                                        primary_duplicate_video - 2
+                                    )
+                                    .parse()?
+                                )
+                                .unwrap()
+                                .clone()
+                        ]
+                    )
+                ))))
+                .collect::<Result<_>>()?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn patch_tags() -> Result<()> {
         let TestState {
             auth_key,
@@ -1728,7 +1979,7 @@ mod test {
             ..
         } = init().await?;
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
 
         let token = make_token(&auth_key)?;
 
@@ -1902,7 +2153,7 @@ mod test {
             ..
         } = init().await?;
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
 
         let token = make_token(&auth_key)?;
 
@@ -1989,7 +2240,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (1..=IMAGE_COUNT).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                                tags: (1..=MEDIA_COUNT).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2052,7 +2303,7 @@ mod test {
                             "month".into() => TagsResponse {
                                 immutable: Some(true),
                                 categories: HashMap::new(),
-                                tags: (1..=IMAGE_COUNT).map(|n| (Arc::from(n.to_string()), 1)).collect()
+                                tags: (1..=MEDIA_COUNT).map(|n| (Arc::from(n.to_string()), 1)).collect()
                             }
                         ],
                         tags: hashmap![
@@ -2327,10 +2578,10 @@ mod test {
             image_lock,
             image_dir,
             cache_dir,
-            colors,
+            info,
         } = init().await?;
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false).await?;
+        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
 
         let token = make_token(&auth_key)?;
 
@@ -2361,7 +2612,7 @@ mod test {
 
         let mut random = StdRng::seed_from_u64(7322);
 
-        for (&number, &color) in colors.deref() {
+        for (&number, info) in info.deref() {
             for variant in &[
                 Variant::Still(Size::Small),
                 Variant::Still(Size::Large),
@@ -2441,8 +2692,7 @@ mod test {
 
                             Variant::Still(Size::Large) => media::LARGE_BOUNDS,
 
-                            Variant::Original | Variant::Video(Size::Large) =>
-                                (IMAGE_WIDTH, IMAGE_HEIGHT),
+                            Variant::Original | Variant::Video(Size::Large) => dimensions(number),
                         }
                     );
 
@@ -2453,9 +2703,9 @@ mod test {
                         let pixel = *image.get_pixel(x, y);
 
                         assert!(
-                            close_enough(pixel, color),
+                            close_enough(pixel, info.color),
                             "expected {:?}; got {:?} for {}/{} at ({},{})",
-                            color,
+                            info.color,
                             pixel,
                             variant,
                             data.hash,

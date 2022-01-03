@@ -1,9 +1,9 @@
 [package]
 name = "tagger-server"
-description = "Image tagging webapp backend"
+description = "Image tagging web app backend"
 version = "0.1.0"
 authors = ["Joel Dice <joel.dice@gmail.com>"]
-edition = "2018"
+edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
@@ -23,7 +23,7 @@ schema = { path = "./schema" }
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
-sha2 = "0.9"
+sha2 = "0.10"
 sqlx = { version = "0.5", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 structopt = "0.3"
 thiserror = "1"

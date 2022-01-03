@@ -1,7 +1,7 @@
 use {
     std::{collections::HashMap, rc::Rc, sync::Arc},
     sycamore::prelude::{
-        self as syc, component, template, Indexed, IndexedProps, Signal, StateHandle, Template,
+        self as syc, component, view, Indexed, IndexedProps, ReadSignal, Signal, View,
     },
     tagger_shared::{ImagesResponse, Medium},
     wasm_bindgen::JsCast,
@@ -44,19 +44,20 @@ fn reset_video(event: Event) {
         if let Ok(video) = video.dyn_into::<HtmlVideoElement>() {
             let _ = video.pause();
             video.set_current_time(0.0);
+            let _ = video.load();
         }
     }
 }
 
 pub struct ImagesProps {
     pub root: Rc<str>,
-    pub selecting: StateHandle<bool>,
-    pub images: StateHandle<ImagesState>,
+    pub selecting: ReadSignal<bool>,
+    pub images: ReadSignal<ImagesState>,
     pub overlay_image: Signal<Option<usize>>,
 }
 
 #[component(Images<G>)]
-pub fn images(props: ImagesProps) -> Template<G> {
+pub fn images(props: ImagesProps) -> View<G> {
     let ImagesProps {
         root,
         selecting,
@@ -147,8 +148,9 @@ pub fn images(props: ImagesProps) -> Template<G> {
                     Medium::ImageWithVideo | Medium::Video => {
                         let video_url = format!("{}/image/small-video/{}", root, hash);
 
-                        template! {
+                        view! {
                             video(src=video_url,
+                                  autoplay=false,
                                   poster=url,
                                   muted=true,
                                   playsinline=true,
@@ -160,19 +162,19 @@ pub fn images(props: ImagesProps) -> Template<G> {
                         }
                     }
 
-                    Medium::Image => template! {
+                    Medium::Image => view! {
                         img(src=url,
                             class=if *selected.get() { "thumbnail selected" } else { "thumbnail" },
                             on:click=on_click)
                     },
                 }
             } else {
-                template! {}
+                view! {}
             }
         },
     };
 
-    template! {
+    view! {
         div {
             Indexed(images)
         }

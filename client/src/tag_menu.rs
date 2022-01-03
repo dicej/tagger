@@ -3,7 +3,7 @@ use {
     reqwest::Client,
     std::{cmp::Ordering, collections::HashMap, ops::Deref, rc::Rc, sync::Arc},
     sycamore::prelude::{
-        self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
+        self as syc, component, view, Keyed, KeyedProps, ReadSignal, Signal, View,
     },
     tagger_shared::{
         tag_expression::{Tag, TagState, TagTree},
@@ -163,7 +163,7 @@ pub struct TagMenuCommonProps {
     pub root: Rc<str>,
     pub filter: Signal<TagTree>,
     pub filter_chain: List<Tag>,
-    pub unfiltered_tags: StateHandle<TagsResponse>,
+    pub unfiltered_tags: ReadSignal<TagsResponse>,
     pub on_unauthorized: Rc<dyn Fn()>,
 }
 
@@ -173,7 +173,8 @@ struct TagSubMenuProps {
 }
 
 #[component(TagSubMenu<G>)]
-fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
+#[allow(clippy::redundant_closure)]
+fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
     let TagSubMenuProps {
         common:
             TagMenuCommonProps {
@@ -227,17 +228,17 @@ fn tag_sub_menu(props: TagSubMenuProps) -> Template<G> {
     let filter_state =
         syc::create_selector(move || filter_state(&filter_chain, filter.get().deref(), &tag));
 
-    template! {
+    view! {
         (if let FilterState::Include = *filter_state.get() {
             let tag_menu = tag_menu();
 
-            template! {
+            view! {
                 ul {
                     TagMenu(tag_menu)
                 }
             }
         } else {
-            template! {}
+            view! {}
         })
     }
 }
@@ -253,12 +254,12 @@ fn compare_numeric(a: &str, b: &str) -> Ordering {
 
 pub struct TagMenuProps {
     pub common: TagMenuCommonProps,
-    pub filtered_tags: StateHandle<TagsResponse>,
+    pub filtered_tags: ReadSignal<TagsResponse>,
     pub category: Option<Arc<str>>,
 }
 
 #[component(TagMenu<G>)]
-pub fn tag_menu(props: TagMenuProps) -> Template<G> {
+pub fn tag_menu(props: TagMenuProps) -> View<G> {
     let TagMenuProps {
         common:
             TagMenuCommonProps {
@@ -322,7 +323,7 @@ pub fn tag_menu(props: TagMenuProps) -> Template<G> {
                         category: Some(category.clone()),
                     };
 
-                    template! {
+                    view! {
                         li {
                             (category)
                             ul {
@@ -336,11 +337,11 @@ pub fn tag_menu(props: TagMenuProps) -> Template<G> {
             key: |category| category.clone(),
         };
 
-        template! {
+        view! {
             Keyed(categories)
         }
     } else {
-        template! {}
+        view! {}
     };
 
     let counts = syc::create_selector({
@@ -443,7 +444,7 @@ pub fn tag_menu(props: TagMenuProps) -> Template<G> {
 
             let filter_state2 = filter_state.clone();
 
-            template! {
+            view! {
                 li {
                     i(class=format!("fa fa-check include{}",
                                     if let FilterState::Include = *filter_state.get() {
@@ -469,7 +470,7 @@ pub fn tag_menu(props: TagMenuProps) -> Template<G> {
         key: |tag| tag.clone(),
     };
 
-    template! {
+    view! {
         ul {
             (categories)
             Keyed(tags)

@@ -9,7 +9,7 @@ use {
     reqwest::{Client, StatusCode},
     std::{collections::HashSet, ops::Deref, rc::Rc},
     sycamore::prelude::{
-        self as syc, component, template, Keyed, KeyedProps, Signal, StateHandle, Template,
+        self as syc, component, view, Keyed, KeyedProps, ReadSignal, Signal, View,
     },
     tagger_shared::{
         tag_expression::{Tag, TagExpression, TagTree},
@@ -81,15 +81,16 @@ pub struct ToolbarProps {
     pub selecting: Signal<bool>,
     pub open_log_in: Rc<dyn Fn()>,
     pub items_per_page: Signal<u32>,
-    pub selected_count: StateHandle<u32>,
+    pub selected_count: ReadSignal<u32>,
     pub filter: Signal<TagTree>,
-    pub images: StateHandle<ImagesState>,
+    pub images: ReadSignal<ImagesState>,
     pub start: Signal<Option<ImageKey>>,
     pub on_unauthorized: Rc<dyn Fn()>,
 }
 
 #[component(Toolbar<G>)]
-pub fn toolbar(props: ToolbarProps) -> Template<G> {
+#[allow(clippy::redundant_closure)]
+pub fn toolbar(props: ToolbarProps) -> View<G> {
     let ToolbarProps {
         root,
         client,
@@ -293,12 +294,12 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
                     }
                 });
 
-                template! {
+                view! {
                     span(class="selected-tag") {
                         (tag) " " (if *immutable.get() {
-                            template! {}
+                            view! {}
                         } else {
-                            template! {
+                            view! {
                                 i(class="fa fa-times-circle remove", on:click=remove.clone())
                             }
                         })
@@ -399,7 +400,7 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
     let filter = syc::create_selector(move || Option::<TagExpression>::from(filter.get().deref()));
     let filter2 = filter.clone();
 
-    template! {
+    view! {
         div {
             div(class="nav") {
                 i(class="fa fa-bars big filter", on:click=toggle_menu)
@@ -410,7 +411,7 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
                     let selecting = selecting.clone();
                     let toggle_selecting = toggle_selecting.clone();
 
-                    template! {
+                    view! {
                         i(class=format!("fa fa-th-large big select{}", if *selecting.get() {
                             " enabled"
                         } else {
@@ -419,17 +420,17 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
                           on:click=toggle_selecting)
                     }
                 } else {
-                    template! {}
+                    view! {}
                 })
             }
 
             div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
                 (if *logged_in.get() {
-                    template! {
+                    view! {
                         div(class="link", on:click=log_out.clone()) { "log out" }
                     }
                 } else {
-                    template! {
+                    view! {
                         div(class="link", on:click=open_log_in_event.clone()) { "log in" }
                     }
                 })
@@ -441,11 +442,11 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
                        on:change=set_items_per_page)
                 {
                     (match *items_per_page.get() {
-                        1000 => template! {
+                        1000 => view! {
                             option(value="100") { "100" }
                             option(value="1000", selected=true) { "1000" }
                         },
-                        _ => template! {
+                        _ => view! {
                             option(value="100", selected=true) { "100" }
                             option(value="1000") { "1000" }
                         },
@@ -457,7 +458,7 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
 
             div(style=format!("display:{};", if *selecting2.get() { "block" } else { "none" })) {
                 (if *selected.get() {
-                    template! {
+                    view! {
                         div {
                             "tags: " Keyed(KeyedProps {
                                 iterable: selected_tags.iterable.clone(),
@@ -475,7 +476,7 @@ pub fn toolbar(props: ToolbarProps) -> Template<G> {
                         }
                     }
                 } else {
-                    template! {
+                    view! {
                         em {
                             "Click images to select them (use Shift key to select an interval)"
                         }
