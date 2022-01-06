@@ -8,9 +8,9 @@ This is web app for organizing and browsing photo and video collections.  Media
 are organized by date by default, and users may add custom tags for querying and
 access control.
 
-This app doesn't (currently) support uploading images.  Instead, it watches a
-directory waiting for new media items to appear.  This is intended to work in
-tandem with e.g. [Syncthing](https://syncthing.net/) such that images from your
+This app doesn't (currently) support uploading media items.  Instead, it watches
+a directory waiting for new media items to appear.  This is intended to work in
+tandem with e.g. [Syncthing](https://syncthing.net/) such that items from your
 phone and/or other devices are continuously synced to the server running the
 `Tagger` back end.  Media items will appear in your collection automatically as
 they are added to the filesystem.
@@ -34,7 +34,7 @@ they are added to the filesystem.
 
 * Automatic location tagging based on embedded GPS coordinates
 * Automatic tagging based on face recognition
-* Uploading images within the app (use e.g. [Syncthing](https://syncthing.net/)
+* Uploading items within the app (use e.g. [Syncthing](https://syncthing.net/)
   instead)
 * User account management within the app (use the `tagger_admin` tool and/or
   SQLite CLI instead)
@@ -120,7 +120,7 @@ Finally, run the server, e.g.
 ```bash
 RUST_LOG=tagger=info,tagger_server=info ./target/release/tagger_server \
   --http-address 127.0.0.1:8080 \
-  --image-directory ~/directory_containing_my_image_collection \
+  --image-directory ~/directory_containing_my_media_collection \
   --public-directory client/dist/ \
   --state-file ~/tagger/database.dat \
   --cache-directory ~/tagger/cache \
