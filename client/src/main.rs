@@ -1,3 +1,24 @@
+//! Tagger client
+//!
+//! This crate contains the Tagger client, a single-page web application allowing users to browse a photo and video
+//! collection hosted on a Tagger server.
+//!
+//! The UI is split into the following submodules, each of which contains one or more
+//! [Sycamore](https://crates.io/crates/sycamore) components.
+//!
+//! * [login_overlay]: A simple log in overlay for authenticating with the server
+//!
+//! * [toolbar]: Container for menus, tool icons, and app status
+//!
+//! * [tag_menu]: Hierarchical widget for browsing and filtering media items by tag
+//!
+//! * [images]: Container for viewing and interacting with media item previews
+//!
+//! * [image_overlay]: Overlay for viewing one high resolution media item at a time and browsing items sequentially
+//! (e.g. a lightbox)
+//!
+//! This top-level module ties all of the above modules together and also hosts code shared by those modules.
+
 #![deny(warnings)]
 
 use {

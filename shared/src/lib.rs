@@ -1,3 +1,11 @@
+//! Tagger shared (e.g. protocol) code
+//!
+//! This crate contains code shared between the Tagger server and client crates.  Currently, it consists of the
+//! [serde](https://crates.io/crates/serde)-enabled structs and enums which define the client/server protocol.
+//!
+//! The `tag_expression` submodule defines the expression language used to query for media items by tag using
+//! boolean algebra (e.g. AND, OR, and NOT).
+
 #![deny(warnings)]
 
 use {

@@ -2,19 +2,19 @@
 //!
 //! This crate contains the Tagger server, which is responsible for:
 //!
-//!  * Authenticating and authorizing client HTTPS requests: [auth]
+//! * Authenticating and authorizing client HTTPS requests: [auth]
 //!
-//!  * Handling tag queries and updates: [tags]
+//! * Handling tag queries and updates: [tags]
 //!
-//!  * Handling media item metadata queries based on tag expressions: [images]
+//! * Handling media item metadata queries based on tag expressions: [images]
 //!
-//!  * Periodically syncing the media database with the filesystem: [sync]
+//! * Periodically syncing the media database with the filesystem: [sync]
 //!
-//!  * Generating and caching preview images and video clips: [media]
+//! * Generating and caching preview images and video clips: [media]
 //!
-//!  * Detecting duplicate media items: [media] and [sync::deduplicate]
+//! * Detecting duplicate media items: [media] and [sync::deduplicate]
 //!
-//!  * Handling media item content requests: [media::image]
+//! * Handling media item content requests: [media::image]
 //!
 //! This top-level module ties all of the above together and hosts the [Warp](https://crates.io/crates/warp)
 //! routing rules, configuration options, tests, et cetera.
