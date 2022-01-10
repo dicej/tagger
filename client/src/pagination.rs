@@ -1,3 +1,6 @@
+//! This module provides the `Pagination` component, which allows the user to browse a sequence of media thumbnails
+//! which spans more than one page.
+
 use {
     crate::images::ImagesState,
     std::convert::TryFrom,
@@ -5,16 +8,19 @@ use {
     tagger_shared::{ImageKey, ImagesResponse},
 };
 
+/// Go to the first page of the sequence
 fn page_start(props: &PaginationProps) {
     props.start.set(None);
 }
 
+/// Go to the previous page of the sequence, if there is one
 pub fn page_back(props: &PaginationProps) {
     props
         .start
         .set(props.images.get().response.later_start.clone());
 }
 
+/// Go to the next page of the sequence, if there is one
 pub fn page_forward(props: &PaginationProps) {
     let images = props.images.get();
     let ImagesResponse { start, total, .. } = *images.response;
@@ -27,19 +33,31 @@ pub fn page_forward(props: &PaginationProps) {
     }
 }
 
+/// Go to the last page of the sequence
 fn page_end(props: &PaginationProps) {
     if let Some(earliest_start) = &props.images.get().response.earliest_start {
         props.start.set(Some(earliest_start.clone()));
     }
 }
 
+/// Properties used to populate and render the `Pagination` component
 #[derive(Clone)]
 pub struct PaginationProps {
+    /// Media items to be displayed on the current page, plus metadata about how to query the server for other
+    /// pages
     pub images: ReadSignal<ImagesState>,
+
+    /// The timestamp (and possibly hash) indicating which page we should be on
+    ///
+    /// More precisely, this indicates the most recent media item we should display.
     pub start: Signal<Option<ImageKey>>,
+
+    /// Indicates whether to show a message to the user when the current sequence of thumbnails is empty
     pub show_message_on_zero: bool,
 }
 
+/// Define the `Pagination` component, which allows the user to browse a set of media thumbnails which spans more
+/// than one page.
 #[component(Pagination<G>)]
 pub fn pagination(props: PaginationProps) -> View<G> {
     view! {

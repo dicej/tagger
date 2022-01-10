@@ -1,3 +1,7 @@
+//! This module provides the [image] function, responsible for handling GET /image/.. requests, which may retrieve
+//! either original media items or derived artifacts (e.g. thumbnails) for those items.  It also provides functions
+//! and types useful for analyzing, resampling, reencoding, and deduplicating media items.
+
 use {
     crate::warp_util::{HttpDate, HttpError, Ranges},
     anyhow::{anyhow, Error, Result},
@@ -31,35 +35,56 @@ use {
     tokio_util::codec::{BytesCodec, FramedRead},
 };
 
+/// Maximum bounding box for thumbnail images and videos
 pub const SMALL_BOUNDS: (u32, u32) = (480, 320);
 
+/// Maximum bounding box for high-resolution preview images and videos
 pub const LARGE_BOUNDS: (u32, u32) = (1920, 1280);
 
+/// Empirically derived quality setting used when encoding WEBP images
+///
+/// This provides a good tradeoff between file size and image quality, with no obvious artifacts in most cases.
 const WEBP_QUALITY: f32 = 85.0;
 
+/// Maximum length in hours:minutes:seconds of video thumbnails
+///
+/// The format of this string is what FFmpeg's "-to" option expects.
 const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
 
+/// Maximum absolute difference (averaged over each per-8-bit-color-channel of all pixels) permitted when comparing
+/// two images in order to consider them duplicates of each other.
 const MAX_AVERAGE_ABSOLUTE_DIFFERENCE: usize = 5;
 
+/// Pair of a media item hash and one of the files where that item was found
 pub struct ItemData {
     pub hash: String,
     pub file: FileData,
 }
 
+/// Metadata about a media item file
 pub struct FileData {
+    /// Filesystem path where the file can be found
     pub path: String,
+
+    /// Offset from the beginning of the file where MPEG-4 data can be found
+    ///
+    /// This will be zero for MP4 files, non-zero for "motion photo" files, and `None` for images with no embedded
+    /// videos.
     pub video_offset: Option<i64>,
 }
 
+/// Find and return `FileData` for one of the files where the item with the specified `hash` was found.
+///
+/// There may be more than one such file in the database; this function will pick one arbitrarily.
 #[allow(clippy::eval_order_dependence)]
-async fn file_data(conn: &mut SqliteConnection, path: &str) -> Result<FileData> {
+async fn file_data(conn: &mut SqliteConnection, hash: &str) -> Result<FileData> {
     if let (Some(path), Some(image)) = (
-        sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", path)
+        sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", hash)
             .fetch_optional(&mut *conn)
             .await?,
         sqlx::query!(
             "SELECT video_offset FROM images WHERE hash = ?1 LIMIT 1",
-            path
+            hash
         )
         .fetch_optional(&mut *conn)
         .await?,
@@ -73,6 +98,7 @@ async fn file_data(conn: &mut SqliteConnection, path: &str) -> Result<FileData> 
     }
 }
 
+/// Return true iff the specified `orientation` is a 90 degree rotation in any direction.
 fn orthagonal(orientation: Orientation) -> bool {
     matches!(
         orientation,
@@ -83,6 +109,8 @@ fn orthagonal(orientation: Orientation) -> bool {
     )
 }
 
+/// Calculate the resized dimensions for an image using the specified bounding box, preserving aspect ratio (to
+/// within integer precision) and respecting `orientation`.
 fn bound(
     (native_width, native_height): (u32, u32),
     (mut bound_width, mut bound_height): (u32, u32),
@@ -99,6 +127,7 @@ fn bound(
     }
 }
 
+/// Produce a still image from the first frame of the specified video.
 async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageFormat)> {
     let full_path = [image_dir, path].iter().collect::<PathBuf>();
 
@@ -134,6 +163,7 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
     }
 }
 
+/// Parse the specified MPEG-4 file and extract its metadata.
 async fn video_track_data(path: &Path, offset: i64) -> Result<VideoTrackData> {
     get_video_data(task::block_in_place(|| {
         let mut file = File::open(path)?;
@@ -151,6 +181,7 @@ async fn video_track_data(path: &Path, offset: i64) -> Result<VideoTrackData> {
     })
 }
 
+/// Calculate an approximation of the average absolute difference between the bytes of the specified arrays.
 fn average_absolute_difference(a: &[u8], b: &[u8]) -> usize {
     // For speed, look at only every Nth sample
     let step = 17;
@@ -166,7 +197,13 @@ fn average_absolute_difference(a: &[u8], b: &[u8]) -> usize {
     sum / count
 }
 
+/// Produce a quality rating for the specified image, useful for comparing two duplicates and choosing the "best" one.
 async fn quality(image_dir: &str, path: &str) -> Result<u64> {
+    // Currently, we compute the quality as width*height.
+    //
+    // TODO: Investigate whether files contain metadata about encoding parameters and/or how many "generations" a
+    // file is away from the original.
+
     let full_path = [image_dir, path].iter().collect::<PathBuf>();
 
     let lowercase = path.to_lowercase();
@@ -174,6 +211,7 @@ async fn quality(image_dir: &str, path: &str) -> Result<u64> {
     let (width, height) = if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
         video_track_data(&full_path, 0).await?.dimensions
     } else {
+        // TODO: Can we easily get the dimensions without completely decoding the image?  Using `rexiv2`, perhaps?
         image::load_from_memory_with_format(
             &content(&mut AsyncFile::open(full_path).await?).await?,
             ImageFormat::Jpeg,
@@ -184,6 +222,9 @@ async fn quality(image_dir: &str, path: &str) -> Result<u64> {
     Ok(width as u64 * height as u64)
 }
 
+/// Group `potential_duplicates` according to which ones appear to be duplicates of each other.
+///
+/// Each group in the result will be sorted from highest quality to lowest quality.
 pub async fn deduplicate<'a>(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
@@ -264,6 +305,7 @@ pub async fn deduplicate<'a>(
     }
 }
 
+/// Calculate the perceptual hash of the media item at the specified `path`.
 pub async fn perceptual_hash(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
@@ -318,6 +360,12 @@ pub async fn perceptual_hash(
     })
 }
 
+/// Generate any missing thumbnail and preview artifacts for each of the specified items.
+///
+/// If an error is produced while generating artifacts for a given item, that error will be logged and this
+/// function will continue on to the next item.
+///
+/// See also [preload_cache].
 pub async fn preload_cache_all(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
@@ -335,6 +383,7 @@ pub async fn preload_cache_all(
     Ok(())
 }
 
+/// Generate any missing thumbnail and preview artifacts for each of the specified item.
 pub async fn preload_cache(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
@@ -369,6 +418,10 @@ pub async fn preload_cache(
     Ok(())
 }
 
+/// Return a handle to the file containing the requested artifact, which will be generated on the fly from the
+/// original media item if it doesn't already exist.
+///
+/// The return value is a tuple containing the file handle, MIME type, and length.
 async fn get_variant(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
@@ -431,6 +484,7 @@ async fn get_variant(
     }
 }
 
+/// Collect the contents of the specified file into a `Vec<u8>` and return it.
 async fn content(file: &mut AsyncFile) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
 
@@ -439,6 +493,7 @@ async fn content(file: &mut AsyncFile) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
+/// Calculate the FFmpeg "-vf" parameter appropriate for scaling the specified video to the specified resolution.
 async fn video_scale(
     image_dir: &str,
     path: &str,
@@ -460,6 +515,8 @@ async fn video_scale(
     let mut width = image.width();
     let mut height = image.height();
 
+    // The H.264 encoder requires both dimensions to be divisible by 2.
+
     if width % 2 != 0 {
         width -= 1;
     }
@@ -471,6 +528,7 @@ async fn video_scale(
     Ok(format!("scale={}:{},setsar=1:1", width, height))
 }
 
+/// Return true iff the specified `entry` has an audio codec supported by all modern web browsers.
 fn audio_supported(entry: &SampleEntry) -> bool {
     static SUPPORTED_AUDIO_CODECS: &[CodecType] = &[CodecType::AAC, CodecType::MP3];
 
@@ -483,17 +541,35 @@ fn audio_supported(entry: &SampleEntry) -> bool {
     }
 }
 
+/// Represents metadata for the primary track of an MPEG-4 video
 struct VideoTrackData {
+    /// The width and height of the primary video track
     dimensions: (u32, u32),
+
+    /// The duration of the primary video track
     duration: Duration,
+
+    /// The ID of the primary video track
     id: usize,
 }
 
+/// Represents metadata for an MPEG-4 video
 struct VideoData {
+    /// True iff the file contains only audio tracks which are not known to be supported by all modern web
+    /// browsers
     need_audio_transcode: bool,
+
+    /// See `VideoTrackData`
+    ///
+    /// If this is `None`, then no video track was found in the file.
     track_data: Option<VideoTrackData>,
 }
 
+/// Extract relevant metadata from the specified `context`.
+///
+/// This function tries to identify at least one audio track which is encoded with a codec supported by all modern
+/// web browsers, as well as which video track, if any, is the longest, which we consider to be the "primary" video
+/// track.
 fn get_video_data(context: MediaContext) -> VideoData {
     let mut audio = None;
     let mut video = None;
@@ -574,14 +650,21 @@ fn get_video_data(context: MediaContext) -> VideoData {
     }
 }
 
+/// Async-friendly wrapper for `NamedTempFile`
+///
+/// See `TempFile::drop` for why this wrapper exists.
 pub struct TempFile(pub Option<NamedTempFile>);
 
 impl Drop for TempFile {
+    /// Drop the inner `NamedTempFile` inside a `task::block_in_place` context so that Tokio knows this thread may
+    /// block on synchronous I/O.
     fn drop(&mut self) {
         task::block_in_place(|| drop(self.0.take()))
     }
 }
 
+/// Create a temporary file containing the suffix of the file at `path` starting at `offset` bytes from the
+/// beginning.
 async fn copy_from_offset(path: &Path, offset: i64) -> Result<TempFile> {
     let mut original = AsyncFile::open(path).await?;
 
@@ -605,6 +688,12 @@ async fn copy_from_offset(path: &Path, offset: i64) -> Result<TempFile> {
     Ok(tmp)
 }
 
+/// Generate a preview version of the specified video at the requested resolution.
+///
+/// If `size` is `Size::Small`, the clip will be truncated to [VIDEO_PREVIEW_LENGTH_HMS] and resampled to
+/// [SMALL_BOUNDS].  If `size` is `Size::Large` will be resampled to [LARGE_BOUNDS] and not truncated.
+///
+/// The return value is a tuple containing the file handle and length.
 async fn video_preview(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
@@ -750,6 +839,10 @@ async fn video_preview(
     }
 }
 
+/// Find the still image preview for the specified media item and specified size, generating it from the original
+/// if it doesn't already exist.
+///
+/// The return value is a tuple containing the file handle, length, and filename.
 async fn thumbnail(
     image_lock: Option<&AsyncRwLock<()>>,
     image_dir: &str,
@@ -838,12 +931,23 @@ async fn thumbnail(
     })
 }
 
+/// Convert the specified `AsyncRead` into a `Stream` of `Bytes`.
+///
+/// The latter is what Warp needs when sending a binary response which we don't want to load into memory all at
+/// once.
 fn as_stream(input: impl AsyncRead + Send) -> impl Stream<Item = Result<Bytes>> + Send {
     FramedRead::new(input, BytesCodec::new())
         .map_ok(BytesMut::freeze)
         .map_err(Error::from)
 }
 
+/// Handle a GET /image/.. request.
+///
+/// `hash` specifies which image is requested, while `variant` specifies which version of the image is requested.
+///
+/// `if_modified_since` and `ranges` enable cache control and HTTP range requests, respectively.  All responses are
+/// considered immutable, so if `if_modified_since` is non-empty, we'll send a 304 Not Modified with no further
+/// consideration.
 #[allow(clippy::too_many_arguments)]
 pub async fn image(
     conn: &AsyncMutex<SqliteConnection>,
@@ -907,6 +1011,8 @@ pub async fn image(
                 .header(header::CACHE_CONTROL, cache_control)
                 .body(Body::wrap_stream(as_stream(image.take(end - start))))?
         } else {
+            // This wouldn't be hard to support, but I don't know if and when any modern web browser makes
+            // multi-range requests; no need to implement something if it will never be used.
             return Err(HttpError::from_slice(
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "multiple ranges not yet supported",

@@ -1,3 +1,5 @@
+//! This module handles user authentication and authorization.
+
 use {
     crate::warp_util::HttpError,
     anyhow::Result,
@@ -18,8 +20,10 @@ use {
     tracing::warn,
 };
 
+/// How long access tokens issued by the server should last, in seconds
 const TOKEN_EXPIRATION_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Hash a user password using using the PBKDF2_HMAC_SHA256 algorthim and return the Base64-encoded result.
 pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
     let mut hash = [0u8; ring::digest::SHA256_OUTPUT_LEN];
 
@@ -34,6 +38,17 @@ pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
     base64::encode(&hash)
 }
 
+/// Attempt to authenticate a user based on the credentials specified in `request`.
+///
+/// * `conn`: used to query the "users" table in the Tagger database
+///
+/// * `key`: used to sign access tokens
+///
+/// * `mutex`: used to bottleneck all calls to this method in order to mitigate parallel brute force attacks
+///
+/// * `invalid_credential_delay`: minimum delay added to responses to invalid authentication requests.  Note that
+/// these delays will stack up if invalid requests are received more often than once per this interval, so the
+/// actual delay experienced by a given request may be much longer.
 pub async fn authenticate(
     conn: &AsyncMutex<SqliteConnection>,
     request: &TokenRequest,
@@ -96,6 +111,8 @@ pub async fn authenticate(
     })
 }
 
+/// Like [authenticate], except use the anonymous account in the database if it exists -- no credentials,
+/// bottlenecking, or delay required
 pub async fn authenticate_anonymous(
     conn: &AsyncMutex<SqliteConnection>,
     key: &[u8],
@@ -145,6 +162,7 @@ pub async fn authenticate_anonymous(
     })
 }
 
+/// Validate the specified access `token`, verifying it was signed with the specified `key`, has not expired, etc.
 pub fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpError> {
     Ok(Arc::new(
         jsonwebtoken::decode::<Authorization>(

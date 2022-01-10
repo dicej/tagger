@@ -1,3 +1,6 @@
+//! This module provides the `ImageOverlay` component, a lightbox-style widget for browsing a sequence of media
+//! items, one at a time, at high resolution.
+
 use {
     crate::images::ImagesState,
     std::{convert::TryFrom, rc::Rc},
@@ -9,25 +12,45 @@ use {
     web_sys::HtmlVideoElement,
 };
 
+/// Indicates which item to display next in a sequence
 pub enum Direction {
+    /// Display the previous item
     Left,
+
+    /// Display the next item
     Right,
 }
 
+/// Indicates which item, if any, to display after paging forward or backward from one sequence to another
 #[derive(Clone, Copy)]
 pub enum Select {
+    /// Don't display any item
     None,
+
+    /// Display the first item in the sequence
     First,
+
+    /// Display the last item in the sequence
     Last,
 }
 
+/// Properties used to populate and render the `ImageOverlay` component
 pub struct ImageOverlayProps {
+    /// Base URL for requesting media content from the server
     pub root: Rc<str>,
+
+    /// Index of the currently-displayed image, if any, in the sequence
     pub overlay_image: Signal<Option<usize>>,
+
+    /// Current sequence of items we're browsing
     pub images: ReadSignal<ImagesState>,
+
+    /// Callback to display the next item when browsing forward or backward
     pub next_overlay_image: Rc<dyn Fn(Direction)>,
 }
 
+/// Define the `ImageOverlay` component, a lightbox-style widget for browsing a sequence of media items, one at a
+/// time, at high resolution.
 #[component(ImageOverlay<G>)]
 pub fn image_overlay(props: ImageOverlayProps) -> View<G> {
     let ImageOverlayProps {
@@ -37,26 +60,32 @@ pub fn image_overlay(props: ImageOverlayProps) -> View<G> {
         next_overlay_image,
     } = props;
 
+    // This component should only be visible when there is an item to display.
     let overlay_image_visible = syc::create_selector({
         let overlay_image = overlay_image.clone();
 
         move || overlay_image.get().is_some()
     });
 
+    // Define a lambda to hide the component by setting the display item to `None`.
     let close_overlay = {
         let overlay_image = overlay_image.clone();
 
         move |_| overlay_image.set(None)
     };
 
+    // When displaying a "motion photo" image (i.e. an image with an embedded video clip), we can toggle between
+    // displaying the image and the video using this reactive variable.
     let playing = Signal::new(false);
 
+    // Define a lambda to flip `playing` to the opposite value.
     let toggle_playing = {
         let playing = playing.clone();
 
         move |_| playing.set(!*playing.get())
     };
 
+    // Whenever we display a new item, we reset `playing` to false.
     syc::create_effect({
         let overlay_image = overlay_image.clone();
         let playing = playing.clone();

@@ -1,3 +1,6 @@
+//! This module provides the [images] function, which handles incoming GET /images requests, which retrieve an
+//! optionally filtered sequence of media item metadata from the server.
+
 use {
     anyhow::Result,
     futures::TryStreamExt,
@@ -15,8 +18,13 @@ use {
     },
 };
 
+/// Maximum number of media items to return if the client does not specify a limit
 const DEFAULT_LIMIT: u32 = 1000;
 
+/// Build an SQL query based on the specified `filter` which retrieves metadata for all matching media items,
+/// appending the result to `buffer`.
+///
+/// If `filter` is `None`, all items in the database will be retrieved.
 fn build_images_query<'a>(
     buffer: &'a mut String,
     filter: Option<&TagExpression>,
@@ -52,8 +60,19 @@ fn build_images_query<'a>(
     select
 }
 
+/// Handle a GET /images request by converting the specified `query` to the equivalent SQL query and collecting the
+/// result as an `ImagesResponse` object.
 pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<ImagesResponse> {
+    // This function is currently somewhat inelegant since it queries the database for all matching items, sorts
+    // them in memory, and scans the result to find the requested interval and gather pagination statistics.
+    //
+    // It may be more elegant to convert some or all of this logic to SQL and possibly avoid the sort and linear
+    // scan.  Meanwhile, this works and performs well enough.
+
     let limit = usize::try_from(query.limit.unwrap_or(DEFAULT_LIMIT)).unwrap();
+
+    // First, query the database, collecting the rows into a map sorted chronologically, and grouping any
+    // duplicates together.
 
     let mut buffer = String::new();
     let mut rows = build_images_query(&mut buffer, query.filter.as_ref()).fetch(&mut *conn);
@@ -83,6 +102,9 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
 
         row_map.insert(key, (row, perceptual_hash));
     }
+
+    // Next, scan the map in reverse chronological order, consolidating duplicates and building `ImageData` objects
+    // out of each row that falls within the requested interval.
 
     let mut images = Vec::with_capacity(limit);
     let mut later = VecDeque::with_capacity(limit + 1);

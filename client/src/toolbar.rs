@@ -1,3 +1,5 @@
+//! This module provides the `Toolbar` component, which hosts various tool icons, menus, and status notifications.
+
 use {
     crate::{
         images::ImagesState,
@@ -19,6 +21,11 @@ use {
     web_sys::{Event, HtmlSelectElement, KeyboardEvent},
 };
 
+/// Send a PATCH /tags request to the Tagger server to add or remove tags to/from media items.
+///
+/// The request is sent using the specified `client`, using `token` for authorization and `root`/tags as the URL.
+/// The body is `patches`, serialized as JSON.  If the server returns 401 Unauthorized, `on_unauthorized` will be
+/// invoked.
 fn patch_tags(
     client: Client,
     token: Signal<Option<String>>,
@@ -54,6 +61,11 @@ fn patch_tags(
     )
 }
 
+/// Attempt to find the specified `category` in `tags`, and if it is present, return whether it is flagged as
+/// immutable (i.e. the server says it will not allow tags in that category to be added to or removed from media
+/// items).
+///
+/// If the category is not found, we return `false`.
 fn is_immutable_category(tags: &TagsResponse, category: Option<&str>) -> bool {
     fn recurse(tags: &TagsResponse, category: &str) -> Option<bool> {
         for (cat, tags) in &tags.categories {
@@ -74,20 +86,43 @@ fn is_immutable_category(tags: &TagsResponse, category: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+/// Properties for populating and rendering the `Toolbar` component
 pub struct ToolbarProps {
+    /// Base URL for sending HTTP requests to the Tagger server
     pub root: Rc<str>,
+
+    /// `reqwest` client for making HTTP requests to the server
     pub client: Client,
+
+    /// Most recent access token received from the server
     pub token: Signal<Option<String>>,
+
+    /// Indicates whether the UI is currently in "selecting" mode, i.e. the user is selecting items to modify
     pub selecting: Signal<bool>,
+
+    /// Callback to make the login overlay visible
     pub open_log_in: Rc<dyn Fn()>,
+
+    /// Number of media item thumbnails to show per page
     pub items_per_page: Signal<u32>,
+
+    /// Number of media items currently selected for modification
     pub selected_count: ReadSignal<u32>,
+
+    /// The current tag expression specified by the user to filter the set of media items displayed
     pub filter: Signal<TagTree>,
+
+    /// The set of media items being displayed on the current page
     pub images: ReadSignal<ImagesState>,
+
+    /// The timestamp (and possibly hash) indicating where to start in the item list when displaying thumbnails
     pub start: Signal<Option<ImageKey>>,
+
+    /// Callback to invoke if the server responds to any request with 401 Unauthorized
     pub on_unauthorized: Rc<dyn Fn()>,
 }
 
+/// Define the `Toolbar` component, which hosts various tool icons, menus, and status notifications.
 #[component(Toolbar<G>)]
 #[allow(clippy::redundant_closure)]
 pub fn toolbar(props: ToolbarProps) -> View<G> {
@@ -105,6 +140,8 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         on_unauthorized,
     } = props;
 
+    // The `TagMenu` component needs to know the set of tags (across all media items accessible to this user)
+    // available from the server.
     let unfiltered_tags = crate::watch::<TagsResponse, _>(
         Signal::new("tags".into()).into_handle(),
         client.clone(),
@@ -131,6 +168,8 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         move |_| show_menu.set(!*show_menu.get())
     };
 
+    // We only enable selection mode if the server has given us an access token which says we may add and remove
+    // tags to/from media items.
     let may_select = syc::create_selector({
         let token = token.handle();
 
@@ -202,6 +241,8 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
 
     let selecting2 = selecting.clone();
 
+    // When at least one media item is selected, we list the union of tags applied to any of those items.  In the
+    // case of mutable tags, we also allow the user to remove them.
     let selected_tags = KeyedProps {
         iterable: syc::create_selector({
             let images = images.clone();
@@ -310,6 +351,8 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
 
         key: |tag| tag.clone(),
     };
+
+    // In addition to removing existing tags, we allow the user to add new ones.
 
     let add_tag_value = Signal::new(String::new());
 

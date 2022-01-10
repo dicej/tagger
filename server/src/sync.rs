@@ -1,3 +1,6 @@
+//! This module provides the [sync] function, responsible for synchronizing the Tagger database with the media
+//! items on the filesystem.
+
 use {
     crate::media::{FileData, ItemData},
     anyhow::{anyhow, Error, Result},
@@ -29,6 +32,7 @@ use {
     tracing::{info, warn},
 };
 
+/// Calculate the SHA-256 hash of the specified `input` and return the result as a hex-encoded string.
 async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<String> {
     let mut hasher = Sha256::default();
 
@@ -51,17 +55,30 @@ async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<St
         .concat())
 }
 
+/// Represents metadata for a given media item
 #[derive(Debug)]
 struct Metadata {
+    /// Creation time for the item (e.g. Exif.Image.DateTimeOriginal)
     datetime: DateTime<Utc>,
+
+    /// Offset in bytes from the start of the file where an MPEG-4 can be found, if any
+    ///
+    /// This will be zero for MP4 files, nonzero for "motion photo" files, and `None` for simple still images.
     video_offset: Option<i64>,
 }
 
+/// Summary statistics for a deduplication pass
+///
+/// See also [deduplicate].
 struct DeduplicationSummary {
+    /// Number of media items visited during deduplication
     item_count: u64,
+
+    /// Number of items found which are considered duplicates
     duplicate_count: u64,
 }
 
+/// Extract relevant metadata from the EXIF content found in the file at `path`.
 fn exif_metadata(path: &Path) -> Result<Metadata> {
     let length = i64::try_from(File::open(path)?.metadata()?.len()).unwrap();
 
@@ -88,6 +105,8 @@ fn exif_metadata(path: &Path) -> Result<Metadata> {
             .ok_or_else(|| anyhow!("unrecognized DateTime format: {}", datetime))?
             .parse()?,
 
+        // Some Android phones embed MPEG-4 video clips in the JPEG files they create, called "motion photos".
+        // There are two versions of this format, each with its own EXIF tags.  We support both versions here:
         video_offset: if metadata
             .get_tag_string("Xmp.Container.Directory[2]/Container:Item/Item:Mime")
             .ok()
@@ -105,6 +124,7 @@ fn exif_metadata(path: &Path) -> Result<Metadata> {
     })
 }
 
+/// Extract relevant metadata from the MPEG-4 content found in te file at `path`.
 fn mp4_metadata(path: &Path) -> Result<Metadata> {
     const SECONDS_FROM_1904_TO_1970: u64 = 2_082_844_800;
 
@@ -126,6 +146,13 @@ fn mp4_metadata(path: &Path) -> Result<Metadata> {
     })
 }
 
+/// Recursively search the specified `dir` directory for JPEG and MPEG-4 media items, identifying any that aren't
+/// already in the database and attempting to extract metadata from them to be recorded in the database later.
+///
+/// The full path of each file found is expected to have a prefix of `root`, and this is stripped off prior to
+/// looking the path up in the database.
+///
+/// Results are appended to `result` as (path, metadata) tuples, where the path is relative to `root`.
 fn find_new<'a>(
     conn: &'a AsyncMutex<SqliteConnection>,
     root: &'a str,
@@ -144,6 +171,8 @@ fn find_new<'a>(
                 if let Some(name) = entry.file_name().to_str() {
                     let lowercase = name.to_lowercase();
 
+                    // Some android phones "hide" files which have been "deleted" by prepending a ".trashed-"
+                    // prefix to them.  We assume here that users don't want to see those.
                     if !lowercase.starts_with(".trashed-")
                         && (lowercase.ends_with(".jpg")
                             || lowercase.ends_with(".jpeg")
@@ -211,12 +240,18 @@ fn find_new<'a>(
     .boxed()
 }
 
+/// Query the database for items for which we have not yet calculated a perceptual hash (e.g. files that have been
+/// newly added), calculate their perceptual hashes, and look for duplicates among all files which share each
+/// perceptual hash.
 async fn deduplicate(
     conn: &AsyncMutex<SqliteConnection>,
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
+    // First, find the items for which we have not yet calculated a perceptual hash (p-hash), calculate the p-hash,
+    // and group the items by their p-ashes.
+
     let unhashed = sqlx::query!(
         "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
          FROM images i \
@@ -247,6 +282,8 @@ async fn deduplicate(
                 row.hash, e
             );
 
+            // If we can't calculate the p-hash now, assume we never will be able to (i.e. the file will never
+            // change) and don't bother trying again.  Instead, record the p-hash as "(unknown)" and move on.
             "(unknown)".into()
         });
 
@@ -266,6 +303,9 @@ async fn deduplicate(
             dirty.values().map(|v| v.len()).sum::<usize>()
         );
     }
+
+    // Next, for each p-hash, collect all the new and old items with that p-hash and deduplicate them, recording
+    // the results in the database.
 
     let mut item_count = 0;
     let duplicate_count = Arc::new(AtomicU64::new(0));
@@ -303,6 +343,9 @@ async fn deduplicate(
                         perceptual_hash, e
                     );
 
+                    // If anything goes wrong deduplicating, assume there's no point in trying again (i.e. assume
+                    // none of the files will change and the error was deterministic).  Instead, we assume none of
+                    // the items is a duplicate of the others.
                     potential_duplicates.iter().map(|item| vec![item]).collect()
                 });
 
@@ -318,6 +361,9 @@ async fn deduplicate(
             })
             .collect::<Vec<_>>();
 
+        // Note that we use a transaction here to ensure everything for this p-hash is updated atomically.  If any
+        // part fails or is interrupted, we can just try again in the next pass without worrying about inconsistent
+        // state.
         conn.lock()
             .await
             .transaction(move |conn| {
@@ -379,6 +425,17 @@ async fn deduplicate(
     })
 }
 
+/// Synchronize the Tagger database with the filesystem.
+///
+/// This includes:
+///
+/// * Checking for new files not yet recorded in the database and adding them
+///
+/// * Checking for old files which have disappeared from the filesystem and removing them from the database
+///
+/// * Optionally generating preview artifacts from any new files
+///
+/// * Optionally comparing new files with each other and existing files to identify duplicates
 pub async fn sync(
     conn: &AsyncMutex<SqliteConnection>,
     image_lock: &AsyncRwLock<()>,
@@ -393,6 +450,8 @@ pub async fn sync(
     );
 
     let then = Instant::now();
+
+    // First, identify any files recorded in the database but no longer present on the filesystem.
 
     let obsolete = {
         let mut lock = conn.lock().await;
@@ -411,6 +470,8 @@ pub async fn sync(
 
     let obsolete_len = obsolete.len();
 
+    // Next, identify any files on the filesystem but not yet recorded in the database.
+
     let new = {
         let mut new = Vec::new();
 
@@ -420,6 +481,8 @@ pub async fn sync(
     };
 
     let new_len = new.len();
+
+    // For each new file, atomically record it in the database.
 
     for (index, (path, data)) in new.into_iter().enumerate() {
         if let Some(data) = data {
@@ -497,6 +560,10 @@ pub async fn sync(
                 }
             }
         } else {
+            // Files for which we could not extract metadata are excluded from further consideration, i.e. we
+            // assume they will never change and thus will never have the metadata we need to sort and display them
+            // in this application.
+
             info!("({} of {}) insert bad path {}", index + 1, new_len, path);
 
             sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
@@ -504,6 +571,8 @@ pub async fn sync(
                 .await?;
         }
     }
+
+    // For each obsolete file found, atomically remove it from the database.
 
     for (index, path) in obsolete.into_iter().enumerate() {
         info!("({} of {}) delete {}", index + 1, obsolete_len, path);

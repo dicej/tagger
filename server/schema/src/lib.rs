@@ -1,3 +1,14 @@
+//! Tagger database schema
+//!
+//! This crate contains the database schema used by the Tagger server, represented as an array of SQL DDL
+//! statements for defining tables and inserting default data.
+//!
+//! The server currently uses SQLite, so we limit this schema to what that DBMS supports.
+//!
+//! Note that we're not currently database migration tool to manage upgrades, so whenever e.g. new columns are
+//! added to these tables, you'll need to manually add them to any existing Tagger databases using the appropriate
+//! "ALTER TABLE" commands.
+
 #![deny(warnings)]
 
 pub static DDL_STATEMENTS: &[&str] = &[

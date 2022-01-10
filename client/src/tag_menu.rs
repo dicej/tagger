@@ -1,3 +1,10 @@
+//! This module provides the `TagMenu` component, which provides a hierarchical, tree-style UI for filtering media
+//! items by tag.
+//!
+//! Note that this module contains utility code for working with types defined in the `tagger_shared` crate --
+//! refer to the documentation for that crate to get the complete picture.  Specifically, see
+//! `tagger_shared::tag_expression::TagTree`, which we use heavily in this module.
+
 use {
     crate::watch,
     reqwest::Client,
@@ -11,12 +18,19 @@ use {
     },
 };
 
+/// Lisp-style singly-linked list
 #[derive(Clone, Debug)]
 pub enum List<T> {
     Nil,
     Cons(Rc<(T, List<T>)>),
 }
 
+/// Given a `filter_chain`, which denotes a path of ANDed-together tags in a filter tree, identify any categories
+/// of tags which could be used to further filter a set of media items.
+///
+/// For example, if the current filter is "year:2017 and state:hawaii", and some of the matching items also have
+/// tags like "city:honolulu" and "city:kailua-kona", then "city" would be one of the categories we'd return here,
+/// but "year" and "state" would not be since we're already filtering by those categories.
 fn find_categories<'a>(
     filter_chain: &List<Tag>,
     categories: &'a HashMap<Arc<str>, TagsResponse>,
@@ -33,6 +47,7 @@ fn find_categories<'a>(
     }
 }
 
+/// If `state` is a `TagState::Included` return a shared reference to the subtree; otherwise, return `None`.
 fn subtree(state: &TagState) -> Option<&TagTree> {
     if let TagState::Included(subtree) = state {
         Some(subtree)
@@ -41,6 +56,7 @@ fn subtree(state: &TagState) -> Option<&TagTree> {
     }
 }
 
+/// If `state` is a `TagState::Included` return a unique reference to the subtree; otherwise, return `None`.
 fn subtree_mut(state: &mut TagState) -> Option<&mut TagTree> {
     if let TagState::Included(subtree) = state {
         Some(subtree)
@@ -49,6 +65,10 @@ fn subtree_mut(state: &mut TagState) -> Option<&mut TagTree> {
     }
 }
 
+/// Create a new `TagTree` which represents the path taken through `filter` using tags from `filter_chain`.
+///
+/// In other words, the returned tree will match `filter` except with extraneous branches (those not specified by
+/// `filter_chain`) removed.
 fn to_tree(filter_chain: &List<Tag>, filter: &TagTree) -> TagTree {
     fn recurse<'a>(
         filter_chain: &List<Tag>,
@@ -84,22 +104,32 @@ fn to_tree(filter_chain: &List<Tag>, filter: &TagTree) -> TagTree {
     recurse(filter_chain, filter, TagTree::default()).1
 }
 
+/// Given a `filter_chain`, which denotes the set of tags we're currently filtering by, identify which tags (if
+/// any) in `tags` are appropriate to list at the next level of the tree, i.e. which tags could be used to further
+/// filter a set of media items.
+///
+/// We use `category` to indicate whether we're building a submenu for a specific category or for uncategorized
+/// tags.  If a category is specified, but we can't find it, we return the tags in `default` instead.
+///
+/// See also [find_categories].
 fn tags_for_category<'a>(
     category: &Option<Arc<str>>,
     filter_chain: &List<Tag>,
-    empty: &'a TagsResponse,
+    default: &'a TagsResponse,
     tags: &'a TagsResponse,
 ) -> &'a HashMap<Arc<str>, u32> {
     &if let Some(category) = category {
         find_categories(filter_chain, &tags.categories)
             .and_then(|categories| categories.get(category.deref()))
-            .unwrap_or(empty)
+            .unwrap_or(default)
     } else {
         tags
     }
     .tags
 }
 
+/// Return a reference to the first `Tag` found in `filter_chain` which matches the specified `tag` name and
+/// `category`, if present.
 fn find_tag<'a>(
     mut filter_chain: &'a List<Tag>,
     category: Option<&str>,
@@ -119,6 +149,7 @@ fn find_tag<'a>(
     }
 }
 
+/// Return a shared reference to the subtree of `filter` reachable via the list of tags in `filter_chain`, if any.
 fn resolve<'a>(filter_chain: &List<Tag>, filter: &'a TagTree) -> Option<&'a TagTree> {
     match filter_chain {
         List::Nil => Some(filter),
@@ -128,6 +159,7 @@ fn resolve<'a>(filter_chain: &List<Tag>, filter: &'a TagTree) -> Option<&'a TagT
     }
 }
 
+/// Return a unique reference to the subtree of `filter` reachable via the list of tags in `filter_chain`, if any.
 fn resolve_mut<'a>(filter_chain: &List<Tag>, filter: &'a mut TagTree) -> Option<&'a mut TagTree> {
     match filter_chain {
         List::Nil => Some(filter),
@@ -136,13 +168,22 @@ fn resolve_mut<'a>(filter_chain: &List<Tag>, filter: &'a mut TagTree) -> Option<
     }
 }
 
+/// Represents the state of a tag menu item
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum FilterState {
+    /// This tag is included in the filter (i.e. only media items having this tag should be shown)
     Include,
+
+    /// This tag is excluded in the filter (i.e. only media items *not* having this tag should be shown)
     Exclude,
+
+    /// This tag is not present in the filter (i.e. media items may be shown regardless of whether they have this
+    /// tag)
     None,
 }
 
+/// Attempt to find the specified `tag` in the subtree of `filter` reachable via `filter_chain` and determine
+/// whether it is included, excluded, or not present.
 fn filter_state(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> FilterState {
     resolve(filter_chain, filter)
         .and_then(|tree| {
@@ -157,21 +198,45 @@ fn filter_state(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> Filter
         .unwrap_or(FilterState::None)
 }
 
+/// Properties common to [TagSubMenuProps] and [TagMenuProps]
 pub struct TagMenuCommonProps {
+    /// `reqwest` client for making HTTP requests to the Tagger server
     pub client: Client,
+
+    /// Most recent access token received from the server
     pub token: Signal<Option<String>>,
+
+    /// Base URL for requesting tag data from the server
     pub root: Rc<str>,
+
+    /// The current filter specified by the user, represented as a `TagTree`
     pub filter: Signal<TagTree>,
+
+    /// The path which identifies the subtree of `filter` which this (sub)menu represents
     pub filter_chain: List<Tag>,
+
+    /// The most recent raw, unfiltered set of tags received from the server
     pub unfiltered_tags: ReadSignal<TagsResponse>,
+
+    /// Callback to invoke if the server responds to any request with 401 Unauthorized
     pub on_unauthorized: Rc<dyn Fn()>,
 }
 
+/// Properties for populating and rendering the `TagSubMenu` component
 struct TagSubMenuProps {
+    /// See [TagMenuCommonProps]
     common: TagMenuCommonProps,
+
+    /// The tag under which this submenu will appear
     tag: Tag,
 }
 
+/// Define the `TagSubMenu` component, which represents a set of tags and categories which may be used to further
+/// refine a filter when a specific tag has been included.
+///
+/// For example, if the user has specified the filter "year:2017 and state:hawaii", and some of the matching items
+/// also have tags like "city:honolulu", "city:kailua-kona", and "sunset", then "city" would be one of the
+/// categories listed in the submenu, and "sunset" would be one of the uncategorized tags listed there as well.
 #[component(TagSubMenu<G>)]
 #[allow(clippy::redundant_closure)]
 fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
@@ -243,6 +308,10 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
     }
 }
 
+/// Compare two strings, numerically when applicable.
+///
+/// If both strings can be parsed as `u64`s, then compare them numerically.  Otherwise, compare them
+/// lexicographically.
 fn compare_numeric(a: &str, b: &str) -> Ordering {
     match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(a), Ok(b)) => a.cmp(&b),
@@ -252,12 +321,21 @@ fn compare_numeric(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Properties for populating and rendering the `TagMenu` component
 pub struct TagMenuProps {
+    /// See [TagMenuCommonProps]
     pub common: TagMenuCommonProps,
+
+    /// The most recent set of tags received from the Tagger server, filtered by the filter provided by the user
+    ///
+    /// See also `TagMenuCommonProps::unfiltered_tags`.
     pub filtered_tags: ReadSignal<TagsResponse>,
+
+    /// The category for which we are displaying this menu, if any
     pub category: Option<Arc<str>>,
 }
 
+/// Define the `TagMenu` component, which provides a hierarchical, tree-style UI for filtering media items by tag.
 #[component(TagMenu<G>)]
 pub fn tag_menu(props: TagMenuProps) -> View<G> {
     let TagMenuProps {

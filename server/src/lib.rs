@@ -74,29 +74,37 @@ mod sync;
 mod tags;
 mod warp_util;
 
+/// Minimum delay added to responses to invalid authentication requests
+///
+/// Note that these delays will stack up if invalid requests are received more often than once per this interval,
+/// so the actual delay experienced by a given request may be much longer, e.g. during a brute force attack.
 const INVALID_CREDENTIAL_DELAY_SECS: u64 = 5;
 
+/// Size of buffer (in bytes) to use when copying or hashing files
 const BUFFER_SIZE: usize = 16 * 1024;
 
+/// Determines which media items to generate thumbnails and previews for, if any
 #[derive(Debug)]
 pub enum PreloadPolicy {
     /// Never pre-generate thumbnails
     None,
 
-    /// Pre-generate thumbnails for newly-discovered images only
+    /// Pre-generate thumbnails for newly-discovered items only
     New,
 
-    /// Pre-generate thumbnails for both existing and newly-discovered images
+    /// Pre-generate thumbnails for both existing and newly-discovered items
     All,
 }
 
 impl Default for PreloadPolicy {
+    /// Return `Self::None`
     fn default() -> Self {
         Self::None
     }
 }
 
 impl Display for PreloadPolicy {
+    /// Convert a `PreloadPolicy` to a string, e.g. "none", "new", or "all"
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -113,6 +121,7 @@ impl Display for PreloadPolicy {
 impl FromStr for PreloadPolicy {
     type Err = Error;
 
+    /// Parse a `PreloadPolicy` from a string, e.g. "none", "new", or "all"
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "none" => Self::None,
@@ -123,8 +132,9 @@ impl FromStr for PreloadPolicy {
     }
 }
 
+/// Configuration options for the Tagger server
 #[derive(StructOpt, Debug)]
-#[structopt(name = "tagger-server", about = "Image tagging webapp backend")]
+#[structopt(name = "tagger-server", about = "Media tagging web application server")]
 pub struct Options {
     /// Address on which to listen for HTTP requests
     #[structopt(long)]
@@ -175,6 +185,7 @@ pub struct Options {
     pub deduplicate: bool,
 }
 
+/// Open or create an SQLite database using the specified filename.
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     let mut conn = format!("sqlite://{}", state_file)
         .parse::<SqliteConnectOptions>()?
@@ -189,6 +200,12 @@ pub async fn open(state_file: &str) -> Result<SqliteConnection> {
     Ok(conn)
 }
 
+/// Convert the specified `expression` to an SQL expression, appending the result to the specified `buffer`.
+///
+/// The resulting SQL fragment will include one or more subselects which reference the "tags" table as well as the
+/// table alias "i", which refers to the "images" table named in the outer query.
+///
+/// See also [bind_filter_clause].
 fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
     match expression {
         TagExpression::Tag(tag) => buffer.push_str(if tag.category.is_some() {
@@ -218,10 +235,16 @@ fn append_filter_clause(buffer: &mut String, expression: &TagExpression) {
     }
 }
 
+/// Bind the specified arguments to the placeholder category and tag parameters used by [append_filter_clause].
 fn bind_filter_clause<'a>(
     expression: &TagExpression,
     select: Query<'a, Sqlite, SqliteArguments<'a>>,
 ) -> Query<'a, Sqlite, SqliteArguments<'a>> {
+    // Note that we rely on `TagExpression::fold_tags` to visit tags in the same order that [append_filter_clause]
+    // does.
+    //
+    // TODO: Can we refactor [append_filter_clause] and/or `TagExpression::fold_tags` so that the former can use
+    // the latter so they don't get out of sync?
     expression.fold_tags(select, |mut select, category, tag| {
         if let Some(category) = category {
             select = select.bind(category.to_owned())
@@ -230,6 +253,12 @@ fn bind_filter_clause<'a>(
     })
 }
 
+/// If the specified `auth` claims include a non-empty `Authorization::filter` field, modify the supplied `filter`
+/// in place, either replacing it with the one from `auth` if the former is empty, or combining them together using
+/// the AND operator.
+///
+/// This ensures that whatever filter was provided by the user is constrained to what that user has permission to
+/// access.
 fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
     if let Some(user_filter) = &auth.filter {
         if let Some(inner) = filter.take() {
@@ -243,10 +272,23 @@ fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
     }
 }
 
+/// Abbreviation for `Response::builder()`
 fn response() -> response::Builder {
     Response::builder()
 }
 
+/// Build a Warp routing filter based on the specified configuration.
+///
+/// * `conn`: used to access the Tagger database
+///
+/// * `image_lock`: used to control concurrent access to the cache directory, e.g. to avoid simultaneous reads and
+/// writes to cache files
+///
+/// * `options`: server configuration -- see [Options] for details
+///
+/// * `default_auth_key`: key used to sign access tokens if `options.auth_key_file` is `None`
+///
+/// * `invalid_credentail_delay`: minimum interval to wait before responding to an invalid authentication request
 async fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     image_lock: &Arc<AsyncRwLock<()>>,
@@ -254,6 +296,8 @@ async fn routes(
     default_auth_key: [u8; 32],
     invalid_credential_delay: Duration,
 ) -> Result<impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone> {
+    // Check if the database contains an anonymous user account and, if so, construct a token representing that
+    // account to use whenever we receive a request that doesn't have a token.
     let default_auth = if let Some(row) = sqlx::query!(
         "SELECT filter, may_patch FROM users WHERE name IS NULL AND password_hash IS NULL"
     )
@@ -283,6 +327,7 @@ async fn routes(
         default_auth_key
     };
 
+    // All authentication requests are bottlenecked by this mutex to mitigate parallel brute force attacks:
     let auth_mutex = Arc::new(AsyncMutex::new(()));
 
     let auth = warp::header::optional::<Bearer>("authorization").and_then(
@@ -481,6 +526,7 @@ async fn routes(
         .map(|reply| warp::reply::with_header(reply, "Accept-Ranges", "bytes")))
 }
 
+/// Wrapper for `panic::catch_unwind` which converts the panic payload to a human-readable `anyhow::Error`
 fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
     panic::catch_unwind(fun).map_err(|e| {
         if let Some(s) = e.downcast_ref::<&str>() {
@@ -493,6 +539,10 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
     })
 }
 
+/// Run a Warp server using a filter created by [routes], bound to the address(es) specified in `options`.
+///
+/// `conn`, `image_lock`, and `default_auth_key` are all passed directly to [routes].  See that function's
+/// documentation for details.
 pub async fn serve(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
     image_lock: &Arc<AsyncRwLock<()>>,

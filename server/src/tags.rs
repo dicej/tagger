@@ -1,3 +1,10 @@
+//! This module provides two functions:
+//!
+//! * [tags]: handles GET /tags requests, which retrieve an optionally filtered list of tags currently applied to
+//! at least one media item
+//!
+//! * [apply]: handles PATCH /tags requests, which add and/or remove tags to/from media items
+
 use {
     anyhow::Result,
     futures::TryStreamExt,
@@ -11,6 +18,11 @@ use {
     },
 };
 
+/// Query the database to determine whether the item identified by `hash` matches the tag expression specified in
+/// `filter`.
+///
+/// For example, an item with tags "foo" and "bar" would match the expression "foo", but not the expression "foo
+/// and not bar".  Any empty expression matches all items.
 async fn visible(conn: &mut SqliteConnection, filter: &TagExpression, hash: &str) -> Result<bool> {
     Ok(crate::bind_filter_clause(
         filter,
@@ -29,6 +41,10 @@ async fn visible(conn: &mut SqliteConnection, filter: &TagExpression, hash: &str
     .is_some())
 }
 
+/// Handle a PATCH /tags request, which adds and/or removes tags to/from media items.
+///
+/// This function first verifies the user identified by `auth` has permission to apply all the specified `Patch`es,
+/// and if so, proceeds to apply them to the database.
 pub async fn apply(
     auth: &Authorization,
     conn: &mut SqliteConnection,
@@ -40,6 +56,11 @@ pub async fn apply(
             .body(Body::empty())?);
     }
 
+    // Users may only patch items to which they already have access.
+    //
+    // Note that we do allow a user to apply patches which make further access by that user impossible.  For
+    // example, a user which can only access items tagged "public" is free to remove that tag from any items, but
+    // will not be able to access or modify the tag data for those items going forward.
     if let Some(filter) = &auth.filter {
         for patch in patches {
             if !(filter.evaluate(&patch.tag) && visible(conn, filter, &patch.hash).await?) {
@@ -50,6 +71,7 @@ pub async fn apply(
         }
     }
 
+    // No user may add or remove tags belonging to an immutable category.
     for patch in patches {
         if let Some(category) = &patch.tag.category {
             let category = category.deref();
@@ -67,6 +89,8 @@ pub async fn apply(
             }
         }
     }
+
+    // TODO: should we consider applying all patches in a single transaction to ensure the operation is atomic?
 
     for patch in patches {
         let value = patch.tag.value.deref();
@@ -113,6 +137,8 @@ pub async fn apply(
     Ok(crate::response().body(Body::empty())?)
 }
 
+/// Recursively search for or create a subresponse within `response` belonging to the specified `category` (which
+/// may be an arbitrarily-nested subcategory of another category).
 fn entry<'a>(
     response: &'a mut TagsResponse,
     parents: &HashMap<Arc<str>, Arc<str>>,
@@ -128,6 +154,11 @@ fn entry<'a>(
     .or_insert_with(TagsResponse::default)
 }
 
+/// Handle a GET /tags request, which retrieves an optionally filtered list of tags currently applied to
+/// at least one media item.
+///
+/// Note that tags may belong to categories, which in turn may be arbitrarily nested subcategories of other
+/// categories, hence the recursive structure of `TagsResponse`.
 pub async fn tags(conn: &mut SqliteConnection, query: &TagsQuery) -> Result<TagsResponse> {
     let select = format!(
         "SELECT (SELECT parent from categories where name = t.category), \

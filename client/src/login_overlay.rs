@@ -1,3 +1,5 @@
+//! This module provides the `LoginOverlay` component, which prompts the user to enter their login credentials.
+
 use {
     anyhow::Error,
     futures::TryFutureExt,
@@ -9,16 +11,32 @@ use {
     web_sys::{Event, KeyboardEvent},
 };
 
+/// Properties used to populate and render the `LoginOverlay` component, including reactive variables shared with
+/// other parts of the application
 pub struct LoginOverlayProps {
+    /// Base URL for requesting images from the server
     pub root: Rc<str>,
+
+    /// `reqwest` client for making OAuth 2 requests to the Tagger server
     pub client: Client,
+
+    /// The most recent access token received from the server, if any
     pub token: Signal<Option<String>>,
+
+    /// Whether the overlay should be visible or hidden
     pub show_log_in: Signal<bool>,
+
+    /// Message, if any, to display to the user if an when something goes wrong while logging in
     pub log_in_error: Signal<Option<String>>,
+
+    /// User name most recently provided by the user
     pub user_name: Signal<String>,
+
+    /// Password most recently provided by the user
     pub password: Signal<String>,
 }
 
+/// Define the `LoginOverlay` component, which prompts the user to enter their login credentials.
 #[component(LoginOverlay<G>)]
 pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
     let LoginOverlayProps {

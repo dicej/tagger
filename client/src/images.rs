@@ -1,3 +1,5 @@
+//! This module provides the `Images` component, which displays a sequence of media item thumbnails.
+
 use {
     std::{collections::HashMap, rc::Rc, sync::Arc},
     sycamore::prelude::{
@@ -8,22 +10,37 @@ use {
     web_sys::{Event, HtmlVideoElement, MouseEvent},
 };
 
+/// Pairs a /images response from the Tagger server with some local state for tracking which items are currently
+/// selected
 #[derive(Default)]
 pub struct ImagesState {
+    /// Response received from the Tagger server for our /images request
     pub response: Rc<ImagesResponse>,
+
+    /// Map of item hashes to local state for each item
     pub states: HashMap<Arc<str>, ImageState>,
 }
 
+/// Local (i.e. client-side) state for a specific media item
 #[derive(Clone)]
 pub struct ImageState {
+    /// Reactive variable which tracks whether this item is selected or not
     pub selected: Signal<bool>,
 }
 
 impl Drop for ImageState {
+    /// Asynchronously set `self.selected` to `false` to ensure derived state is updated.
+    ///
+    /// This is important because other parts of the UI rely on knowing whether any items are selected or not.  If
+    /// we let this instance be dropped while `selected` is `true` without setting it to `false` explicitly, the UI
+    /// may end up in an inconsistent state that indicates some items are selected even though none really are.
     fn drop(&mut self) {
         if *self.selected.get_untracked() {
             let selected = self.selected.clone();
 
+            // We use `wasm_bindgen_futures::spawn_local` here to ensure the `Signal::set` call happens outside of
+            // any Sycamore context.  This guarantees that we won't try to call it e.g. from within Sycamore
+            // clean-up code such that the thread-local context is in an indeterminate state.
             wasm_bindgen_futures::spawn_local(async move {
                 selected.set(false);
             });
@@ -31,6 +48,7 @@ impl Drop for ImageState {
     }
 }
 
+/// Call `HtmlVideoElement::play` on the target of the specified `event`, if possible
 fn play_video(event: Event) {
     if let Some(video) = event.target() {
         if let Ok(video) = video.dyn_into::<HtmlVideoElement>() {
@@ -39,23 +57,38 @@ fn play_video(event: Event) {
     }
 }
 
+/// Pause and reset the `HtmlVideoElement` target of the specified `event`, if possible
 fn reset_video(event: Event) {
     if let Some(video) = event.target() {
         if let Ok(video) = video.dyn_into::<HtmlVideoElement>() {
             let _ = video.pause();
             video.set_current_time(0.0);
+
+            // We (re)load the video here to force the poster image to be displayed (again)
+            //
+            // See https://stackoverflow.com/questions/14245644/html5-video-end-of-a-video-poster for details.
             let _ = video.load();
         }
     }
 }
 
+/// Properties used to populate and render the `Images` component
 pub struct ImagesProps {
+    /// Base URL for requesting images from the server
     pub root: Rc<str>,
+
+    /// Indicates whether the UI is in "selecting" mode, i.e. if clicking on a thumbnail will cause its selection
+    /// state to be toggled on or off
     pub selecting: ReadSignal<bool>,
+
+    /// The current item sequence, including which items, if any, are selected
     pub images: ReadSignal<ImagesState>,
+
+    /// Index of the item currently being displayed in the lightbox overlay, if any
     pub overlay_image: Signal<Option<usize>>,
 }
 
+/// Define the `Images` component, which displays a sequence of media item thumbnails.
 #[component(Images<G>)]
 pub fn images(props: ImagesProps) -> View<G> {
     let ImagesProps {
@@ -90,6 +123,14 @@ pub fn images(props: ImagesProps) -> View<G> {
             if let Some(data) = images.response.images.get(index) {
                 let state = images.states.get(&data.hash).unwrap();
 
+                // Define a lambda to handle a mouse click event.
+                //
+                // While in "selecting" mode, we treat mouse clicks as selection toggle events, optionally
+                // including a shift key modifier to (de)select an interval.
+                //
+                // While not in "selecting" mode (or when a control key modifier is used), we simply set
+                // `overlay_image` to the index of the clicked item, which tells the lightbox overlay to display
+                // the high-resolution version of that item.
                 let on_click = {
                     let images = images.clone();
                     let state = state.clone();
@@ -145,6 +186,8 @@ pub fn images(props: ImagesProps) -> View<G> {
                 let selected = state.selected.clone();
 
                 match data.medium {
+                    // Videos and "motion photo" images are rendered as HTML5 video elements which display their
+                    // poster image by default and play a preview clip on mouse over.
                     Medium::ImageWithVideo | Medium::Video => {
                         let video_url = format!("{}/image/small-video/{}", root, hash);
 
@@ -157,7 +200,6 @@ pub fn images(props: ImagesProps) -> View<G> {
                                   class=if *selected.get() { "thumbnail selected" } else { "thumbnail" },
                                   on:mouseenter=play_video,
                                   on:mouseleave=reset_video,
-                                  on:ended=reset_video,
                                   on:click=on_click)
                         }
                     }
