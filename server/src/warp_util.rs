@@ -78,7 +78,7 @@ impl FromStr for Bearer {
         if let Some(body) = s.strip_prefix(prefix) {
             Ok(Self { body: body.into() })
         } else {
-            Err(anyhow!("expected prefix \"{}\"", prefix))
+            Err(anyhow!("expected prefix \"{prefix}\""))
         }
     }
 }
@@ -136,7 +136,7 @@ impl FromStr for Ranges {
                     .collect::<Result<_>>()?,
             ))
         } else {
-            Err(anyhow!("expected prefix \"{}\"", prefix))
+            Err(anyhow!("expected prefix \"{prefix}\""))
         }
     }
 }

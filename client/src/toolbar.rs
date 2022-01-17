@@ -36,10 +36,10 @@ fn patch_tags(
     wasm_bindgen_futures::spawn_local(
         {
             async move {
-                let mut request = client.patch(format!("{}/tags", root));
+                let mut request = client.patch(format!("{root}/tags"));
 
                 if let Some(token) = token.get().deref() {
-                    request = request.header("authorization", &format!("Bearer {}", token));
+                    request = request.header("authorization", &format!("Bearer {token}"));
                 }
 
                 let response = request.json(&patches).send().await?;
@@ -56,7 +56,7 @@ fn patch_tags(
             }
         }
         .unwrap_or_else(move |e| {
-            log::error!("error patching tags: {:?}", e);
+            log::error!("error patching tags: {e:?}");
         }),
     )
 }
@@ -416,7 +416,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                         }
 
                         Err(e) => {
-                            log::error!("unable to parse tag {}: {:?}", add_tag_value.get(), e)
+                            log::error!("unable to parse tag {}: {e:?}", add_tag_value.get())
                         }
                     }
 

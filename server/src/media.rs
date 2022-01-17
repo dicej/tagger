@@ -55,13 +55,19 @@ const VIDEO_PREVIEW_LENGTH_HMS: &str = "00:00:05";
 /// two images in order to consider them duplicates of each other.
 const MAX_AVERAGE_ABSOLUTE_DIFFERENCE: usize = 5;
 
+const ORDINAL_WIDTH: usize = 4;
+const ORDINAL_HEIGHT: usize = 4;
+const ORDINAL_CHANNEL_COUNT: usize = 3;
+
 /// Pair of a media item hash and one of the files where that item was found
+#[derive(Debug)]
 pub struct ItemData {
     pub hash: String,
     pub file: FileData,
 }
 
 /// Metadata about a media item file
+#[derive(Debug)]
 pub struct FileData {
     /// Filesystem path where the file can be found
     pub path: String,
@@ -305,8 +311,29 @@ pub async fn deduplicate<'a>(
     }
 }
 
-/// Calculate the perceptual hash of the media item at the specified `path`.
-pub async fn perceptual_hash(
+fn ordinal(iter: impl Iterator<Item = (u32, u32, Rgba<u8>)>) -> Vec<u8> {
+    let mut ordinal = vec![0u8; ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT];
+
+    for (x, y, Rgba(color)) in iter {
+        let offset = usize::try_from(y / 2).unwrap() * ORDINAL_CHANNEL_COUNT;
+        let shift =
+            usize::try_from(x + ((y % 2) * u32::try_from(ORDINAL_HEIGHT).unwrap())).unwrap();
+
+        for bit in 0..8 {
+            let index = ((7 - bit) * ORDINAL_CHANNEL_COUNT * 2) + offset;
+            let mask = 1 << bit;
+
+            for channel in 0..ORDINAL_CHANNEL_COUNT {
+                ordinal[index + channel] |= ((color[channel] & mask) >> bit) << shift;
+            }
+        }
+    }
+
+    ordinal
+}
+
+/// Calculate the perceptual ordinal of the media item at the specified `path`.
+pub async fn perceptual_ordinal(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
@@ -314,49 +341,47 @@ pub async fn perceptual_hash(
     path: &str,
     video_offset: Option<i64>,
 ) -> Result<String> {
-    const HASH_WIDTH: u32 = 8;
-    const HASH_HEIGHT: u32 = 8;
-
-    let perceptual_hash = webp::Decoder::new(
-        &content(
-            &mut thumbnail(
-                Some(image_lock),
-                image_dir,
-                path,
-                cache_dir,
-                Size::Small,
-                hash,
+    let ordinal = ordinal(
+        webp::Decoder::new(
+            &content(
+                &mut thumbnail(
+                    Some(image_lock),
+                    image_dir,
+                    path,
+                    cache_dir,
+                    Size::Small,
+                    hash,
+                )
+                .await?
+                .0,
             )
-            .await?
-            .0,
+            .await?,
         )
-        .await?,
+        .decode()
+        .ok_or_else(|| anyhow!("unable to decode {path}"))?
+        .to_image()
+        .resize_exact(
+            ORDINAL_WIDTH.try_into().unwrap(),
+            ORDINAL_HEIGHT.try_into().unwrap(),
+            FilterType::Lanczos3,
+        )
+        .pixels(),
     )
-    .decode()
-    .ok_or_else(|| anyhow!("unable to decode {}", path))?
-    .to_image()
-    .resize_exact(HASH_WIDTH, HASH_HEIGHT, FilterType::Lanczos3)
-    .pixels()
-    .map(|(_, _, Rgba(color))| {
-        format!(
-            "{:02x}",
-            (color[0] & 0b1110_0000) | ((color[1] & 0b1110_0000) >> 3) | (color[2] >> 6)
-        )
-    })
+    .iter()
+    .map(|v| format!("{v:02x}"))
     .collect::<Vec<_>>()
     .concat();
 
     Ok(if video_offset == Some(0) {
         format!(
-            "{}-{}",
-            perceptual_hash,
+            "{}-{ordinal}",
             video_track_data(&[image_dir, path].iter().collect::<PathBuf>(), 0)
                 .await?
                 .duration
                 .as_secs()
         )
     } else {
-        perceptual_hash
+        ordinal
     })
 }
 
@@ -376,7 +401,7 @@ pub async fn preload_cache_all(
         if let Err(e) =
             preload_cache(image_lock, image_dir, &item.file, cache_dir, &item.hash).await
         {
-            tracing::warn!("error preloading cache for {}: {:?}", item.hash, e);
+            tracing::warn!("error preloading cache for {}: {e:?}", item.hash);
         }
     }
 
@@ -525,7 +550,7 @@ async fn video_scale(
         height -= 1;
     }
 
-    Ok(format!("scale={}:{},setsar=1:1", width, height))
+    Ok(format!("scale={width}:{height},setsar=1:1"))
 }
 
 /// Return true iff the specified `entry` has an audio codec supported by all modern web browsers.
@@ -703,7 +728,7 @@ async fn video_preview(
     size: Size,
     hash: &str,
 ) -> Result<(AsyncFile, u64)> {
-    let filename = format!("{}/video/{}/{}.mp4", cache_dir, size, hash);
+    let filename = format!("{cache_dir}/video/{size}/{hash}.mp4");
 
     let read = image_lock.read().await;
 
@@ -851,7 +876,7 @@ async fn thumbnail(
     size: Size,
     hash: &str,
 ) -> Result<(AsyncFile, u64, PathBuf)> {
-    let filename = format!("{}/{}/{}.webp", cache_dir, size, hash);
+    let filename = format!("{cache_dir}/{size}/{hash}.webp");
 
     let read = if let Some(image_lock) = image_lock {
         Some(image_lock.read().await)
@@ -911,12 +936,12 @@ async fn thumbnail(
                     Orientation::Rotate180 => transformed.rotate180(),
                     Orientation::Rotate270 => transformed.rotate270(),
                     Orientation::Normal | Orientation::Unspecified => transformed,
-                    _ => return Err(anyhow!("unsupported orientation: {:?}", orientation)),
+                    _ => return Err(anyhow!("unsupported orientation: {orientation:?}")),
                 };
 
                 File::create(&filename)?.write_all(
                     &webp::Encoder::from_image(&transformed)
-                        .map_err(|e| anyhow!("{}", e))?
+                        .map_err(|e| anyhow!("{e}"))?
                         .encode(WEBP_QUALITY),
                 )?;
 
@@ -1004,7 +1029,7 @@ pub async fn image(
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(
                     header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end - 1, length),
+                    format!("bytes {start}-{}/{length}", end - 1),
                 )
                 .header(header::CONTENT_LENGTH, end - start)
                 .header(header::CONTENT_TYPE, content_type)
@@ -1026,4 +1051,111 @@ pub async fn image(
             .header(header::CACHE_CONTROL, cache_control)
             .body(Body::wrap_stream(as_stream(image)))?
     })
+}
+
+#[cfg(test)]
+mod test {
+    use {super::*, std::iter};
+
+    #[test]
+    fn ordinals() {
+        let ordinal = |value| {
+            ordinal(
+                iter::repeat(Rgba([value; 4]))
+                    .enumerate()
+                    .map(|(i, p)| {
+                        (
+                            (i % ORDINAL_WIDTH).try_into().unwrap(),
+                            (i / ORDINAL_WIDTH).try_into().unwrap(),
+                            p,
+                        )
+                    })
+                    .take(ORDINAL_WIDTH * ORDINAL_HEIGHT),
+            )
+        };
+
+        assert_eq!(
+            ordinal(0u8),
+            vec![0u8; ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT]
+        );
+
+        assert_eq!(
+            ordinal(0b1111_1111_u8),
+            vec![0b1111_1111_u8; ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT]
+        );
+
+        assert_eq!(
+            ordinal(0b1111_0000_u8),
+            iter::repeat(0b1111_1111_u8)
+                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
+                .chain(
+                    iter::repeat(0u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
+                )
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            ordinal(0b0000_1111_u8),
+            iter::repeat(0u8)
+                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
+                .chain(
+                    iter::repeat(0b1111_1111_u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
+                )
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            ordinal(0b1100_0000_u8),
+            iter::repeat(0b1111_1111_u8)
+                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
+                .chain(
+                    iter::repeat(0u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT * 3) / 4)
+                )
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            ordinal(0b0011_0000_u8),
+            iter::repeat(0u8)
+                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
+                .chain(
+                    iter::repeat(0b1111_1111u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
+                )
+                .chain(
+                    iter::repeat(0u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
+                )
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            ordinal(0b0000_1100_u8),
+            iter::repeat(0u8)
+                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
+                .chain(
+                    iter::repeat(0b1111_1111u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
+                )
+                .chain(
+                    iter::repeat(0u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
+                )
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            ordinal(0b0000_0011_u8),
+            iter::repeat(0_u8)
+                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT * 3) / 4)
+                .chain(
+                    iter::repeat(0b1111_1111u8)
+                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
+                )
+                .collect::<Vec<_>>()
+        );
+    }
 }

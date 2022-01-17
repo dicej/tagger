@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
             }
         }
         .map_err(|e| {
-            error!("sync error: {:?}", e);
+            error!("sync error: {e:?}");
             process::exit(-1)
         }),
     );

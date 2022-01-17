@@ -105,10 +105,9 @@ pub fn pagination(props: PaginationProps) -> View<G> {
                           on:click=move |_| page_back(&props2),
                           style=left_style)
 
-                        (format!(" {}-{} of {} ",
+                        (format!(" {}-{} of {total} ",
                                  start + 1,
-                                 start + count,
-                                 total))
+                                 start + count))
 
                         i(class="fa fa-angle-right big forward",
                           on:click=move |_| page_forward(&props3),

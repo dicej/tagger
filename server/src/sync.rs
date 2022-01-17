@@ -50,7 +50,7 @@ async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<St
     Ok(hasher
         .finalize()
         .iter()
-        .map(|b| format!("{:02x}", b))
+        .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .concat())
 }
@@ -102,7 +102,7 @@ fn exif_metadata(path: &Path) -> Result<Metadata> {
                     &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
                 )
             })
-            .ok_or_else(|| anyhow!("unrecognized DateTime format: {}", datetime))?
+            .ok_or_else(|| anyhow!("unrecognized DateTime format: {datetime}"))?
             .parse()?,
 
         // Some Android phones embed MPEG-4 video clips in the JPEG files they create, called "motion photos".
@@ -240,24 +240,23 @@ fn find_new<'a>(
     .boxed()
 }
 
-/// Query the database for items for which we have not yet calculated a perceptual hash (e.g. files that have been
-/// newly added), calculate their perceptual hashes, and look for duplicates among all files which share each
-/// perceptual hash.
+/// Query the database for items for which we have not yet calculated a perceptual ordinal (e.g. files that have been
+/// newly added), calculate their ordinals, and look for duplicates among all files which have similar ordinals.
 async fn deduplicate(
     conn: &AsyncMutex<SqliteConnection>,
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
-    // First, find the items for which we have not yet calculated a perceptual hash (p-hash), calculate the p-hash,
-    // and group the items by their p-ashes.
+    // First, find the items for which we have not yet calculated an ordinal, calculate the ordinals,
+    // and group the items by their ordinals.
 
     let unhashed = sqlx::query!(
         "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
          FROM images i \
          INNER JOIN paths p \
          ON i.hash = p.hash \
-         WHERE i.perceptual_hash IS NULL \
+         WHERE i.ordinal IS NULL \
          GROUP BY i.hash"
     )
     .fetch(conn.lock().await.deref_mut())
@@ -267,7 +266,7 @@ async fn deduplicate(
     let mut dirty = HashMap::<_, Vec<_>>::new();
 
     for row in unhashed {
-        let perceptual_hash = crate::media::perceptual_hash(
+        let ordinal = crate::media::perceptual_ordinal(
             image_lock,
             image_dir,
             cache_dir,
@@ -278,16 +277,16 @@ async fn deduplicate(
         .await
         .unwrap_or_else(|e| {
             warn!(
-                "error calculating perceptual hash for {}: {:?}",
+                "error calculating perceptual ordinal for {}: {:?}",
                 row.hash, e
             );
 
-            // If we can't calculate the p-hash now, assume we never will be able to (i.e. the file will never
-            // change) and don't bother trying again.  Instead, record the p-hash as "(unknown)" and move on.
+            // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will never
+            // change) and don't bother trying again.  Instead, record the ordinal as "(unknown)" and move on.
             "(unknown)".into()
         });
 
-        dirty.entry(perceptual_hash).or_default().push(ItemData {
+        dirty.entry(ordinal).or_default().push(ItemData {
             hash: row.hash,
             file: FileData {
                 path: row.path,
@@ -298,27 +297,27 @@ async fn deduplicate(
 
     if !dirty.is_empty() {
         info!(
-            "calculated {} unique perceptual hashes for {} items",
+            "calculated {} unique perceptual ordinals for {} items",
             dirty.len(),
             dirty.values().map(|v| v.len()).sum::<usize>()
         );
     }
 
-    // Next, for each p-hash, collect all the new and old items with that p-hash and deduplicate them, recording
+    // Next, for each ordinal, collect all the new and old items with that ordinal and deduplicate them, recording
     // the results in the database.
 
     let mut item_count = 0;
     let duplicate_count = Arc::new(AtomicU64::new(0));
 
-    for (perceptual_hash, dirty) in dirty {
+    for (ordinal, dirty) in dirty {
         let potential_duplicates = sqlx::query!(
             "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
              FROM images i \
              INNER JOIN paths p \
              ON i.hash = p.hash \
-             WHERE i.perceptual_hash = ?1 \
+             WHERE i.ordinal = ?1 \
              GROUP BY i.hash",
-            perceptual_hash
+            ordinal
         )
         .fetch(conn.lock().await.deref_mut())
         .map_ok(|row| ItemData {
@@ -339,8 +338,8 @@ async fn deduplicate(
                 .await
                 .unwrap_or_else(|e| {
                     warn!(
-                        "error deduplicating for perceptual hash {}: {:?}",
-                        perceptual_hash, e
+                        "error deduplicating for perceptual ordinal {}: {:?}",
+                        ordinal, e
                     );
 
                     // If anything goes wrong deduplicating, assume there's no point in trying again (i.e. assume
@@ -361,7 +360,7 @@ async fn deduplicate(
             })
             .collect::<Vec<_>>();
 
-        // Note that we use a transaction here to ensure everything for this p-hash is updated atomically.  If any
+        // Note that we use a transaction here to ensure everything for this ordinal is updated atomically.  If any
         // part fails or is interrupted, we can just try again in the next pass without worrying about inconsistent
         // state.
         conn.lock()
@@ -374,11 +373,11 @@ async fn deduplicate(
                                 sqlx::query!(
                                     "UPDATE images \
                                      SET \
-                                     perceptual_hash = ?1, \
+                                     ordinal = ?1, \
                                      duplicate_group = 0, \
                                      duplicate_index = 0 \
                                      WHERE hash = ?2",
-                                    perceptual_hash,
+                                    ordinal,
                                     hash,
                                 )
                                 .execute(&mut *conn)
@@ -396,11 +395,11 @@ async fn deduplicate(
                                     sqlx::query!(
                                         "UPDATE images \
                                          SET \
-                                         perceptual_hash = ?1, \
+                                         ordinal = ?1, \
                                          duplicate_group = ?2, \
                                          duplicate_index = ?3 \
                                          WHERE hash = ?4",
-                                        perceptual_hash,
+                                        ordinal,
                                         group,
                                         index,
                                         hash,
@@ -556,7 +555,7 @@ pub async fn sync(
                 )
                 .await
                 {
-                    warn!("error preloading cache for {}: {:?}", hash, e);
+                    warn!("error preloading cache for {hash}: {e:?}");
                 }
             }
         } else {
@@ -564,7 +563,7 @@ pub async fn sync(
             // assume they will never change and thus will never have the metadata we need to sort and display them
             // in this application.
 
-            info!("({} of {}) insert bad path {}", index + 1, new_len, path);
+            info!("({} of {new_len}) insert bad path {path}", index + 1);
 
             sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
                 .execute(conn.lock().await.deref_mut())
@@ -575,7 +574,7 @@ pub async fn sync(
     // For each obsolete file found, atomically remove it from the database.
 
     for (index, path) in obsolete.into_iter().enumerate() {
-        info!("({} of {}) delete {}", index + 1, obsolete_len, path);
+        info!("({} of {obsolete_len}) delete {path}", index + 1);
 
         conn.lock()
             .await
@@ -612,10 +611,8 @@ pub async fn sync(
     }
 
     info!(
-        "sync took {:?} (added {}; deleted {})",
-        then.elapsed(),
-        new_len,
-        obsolete_len
+        "sync took {:?} (added {new_len}; deleted {obsolete_len})",
+        then.elapsed()
     );
 
     if deduplicate {

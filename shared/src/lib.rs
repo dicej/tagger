@@ -344,7 +344,7 @@ impl FromStr for Variant {
             "small-video" => Self::Video(Size::Small),
             "large-video" => Self::Video(Size::Large),
             "original" => Self::Original,
-            _ => return Err(anyhow!("unrecognized variant: {}", s)),
+            _ => return Err(anyhow!("unrecognized variant: {s}")),
         })
     }
 }
