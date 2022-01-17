@@ -41,7 +41,7 @@ impl FromStr for Tag {
         if let TagExpression::Tag(tag) = s.parse::<TagExpression>()? {
             Ok(tag)
         } else {
-            Err(anyhow!("expected tag, got {}", s))
+            Err(anyhow!("expected tag, got {s}"))
         }
     }
 }
@@ -50,7 +50,7 @@ impl Display for Tag {
     /// Convert a `Tag` to a string, e.g. "year:2020" or "sunset".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(category) = &self.category {
-            write!(f, "{}:{}", category, self.value)
+            write!(f, "{category}:{}", self.value)
         } else {
             write!(f, "{}", self.value)
         }
@@ -135,7 +135,7 @@ impl FromStr for TagExpression {
         PARSER
             .parse(s)
             .map(|tags| *tags)
-            .map_err(|e| anyhow!("{}", e))
+            .map_err(|e| anyhow!("{e}"))
     }
 }
 
@@ -143,10 +143,10 @@ impl Display for TagExpression {
     /// Convert a `TagExpression` to a string, e.g. "(year:2020 and (sunset or (not month:7)))".
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TagExpression::Tag(tag) => write!(f, "{}", tag),
-            TagExpression::Not(a) => write!(f, "(not {})", a),
-            TagExpression::And(a, b) => write!(f, "({} and {})", a, b),
-            TagExpression::Or(a, b) => write!(f, "({} or {})", a, b),
+            TagExpression::Tag(tag) => write!(f, "{tag}"),
+            TagExpression::Not(a) => write!(f, "(not {a})"),
+            TagExpression::And(a, b) => write!(f, "({a} and {b})"),
+            TagExpression::Or(a, b) => write!(f, "({a} or {b})"),
         }
     }
 }
@@ -238,7 +238,7 @@ impl FromStr for TagTree {
             static ref PARSER: TagTreeParser = TagTreeParser::new();
         }
 
-        PARSER.parse(s).map_err(|e| anyhow!("{}", e))
+        PARSER.parse(s).map_err(|e| anyhow!("{e}"))
     }
 }
 
@@ -253,9 +253,9 @@ impl Display for TagTree {
             } else {
                 f.write_str(",")?;
             }
-            write!(f, "{}=>", tag)?;
+            write!(f, "{tag}=>")?;
             if let TagState::Included(tree) = state {
-                write!(f, "{}", tree)?;
+                write!(f, "{tree}")?;
             } else {
                 f.write_str("excluded")?;
             }
@@ -348,7 +348,7 @@ mod test {
     };
 
     fn parse_te(s: &str) -> Result<TagExpression> {
-        s.parse().map_err(|e| anyhow!("{:?}", e))
+        s.parse().map_err(|e| anyhow!("{e:?}"))
     }
 
     fn raw_cat_tag(category: &str, tag: &str) -> Tag {

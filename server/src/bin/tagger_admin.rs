@@ -4,7 +4,7 @@ use {
     anyhow::Result,
     futures::stream::TryStreamExt,
     structopt::StructOpt,
-    tagger_server::{FileData, ItemData},
+    tagger_server::{FileData, Item, ItemData},
     tagger_shared::tag_expression::TagExpression,
     tokio::sync::RwLock as AsyncRwLock,
 };
@@ -12,7 +12,7 @@ use {
 #[derive(StructOpt, Debug)]
 #[structopt(name = "tagger-admin", about = "Image tagging webapp admin tool")]
 enum Command {
-    /// Add a new user to the database
+    /// Add a new user to the database.
     AddUser {
         /// SQLite database to create or reuse
         state_file: String,
@@ -32,7 +32,7 @@ enum Command {
         may_patch: bool,
     },
 
-    /// Generate thumbnail/transcode cache for all images and videos
+    /// Generate thumbnail/transcode cache for images and videos.
     PreloadCache {
         /// SQLite database to create or reuse
         state_file: String,
@@ -45,6 +45,23 @@ enum Command {
 
         /// Image hash to generate cache files for.  If not specified, cache files are generated for all images.
         hash: Option<String>,
+    },
+
+    /// Calculate perceptual hashes for the specified items and identify any duplicates among them.
+    ///
+    /// Note that this command does not update the database -- it only prints the results to standard output.
+    Compare {
+        /// SQLite database to create or reuse
+        state_file: String,
+
+        /// Directory containing source image and video files
+        image_directory: String,
+
+        /// Directory in which to cache lazily generated image and video variants
+        cache_directory: String,
+
+        /// Image hashes to analyze
+        hashes: Vec<String>,
     },
 }
 
@@ -75,6 +92,8 @@ async fn main() -> Result<()> {
             )
             .execute(&mut conn)
             .await?;
+
+            println!("success!");
         }
 
         Command::PreloadCache {
@@ -134,10 +153,78 @@ async fn main() -> Result<()> {
                 )
                 .await
             }?;
+
+            println!("success!");
+        }
+
+        Command::Compare {
+            state_file,
+            image_directory,
+            cache_directory,
+            hashes,
+        } => {
+            let mut conn = tagger_server::open(&state_file).await?;
+
+            let image_lock = AsyncRwLock::new(());
+
+            let mut items = Vec::new();
+
+            for hash in hashes {
+                if let Some(row) = sqlx::query!(
+                    "SELECT i.video_offset, min(p.path) as \"path!: String\" \
+                     FROM images i \
+                     INNER JOIN paths p \
+                     ON i.hash = p.hash \
+                     WHERE i.hash = ?1 \
+                     GROUP BY i.hash",
+                    hash
+                )
+                .fetch_optional(&mut conn)
+                .await?
+                {
+                    let perceptual_hash = tagger_server::perceptual_hash(
+                        &image_lock,
+                        &image_directory,
+                        &cache_directory,
+                        &hash,
+                        &row.path,
+                        row.video_offset,
+                    )
+                    .await?;
+
+                    println!(
+                        "perceptual hash for {hash} is {perceptual_hash} and ordinal is {:?}",
+                        perceptual_hash.ordinal()
+                    );
+
+                    items.push(Item {
+                        perceptual_hash,
+                        duplicate_group: None,
+                        duplicate_index: None,
+                        data: ItemData {
+                            hash,
+                            file: FileData {
+                                video_offset: row.video_offset,
+                                path: row.path,
+                            },
+                        },
+                    });
+                } else {
+                    println!("no item found for {hash}");
+                }
+            }
+
+            let groups = tagger_server::deduplicate(
+                &image_lock,
+                &image_directory,
+                &cache_directory,
+                &items.iter().collect(),
+            )
+            .await?;
+
+            println!("{groups:#?}");
         }
     }
-
-    println!("success!");
 
     Ok(())
 }

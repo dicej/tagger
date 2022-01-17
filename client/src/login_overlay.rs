@@ -70,7 +70,7 @@ pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
 
                             async move {
                                 let response = client
-                                    .post(format!("{}/token", root))
+                                    .post(format!("{root}/token"))
                                     .form(&TokenRequest {
                                         grant_type: GrantType::Password,
                                         username: user_name.trim().into(),
@@ -100,7 +100,7 @@ pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
                             let log_in_error = log_in_error.clone();
 
                             move |e| {
-                                log::error!("error logging in: {:?}", e);
+                                log::error!("error logging in: {e:?}");
 
                                 log_in_error.set(Some("Error communicating with server".into()));
                             }

@@ -2,25 +2,25 @@
 //! items on the filesystem.
 
 use {
-    crate::media::{FileData, ItemData},
+    crate::{
+        media::{self, FileData, Item, ItemData, PerceptualHash, PERCEPTUAL_HASH_LENGTH},
+        BUFFER_SIZE,
+    },
     anyhow::{anyhow, Error, Result},
     chrono::{DateTime, Datelike, NaiveDateTime, Utc},
-    futures::{future::BoxFuture, stream, FutureExt, StreamExt, TryStreamExt},
+    futures::{future::BoxFuture, FutureExt, TryStreamExt},
     lazy_static::lazy_static,
     regex::Regex,
     rexiv2::Metadata as ExifMetadata,
     sha2::{Digest, Sha256},
     sqlx::{Connection, SqliteConnection},
     std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         convert::{TryFrom, TryInto},
         fs::File,
         ops::DerefMut,
         path::{Path, PathBuf},
-        sync::{
-            atomic::{AtomicU64, Ordering::Relaxed},
-            Arc,
-        },
+        str::FromStr,
         time::Instant,
     },
     tokio::{
@@ -36,7 +36,7 @@ use {
 async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<String> {
     let mut hasher = Sha256::default();
 
-    let mut buffer = vec![0; crate::BUFFER_SIZE];
+    let mut buffer = vec![0; BUFFER_SIZE];
 
     loop {
         let count = input.read(&mut buffer[..]).await?;
@@ -50,7 +50,7 @@ async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<St
     Ok(hasher
         .finalize()
         .iter()
-        .map(|b| format!("{:02x}", b))
+        .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .concat())
 }
@@ -72,10 +72,10 @@ struct Metadata {
 /// See also [deduplicate].
 struct DeduplicationSummary {
     /// Number of media items visited during deduplication
-    item_count: u64,
+    item_count: usize,
 
     /// Number of items found which are considered duplicates
-    duplicate_count: u64,
+    duplicate_count: usize,
 }
 
 /// Extract relevant metadata from the EXIF content found in the file at `path`.
@@ -102,7 +102,7 @@ fn exif_metadata(path: &Path) -> Result<Metadata> {
                     &c[1], &c[2], &c[3], &c[4], &c[5], &c[6]
                 )
             })
-            .ok_or_else(|| anyhow!("unrecognized DateTime format: {}", datetime))?
+            .ok_or_else(|| anyhow!("unrecognized DateTime format: {datetime}"))?
             .parse()?,
 
         // Some Android phones embed MPEG-4 video clips in the JPEG files they create, called "motion photos".
@@ -217,9 +217,8 @@ fn find_new<'a>(
                                         Ok(data) => Some(data),
                                         Err(e) => {
                                             warn!(
-                                                "unable to get metadata for {}: {:?}",
-                                                path.to_string_lossy(),
-                                                e
+                                                "unable to get metadata for {}: {e:?}",
+                                                path.to_string_lossy()
                                             );
 
                                             None
@@ -240,189 +239,299 @@ fn find_new<'a>(
     .boxed()
 }
 
+/// Group the specified `items` according to transitive similarity.
+///
+/// Here we define two items to be similar if their `PerceptualHash`es are either directly similar or transitively
+/// similar.  I.e. if A is similar to B, and B is similar to C, then A, B, and C will be grouped together even if A
+/// is not directly similar to C.  See also `PerceptualHash::is_similar_to` and `media::group_similar`.
+fn group_similar(items: &[Item]) -> Vec<HashSet<&Item>> {
+    let mut map = BTreeMap::<_, VecDeque<_>>::new();
+
+    for item in items {
+        map.entry(item.perceptual_hash.ordinal())
+            .or_default()
+            .push_back(item);
+    }
+
+    let mut items = map.into_iter().collect::<VecDeque<_>>();
+
+    let mut similar = HashMap::<&Item, HashSet<&Item>>::new();
+
+    while let Some((ordinal, mut my_items)) = items.pop_front() {
+        // We need not compare items whose `PerceptualOrdinal`s which are not similar -- if the
+        // `PerceptualOrdinal`s are not similar then the `PerceptualHash`es will not be either.  See also
+        // `PerceptualOrdinal::is_similar_to`.
+        let others = items
+            .iter()
+            .take_while(|(o, _)| ordinal.is_similar_to(o))
+            .map(|(_, i)| i.iter())
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+
+        while let Some(item) = my_items.pop_front() {
+            similar.entry(item).or_default();
+
+            for other in my_items.iter().chain(others.iter()) {
+                if item.perceptual_hash.is_similar_to(&other.perceptual_hash) {
+                    similar.entry(item).or_default().insert(other);
+
+                    similar.entry(other).or_default().insert(item);
+                }
+            }
+        }
+    }
+
+    media::group_similar(similar)
+}
+
+/// Scan the collection of media items in `all`, grouping them by similarity and deduplicating each group with at
+/// least one `dirty` item in it, recording the results in the database.
+async fn deduplicate_dirty(
+    conn: &AsyncMutex<SqliteConnection>,
+    image_lock: &AsyncRwLock<()>,
+    image_dir: &str,
+    cache_dir: &str,
+    mut dirty: HashMap<String, Item>,
+    all: Vec<Item>,
+) -> Result<DeduplicationSummary> {
+    let new_count = dirty.len();
+
+    info!("{new_count} new items since previous deduplication");
+
+    // First, group all the items according to similarity, and identify which groups contain at least one dirty
+    // item.
+    //
+    // Note that we use task::block_in_place here since this is an O(n^2) operation and can take a while.
+
+    let dirty_groups = task::block_in_place(|| {
+        group_similar(&all)
+            .into_iter()
+            .filter(|similar| {
+                similar
+                    .iter()
+                    .any(|item| dirty.contains_key(&item.data.hash))
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // Next, deduplicate each of the groups identified above, and add any whose duplicate group or index has
+    // changed to the `dirty` collection so we can update the database later.
+
+    let mut duplicate_count = 0;
+
+    let group_count = dirty_groups.len();
+
+    for (group_index, similar) in dirty_groups.into_iter().enumerate() {
+        info!(
+            "({} of {group_count}) deduplicating similar items [{}]",
+            group_index + 1,
+            similar
+                .iter()
+                .map(|item| &item.data.hash as &str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let duplicates = media::deduplicate(image_lock, image_dir, cache_dir, &similar)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    "error deduplicating group [{}]: {e:?}",
+                    similar
+                        .iter()
+                        .map(|item| &item.data.hash as &str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+
+                // If anything goes wrong deduplicating, assume there's no point in trying again (i.e. assume none
+                // of the files will change and the error was deterministic).  Instead, we consider all the items
+                // to be unique.
+                similar.iter().map(|&item| vec![item]).collect()
+            });
+
+        for duplicates in duplicates {
+            let alone = duplicates.len() == 1;
+
+            let duplicate_group = if alone {
+                None
+            } else {
+                duplicates.first().map(|item| item.data.hash.clone())
+            };
+
+            for (index, item) in duplicates.into_iter().enumerate() {
+                let duplicate_index = if alone {
+                    None
+                } else {
+                    Some(i64::try_from(index).unwrap())
+                };
+
+                if item.duplicate_group != duplicate_group
+                    || item.duplicate_index != duplicate_index
+                {
+                    if !alone {
+                        duplicate_count += 1;
+                    }
+
+                    dirty.insert(
+                        item.data.hash.clone(),
+                        Item {
+                            duplicate_group: duplicate_group.clone(),
+                            duplicate_index,
+                            perceptual_hash: item.perceptual_hash.clone(),
+                            data: item.data.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // Finally, update the database in a single transaction so that if it fails or is interrupted, we can try again
+    // in the next pass without worrying about inconsistent state.
+
+    let item_count = dirty.len();
+
+    conn.lock()
+        .await
+        .transaction(move |conn| {
+            async move {
+                for item in dirty.values() {
+                    let perceptual_hash = item.perceptual_hash.to_string();
+
+                    sqlx::query!(
+                        "UPDATE images \
+                         SET \
+                         perceptual_hash = ?1, \
+                         duplicate_group = ?2, \
+                         duplicate_index = ?3 \
+                         WHERE hash = ?4",
+                        perceptual_hash,
+                        item.duplicate_group,
+                        item.duplicate_index,
+                        item.data.hash,
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+                }
+
+                Ok::<_, Error>(())
+            }
+            .boxed()
+        })
+        .await?;
+
+    Ok(DeduplicationSummary {
+        item_count,
+        duplicate_count,
+    })
+}
+
 /// Query the database for items for which we have not yet calculated a perceptual hash (e.g. files that have been
-/// newly added), calculate their perceptual hashes, and look for duplicates among all files which share each
-/// perceptual hash.
+/// newly added), calculate their p-hashes, and look for duplicates among all files which have similar p-hashes.
 async fn deduplicate(
     conn: &AsyncMutex<SqliteConnection>,
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
-    // First, find the items for which we have not yet calculated a perceptual hash (p-hash), calculate the p-hash,
-    // and group the items by their p-ashes.
+    // First, collect all items, calculating any missing perceptual hashes.
 
-    let unhashed = sqlx::query!(
-        "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
+    let rows = sqlx::query!(
+        "SELECT \
+         i.hash, \
+         i.video_offset, \
+         i.perceptual_hash, \
+         i.duplicate_group, \
+         i.duplicate_index, \
+         min(p.path) as \"path!: String\" \
          FROM images i \
          INNER JOIN paths p \
          ON i.hash = p.hash \
-         WHERE i.perceptual_hash IS NULL \
          GROUP BY i.hash"
     )
     .fetch(conn.lock().await.deref_mut())
     .try_collect::<Vec<_>>()
     .await?;
 
-    let mut dirty = HashMap::<_, Vec<_>>::new();
+    let mut dirty = HashMap::new();
+    let mut all = Vec::new();
 
-    for row in unhashed {
-        let perceptual_hash = crate::media::perceptual_hash(
-            image_lock,
-            image_dir,
-            cache_dir,
-            &row.hash,
-            &row.path,
-            row.video_offset,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            warn!(
-                "error calculating perceptual hash for {}: {:?}",
-                row.hash, e
+    let dirty_count = rows
+        .iter()
+        .filter(|row| row.perceptual_hash.is_none())
+        .count();
+    let mut dirty_index = 1;
+
+    for row in rows {
+        let (perceptual_hash, is_dirty) = if let Some(perceptual_hash) = &row.perceptual_hash {
+            (PerceptualHash::from_str(perceptual_hash)?, false)
+        } else {
+            info!(
+                "({dirty_index} of {dirty_count}) calculating perceptual hash for {}",
+                row.hash
             );
 
-            // If we can't calculate the p-hash now, assume we never will be able to (i.e. the file will never
-            // change) and don't bother trying again.  Instead, record the p-hash as "(unknown)" and move on.
-            "(unknown)".into()
-        });
+            dirty_index += 1;
 
-        dirty.entry(perceptual_hash).or_default().push(ItemData {
-            hash: row.hash,
-            file: FileData {
-                path: row.path,
-                video_offset: row.video_offset,
-            },
-        });
-    }
-
-    if !dirty.is_empty() {
-        info!(
-            "calculated {} unique perceptual hashes for {} items",
-            dirty.len(),
-            dirty.values().map(|v| v.len()).sum::<usize>()
-        );
-    }
-
-    // Next, for each p-hash, collect all the new and old items with that p-hash and deduplicate them, recording
-    // the results in the database.
-
-    let mut item_count = 0;
-    let duplicate_count = Arc::new(AtomicU64::new(0));
-
-    for (perceptual_hash, dirty) in dirty {
-        let potential_duplicates = sqlx::query!(
-            "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
-             FROM images i \
-             INNER JOIN paths p \
-             ON i.hash = p.hash \
-             WHERE i.perceptual_hash = ?1 \
-             GROUP BY i.hash",
-            perceptual_hash
-        )
-        .fetch(conn.lock().await.deref_mut())
-        .map_ok(|row| ItemData {
-            hash: row.hash,
-            file: FileData {
-                path: row.path,
-                video_offset: row.video_offset,
-            },
-        })
-        .chain(stream::iter(dirty).map(Ok))
-        .try_collect::<Vec<_>>()
-        .await?;
-
-        item_count += potential_duplicates.len();
-
-        let duplicates =
-            crate::media::deduplicate(image_lock, image_dir, cache_dir, &potential_duplicates)
+            (
+                media::perceptual_hash(
+                    image_lock,
+                    image_dir,
+                    cache_dir,
+                    &row.hash,
+                    &row.path,
+                    row.video_offset,
+                )
                 .await
                 .unwrap_or_else(|e| {
-                    warn!(
-                        "error deduplicating for perceptual hash {}: {:?}",
-                        perceptual_hash, e
-                    );
+                    warn!("error calculating perceptual hash for {}: {e:?}", row.hash);
 
-                    // If anything goes wrong deduplicating, assume there's no point in trying again (i.e. assume
-                    // none of the files will change and the error was deterministic).  Instead, we assume none of
-                    // the items is a duplicate of the others.
-                    potential_duplicates.iter().map(|item| vec![item]).collect()
-                });
-
-        let duplicate_count = duplicate_count.clone();
-
-        let duplicates = duplicates
-            .iter()
-            .map(|duplicates| {
-                duplicates
-                    .iter()
-                    .map(|image| image.hash.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        // Note that we use a transaction here to ensure everything for this p-hash is updated atomically.  If any
-        // part fails or is interrupted, we can just try again in the next pass without worrying about inconsistent
-        // state.
-        conn.lock()
-            .await
-            .transaction(move |conn| {
-                async move {
-                    for (group, duplicates) in duplicates.iter().enumerate() {
-                        match &duplicates[..] {
-                            [hash] => {
-                                sqlx::query!(
-                                    "UPDATE images \
-                                     SET \
-                                     perceptual_hash = ?1, \
-                                     duplicate_group = 0, \
-                                     duplicate_index = 0 \
-                                     WHERE hash = ?2",
-                                    perceptual_hash,
-                                    hash,
-                                )
-                                .execute(&mut *conn)
-                                .await?;
-                            }
-
-                            _ => {
-                                duplicate_count
-                                    .fetch_add(u64::try_from(duplicates.len()).unwrap(), Relaxed);
-
-                                for (index, hash) in duplicates.iter().enumerate() {
-                                    let group = i64::try_from(group + 1).unwrap();
-                                    let index = i64::try_from(index).unwrap();
-
-                                    sqlx::query!(
-                                        "UPDATE images \
-                                         SET \
-                                         perceptual_hash = ?1, \
-                                         duplicate_group = ?2, \
-                                         duplicate_index = ?3 \
-                                         WHERE hash = ?4",
-                                        perceptual_hash,
-                                        group,
-                                        index,
-                                        hash,
-                                    )
-                                    .execute(&mut *conn)
-                                    .await?;
-                                }
-                            }
-                        }
+                    // If we can't calculate the p-hash now, assume we never will be able to (i.e. the file will
+                    // never change) and don't bother trying again.  Instead, record the p-hash as all zeros and
+                    // move on.
+                    PerceptualHash {
+                        video_length_seconds: None,
+                        image_hash: vec![0u8; PERCEPTUAL_HASH_LENGTH],
                     }
+                }),
+                true,
+            )
+        };
 
-                    Ok::<_, Error>(())
-                }
-                .boxed()
-            })
-            .await?;
+        let item = Item {
+            data: ItemData {
+                hash: row.hash,
+                file: FileData {
+                    path: row.path,
+                    video_offset: row.video_offset,
+                },
+            },
+            perceptual_hash: perceptual_hash.clone(),
+            duplicate_group: row.duplicate_group,
+            duplicate_index: row.duplicate_index,
+        };
+
+        if is_dirty {
+            dirty.insert(item.data.hash.clone(), item.clone());
+        }
+
+        all.push(item);
     }
 
-    Ok(DeduplicationSummary {
-        item_count: item_count.try_into().unwrap(),
-        duplicate_count: duplicate_count.load(Relaxed),
-    })
+    if dirty.is_empty() {
+        // No new items present -- nothing else to do.
+        info!("no new items found to deduplicate");
+
+        Ok(DeduplicationSummary {
+            item_count: 0,
+            duplicate_count: 0,
+        })
+    } else {
+        // Found new items -- recalculate duplicates accordingly.
+        deduplicate_dirty(conn, image_lock, image_dir, cache_dir, dirty, all).await
+    }
 }
 
 /// Synchronize the Tagger database with the filesystem.
@@ -444,10 +553,7 @@ pub async fn sync(
     preload: bool,
     deduplicate: bool,
 ) -> Result<()> {
-    info!(
-        "starting sync (preload: {}; deduplicate: {})",
-        preload, deduplicate
-    );
+    info!("starting sync (preload: {preload}; deduplicate: {deduplicate})");
 
     let then = Instant::now();
 
@@ -491,12 +597,8 @@ pub async fn sync(
                     .await?;
 
             info!(
-                "({} of {}) insert {} (hash {}; data {:?})",
-                index + 1,
-                new_len,
-                path,
-                hash,
-                data
+                "({} of {new_len}) insert {path} (hash {hash}; data {data:?})",
+                index + 1
             );
 
             conn.lock()
@@ -544,7 +646,7 @@ pub async fn sync(
                 .await?;
 
             if preload {
-                if let Err(e) = crate::media::preload_cache(
+                if let Err(e) = media::preload_cache(
                     image_lock,
                     image_dir,
                     &FileData {
@@ -556,7 +658,7 @@ pub async fn sync(
                 )
                 .await
                 {
-                    warn!("error preloading cache for {}: {:?}", hash, e);
+                    warn!("error preloading cache for {hash}: {e:?}");
                 }
             }
         } else {
@@ -564,7 +666,7 @@ pub async fn sync(
             // assume they will never change and thus will never have the metadata we need to sort and display them
             // in this application.
 
-            info!("({} of {}) insert bad path {}", index + 1, new_len, path);
+            info!("({} of {new_len}) insert bad path {path}", index + 1);
 
             sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
                 .execute(conn.lock().await.deref_mut())
@@ -575,7 +677,7 @@ pub async fn sync(
     // For each obsolete file found, atomically remove it from the database.
 
     for (index, path) in obsolete.into_iter().enumerate() {
-        info!("({} of {}) delete {}", index + 1, obsolete_len, path);
+        info!("({} of {obsolete_len}) delete {path}", index + 1);
 
         conn.lock()
             .await
@@ -612,10 +714,8 @@ pub async fn sync(
     }
 
     info!(
-        "sync took {:?} (added {}; deleted {})",
-        then.elapsed(),
-        new_len,
-        obsolete_len
+        "sync took {:?} (added {new_len}; deleted {obsolete_len})",
+        then.elapsed()
     );
 
     if deduplicate {

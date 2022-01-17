@@ -35,7 +35,6 @@ fn build_images_query<'a>(
          hash, \
          datetime, \
          video_offset, \
-         perceptual_hash, \
          duplicate_group, \
          duplicate_index, \
          (SELECT group_concat(CASE WHEN category IS NULL THEN tag ELSE category || ':' || tag END) \
@@ -85,22 +84,18 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
             hash: Some(Arc::from(row.get::<&str, _>(0))),
         };
 
-        let perceptual_hash = row.get::<Option<&str>, _>(3).map(Arc::<str>::from);
+        let duplicate_group = row.get::<Option<&str>, _>(3).map(Arc::<str>::from);
+        let duplicate_index = row.get::<Option<i64>, _>(4);
 
-        if let Some(perceptual_hash) = &perceptual_hash {
-            let duplicate_group = row.get::<i64, _>(4);
-
-            if duplicate_group > 0 {
-                let duplicate_index = row.get::<i64, _>(5);
-
-                duplicates
-                    .entry((perceptual_hash.clone(), duplicate_group))
-                    .or_default()
-                    .insert(duplicate_index, key.clone());
-            }
+        if let (Some(duplicate_group), Some(duplicate_index)) = (&duplicate_group, duplicate_index)
+        {
+            duplicates
+                .entry(duplicate_group.clone())
+                .or_default()
+                .insert(duplicate_index, key.clone());
         }
 
-        row_map.insert(key, (row, perceptual_hash));
+        row_map.insert(key, (row, duplicate_group));
     }
 
     // Next, scan the map in reverse chronological order, consolidating duplicates and building `ImageData` objects
@@ -115,31 +110,25 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
     let mut earlier_count = 0;
     let mut duplicates_seen = HashSet::new();
 
-    for (mut key, (ref row, perceptual_hash)) in row_map.iter().rev() {
+    for (mut key, (ref row, duplicate_group)) in row_map.iter().rev() {
         let mut row = row;
         let mut my_duplicates = Vec::new();
 
-        if let Some(perceptual_hash) = &perceptual_hash {
-            let duplicate_group = row.get::<i64, _>(4);
+        if let Some(duplicate_group) = &duplicate_group {
+            if duplicates_seen.contains(duplicate_group) {
+                continue;
+            } else if let Some(duplicates) = duplicates.get(duplicate_group) {
+                duplicates_seen.insert(duplicate_group.clone());
 
-            if duplicate_group > 0 {
-                if duplicates_seen.contains(&(perceptual_hash.clone(), duplicate_group)) {
-                    continue;
-                } else if let Some(duplicates) =
-                    duplicates.get(&(perceptual_hash.clone(), duplicate_group))
-                {
-                    duplicates_seen.insert((perceptual_hash.clone(), duplicate_group));
+                let mut iter = duplicates.values();
 
-                    let mut iter = duplicates.values();
+                key = iter.next().unwrap();
 
-                    key = iter.next().unwrap();
+                row = &row_map.get(key).unwrap().0;
 
-                    row = &row_map.get(key).unwrap().0;
-
-                    my_duplicates = iter
-                        .map(|key| key.hash.clone().unwrap())
-                        .collect::<Vec<_>>();
-                }
+                my_duplicates = iter
+                    .map(|key| key.hash.clone().unwrap())
+                    .collect::<Vec<_>>();
             }
         }
 
@@ -166,7 +155,7 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
                     duplicates: my_duplicates,
 
                     tags: row
-                        .get::<&str, _>(6)
+                        .get::<&str, _>(5)
                         .split(',')
                         .filter(|s| !s.is_empty())
                         .map(Tag::from_str)

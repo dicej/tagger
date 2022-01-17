@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
 
     let _ = fs::remove_file(db).await;
 
-    let mut conn = format!("sqlite://{}", db)
+    let mut conn = format!("sqlite://{db}")
         .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
         .connect()
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
         sqlx::query(statement).execute(&mut conn).await?;
     }
 
-    println!("cargo:rustc-env=DATABASE_URL=sqlite://{}", db);
+    println!("cargo:rustc-env=DATABASE_URL=sqlite://{db}");
 
     Ok(())
 }

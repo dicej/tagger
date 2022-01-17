@@ -36,10 +36,10 @@ fn patch_tags(
     wasm_bindgen_futures::spawn_local(
         {
             async move {
-                let mut request = client.patch(format!("{}/tags", root));
+                let mut request = client.patch(format!("{root}/tags"));
 
                 if let Some(token) = token.get().deref() {
-                    request = request.header("authorization", &format!("Bearer {}", token));
+                    request = request.header("authorization", &format!("Bearer {token}"));
                 }
 
                 let response = request.json(&patches).send().await?;
@@ -56,7 +56,7 @@ fn patch_tags(
             }
         }
         .unwrap_or_else(move |e| {
-            log::error!("error patching tags: {:?}", e);
+            log::error!("error patching tags: {e:?}");
         }),
     )
 }
@@ -374,8 +374,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                                 tag.category.as_deref(),
                             ) {
                                 log::error!(
-                                    "cannot add tag {} since it belongs to an immutable category",
-                                    tag
+                                    "cannot add tag {tag} since it belongs to an immutable category",
                                 )
                             } else {
                                 let images = images.get();
@@ -416,7 +415,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                         }
 
                         Err(e) => {
-                            log::error!("unable to parse tag {}: {:?}", add_tag_value.get(), e)
+                            log::error!("unable to parse tag {}: {e:?}", add_tag_value.get())
                         }
                     }
 
@@ -435,6 +434,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
             filter_chain: List::Nil,
             unfiltered_tags: unfiltered_tags.clone(),
             on_unauthorized: on_unauthorized.clone(),
+            show_menu: show_menu.clone(),
         },
         filtered_tags: unfiltered_tags,
         category: None,

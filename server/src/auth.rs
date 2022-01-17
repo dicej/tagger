@@ -171,7 +171,7 @@ pub fn authorize(token: &str, key: &[u8]) -> Result<Arc<Authorization>, HttpErro
             &Validation::new(Algorithm::HS256),
         )
         .map_err(|e| {
-            warn!("received invalid token: {}: {:?}", token, e);
+            warn!("received invalid token: {token}: {e:?}");
 
             HttpError::from_slice(StatusCode::UNAUTHORIZED, "invalid token")
         })?

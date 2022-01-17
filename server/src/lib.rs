@@ -63,7 +63,10 @@ use {
 
 pub use {
     auth::hash_password,
-    media::{preload_cache, preload_cache_all, FileData, ItemData},
+    media::{
+        deduplicate, perceptual_hash, preload_cache, preload_cache_all, FileData, Item, ItemData,
+        PerceptualHash, PerceptualOrdinal,
+    },
     sync::sync,
 };
 
@@ -127,7 +130,7 @@ impl FromStr for PreloadPolicy {
             "none" => Self::None,
             "new" => Self::New,
             "all" => Self::All,
-            _ => return Err(anyhow!("unknown preload policy: {}", s)),
+            _ => return Err(anyhow!("unknown preload policy: {s}")),
         })
     }
 }
@@ -187,7 +190,7 @@ pub struct Options {
 
 /// Open or create an SQLite database using the specified filename.
 pub async fn open(state_file: &str) -> Result<SqliteConnection> {
-    let mut conn = format!("sqlite://{}", state_file)
+    let mut conn = format!("sqlite://{state_file}")
         .parse::<SqliteConnectOptions>()?
         .create_if_missing(true)
         .connect()
@@ -370,7 +373,7 @@ async fn routes(
                     .await
                 }
                 .map_err(|e| {
-                    warn!("error authorizing: {:?}", e);
+                    warn!("error authorizing: {e:?}");
 
                     Rejection::from(HttpError::from(e))
                 })
@@ -400,7 +403,7 @@ async fn routes(
                                     .body(Body::from(state))?)
                             }
                             .map_err(move |e| {
-                                warn!(?auth, "error retrieving state: {:?}", e);
+                                warn!(?auth, "error retrieving state: {e:?}");
 
                                 Rejection::from(HttpError::from(e))
                             })
@@ -428,7 +431,7 @@ async fn routes(
                                         .body(Body::from(tags))?)
                                 }
                                 .map_err(move |e| {
-                                    warn!(?auth, "error retrieving tags: {:?}", e);
+                                    warn!(?auth, "error retrieving tags: {e:?}");
 
                                     Rejection::from(HttpError::from(e))
                                 })
@@ -469,7 +472,7 @@ async fn routes(
                                     }
                                 }
                                 .map_err(move |e| {
-                                    warn!("error retrieving image {}: {:?}", hash, e);
+                                    warn!("error retrieving image {hash}: {e:?}");
 
                                     Rejection::from(HttpError::from(e))
                                 })
@@ -509,11 +512,10 @@ async fn routes(
                             .map_err(move |e| {
                                 warn!(
                                     ?auth,
-                                    "error applying patch {}: {:?}",
+                                    "error applying patch {}: {e:?}",
                                     serde_json::to_string(patches.as_ref()).unwrap_or_else(|_| {
                                         "(unable to serialize patches)".to_string()
-                                    }),
-                                    e
+                                    })
                                 );
 
                                 Rejection::from(HttpError::from(e))
@@ -530,9 +532,9 @@ async fn routes(
 fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
     panic::catch_unwind(fun).map_err(|e| {
         if let Some(s) = e.downcast_ref::<&str>() {
-            anyhow!("{}", s)
+            anyhow!("{s}")
         } else if let Some(s) = e.downcast_ref::<String>() {
-            anyhow!("{}", s)
+            anyhow!("{s}")
         } else {
             anyhow!("caught panic")
         }
@@ -582,10 +584,9 @@ pub async fn serve(
                                     .build()
                                     .map_err(move |e| {
                                         warn!(
-                                            "error redirecting http://{}/{} to HTTPS: {:?}",
+                                            "error redirecting http://{}/{} to HTTPS: {e:?}",
                                             authority.host(),
-                                            path.as_str(),
-                                            e
+                                            path.as_str()
                                         );
 
                                         Rejection::from(HttpError::from(e.into()))
@@ -621,11 +622,11 @@ pub async fn serve(
         };
 
     if let Some(address) = http_address {
-        info!("listening on http://{}", address);
+        info!("listening on http://{address}");
     }
 
     if let Some(address) = https_address {
-        info!("listening on https://{}", address);
+        info!("listening on https://{address}");
     }
 
     future.await;
@@ -703,7 +704,7 @@ mod test {
         for (&number, info) in info {
             let mut path = image_dir.to_owned();
 
-            path.push(format!("{}.jpg", number));
+            path.push(format!("{number}.jpg"));
 
             task::block_in_place(|| {
                 let (width, height) = dimensions(number);
@@ -714,7 +715,7 @@ mod test {
 
                 metadata.set_tag_string(
                     "Exif.Image.DateTimeOriginal",
-                    &format!("2021:{:02}:01 00:00:00", number),
+                    &format!("2021:{number:02}:01 00:00:00"),
                 )?;
 
                 metadata.save_to_file(&path)?;
@@ -725,7 +726,7 @@ mod test {
             if let TestMedium::Video = info.medium {
                 let mut video = image_dir.to_owned();
 
-                video.push(format!("{}.mp4", number));
+                video.push(format!("{number}.mp4"));
 
                 let output = Command::new("ffmpeg")
                     .arg("-loop")
@@ -735,7 +736,7 @@ mod test {
                     .arg("-t")
                     .arg("10")
                     .arg("-timestamp")
-                    .arg(format!("2021-{:02}-01T00:00:00Z", number))
+                    .arg(format!("2021-{number:02}-01T00:00:00Z"))
                     .arg(&video)
                     .output()
                     .await?;
@@ -951,8 +952,7 @@ mod test {
             .method("POST")
             .path("/token")
             .body(&format!(
-                "grant_type=password&username={}&password=invalid+password",
-                user
+                "grant_type=password&username={user}&password=invalid+password"
             ))
             .reply(&routes)
             .await;
@@ -967,8 +967,7 @@ mod test {
             .method("POST")
             .path("/token")
             .body(&format!(
-                "grant_type=password&username={}&password={}",
-                user, password
+                "grant_type=password&username={user}&password={password}"
             ))
             .reply(&routes)
             .await;
@@ -1036,7 +1035,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1088,7 +1087,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1115,8 +1114,8 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=MEDIA_COUNT)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1126,7 +1125,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?limit=2")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1149,8 +1148,8 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             ((MEDIA_COUNT - 1)..=MEDIA_COUNT)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1160,7 +1159,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?start=2021-04-01T00:00:00Z&limit=2")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1186,8 +1185,8 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=3)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1210,7 +1209,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1230,15 +1229,15 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=MEDIA_COUNT)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     if number == 3 {
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?
                         ]
                     } else {
-                        hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
+                        hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1249,7 +1248,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=foo")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1269,10 +1268,10 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     hashset![
                         "year:2021".parse()?,
-                        format!("month:{}", number).parse()?,
+                        format!("month:{number}").parse()?,
                         "foo".parse()?
                     ]
                 )))
@@ -1312,7 +1311,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=foo")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1332,18 +1331,18 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=3)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     if number == 3 {
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?,
                             "bar".parse()?
                         ]
                     } else {
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?
                         ]
                     }
@@ -1356,7 +1355,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1376,18 +1375,18 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (3..=4)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     if number == 3 {
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?,
                             "bar".parse()?
                         ]
                     } else {
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "bar".parse()?
                         ]
                     }
@@ -1400,7 +1399,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=foo%20and%20bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1420,10 +1419,10 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     hashset![
                         "year:2021".parse()?,
-                        format!("month:{}", number).parse()?,
+                        format!("month:{number}").parse()?,
                         "foo".parse()?,
                         "bar".parse()?
                     ]
@@ -1436,7 +1435,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=foo%20or%20bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1456,22 +1455,22 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=4)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     match number {
                         4 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "bar".parse()?
                         ],
                         3 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?,
                             "bar".parse()?
                         ],
                         2 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?
                         ],
                         _ => unreachable!(),
@@ -1486,7 +1485,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path(&format!("/images?limit={}", MEDIA_COUNT - 1))
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1509,25 +1508,25 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (2..=MEDIA_COUNT)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     match number {
                         4 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "bar".parse()?
                         ],
                         3 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?,
                             "bar".parse()?
                         ],
                         2 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?
                         ],
-                        _ => hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
+                        _ => hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1551,7 +1550,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=bar%20and%20%28foo%20or%20baz%29")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1571,17 +1570,17 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (3..=4)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     match number {
                         4 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "bar".parse()?,
                             "baz".parse()?
                         ],
                         3 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?,
                             "bar".parse()?
                         ],
@@ -1596,7 +1595,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=bar%20and%20%28foo%20or%20baz%29&limit=1")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1619,10 +1618,10 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     hashset![
                         "year:2021".parse()?,
-                        format!("month:{}", number).parse()?,
+                        format!("month:{number}").parse()?,
                         "bar".parse()?,
                         "baz".parse()?
                     ]
@@ -1635,7 +1634,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=foo%20or%20bar&start=2021-04-01T00:00:00Z&limit=1")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1658,10 +1657,10 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(3)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     hashset![
                         "year:2021".parse()?,
-                        format!("month:{}", number).parse()?,
+                        format!("month:{number}").parse()?,
                         "foo".parse()?,
                         "bar".parse()?
                     ]
@@ -1687,7 +1686,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1707,10 +1706,10 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     hashset![
                         "year:2021".parse()?,
-                        format!("month:{}", number).parse()?,
+                        format!("month:{number}").parse()?,
                         "bar".parse()?,
                         "baz".parse()?
                     ]
@@ -1723,7 +1722,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=year:2021")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1743,20 +1742,20 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=MEDIA_COUNT)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     match number {
                         4 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "bar".parse()?,
                             "baz".parse()?
                         ],
                         3 | 2 => hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", number).parse()?,
+                            format!("month:{number}").parse()?,
                             "foo".parse()?
                         ],
-                        _ => hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
+                        _ => hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
                     }
                 )))
                 .collect::<Result<_>>()?
@@ -1767,7 +1766,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images?filter=year:2021%20and%20month:7")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1787,8 +1786,8 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(7)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{}", number).parse()?]
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1830,10 +1829,10 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             iter::once(4)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     hashset![
                         "year:2021".parse()?,
-                        format!("month:{}", number).parse()?,
+                        format!("month:{number}").parse()?,
                         "bar".parse()?,
                         "baz".parse()?,
                         "public".parse()?
@@ -1869,7 +1868,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1896,9 +1895,9 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=MEDIA_COUNT)
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     (
-                        hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
+                        hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
                         Vec::new()
                     )
                 )))
@@ -1916,7 +1915,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -1943,18 +1942,18 @@ mod test {
                 .collect::<HashMap<_, _>>(),
             (1..=(MEDIA_COUNT - (DUPLICATE_IMAGE_COUNT + DUPLICATE_VIDEO_COUNT)))
                 .map(|number| Ok((
-                    format!("2021-{:02}-01T00:00:00Z", number).parse()?,
+                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     (
-                        hashset!["year:2021".parse()?, format!("month:{}", number).parse()?],
+                        hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
                         Vec::new()
                     )
                 )))
                 .chain(iter::once(Ok((
-                    format!("2021-{:02}-01T00:00:00Z", primary_duplicate_image).parse()?,
+                    format!("2021-{primary_duplicate_image:02}-01T00:00:00Z").parse()?,
                     (
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", primary_duplicate_image).parse()?
+                            format!("month:{primary_duplicate_image}").parse()?
                         ],
                         vec![
                             hashes
@@ -1981,11 +1980,11 @@ mod test {
                     )
                 ))))
                 .chain(iter::once(Ok((
-                    format!("2021-{:02}-01T00:00:00Z", primary_duplicate_video).parse()?,
+                    format!("2021-{primary_duplicate_video:02}-01T00:00:00Z").parse()?,
                     (
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{}", primary_duplicate_video).parse()?
+                            format!("month:{primary_duplicate_video}").parse()?
                         ],
                         vec![
                             hashes
@@ -2036,7 +2035,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2093,7 +2092,7 @@ mod test {
             let response = warp::test::request()
                 .method("PATCH")
                 .path("/tags")
-                .header("authorization", format!("Bearer {}", token))
+                .header("authorization", format!("Bearer {token}"))
                 .json(&vec![Patch {
                     hash: hashes
                         .get(&"2021-03-01T00:00:00Z".parse()?)
@@ -2116,7 +2115,7 @@ mod test {
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .json(&patches)
             .reply(&routes)
             .await;
@@ -2141,7 +2140,7 @@ mod test {
         let response = warp::test::request()
             .method("PATCH")
             .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .json(&vec![Patch {
                 hash: hashes
                     .get(&"2021-03-01T00:00:00Z".parse()?)
@@ -2169,7 +2168,7 @@ mod test {
                 let response = warp::test::request()
                     .method("PATCH")
                     .path("/tags")
-                    .header("authorization", format!("Bearer {}", token))
+                    .header("authorization", format!("Bearer {token}"))
                     .json(&vec![Patch {
                         hash: hashes
                             .get(&"2021-04-01T00:00:00Z".parse()?)
@@ -2210,7 +2209,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2274,7 +2273,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2337,7 +2336,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2373,7 +2372,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags?filter=foo")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2409,7 +2408,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags?filter=bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2445,7 +2444,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags?filter=foo%20and%20bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2483,7 +2482,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags?filter=foo%20or%20bar")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2533,7 +2532,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/tags?filter=bar%20and%20%28foo%20or%20baz%29")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2638,7 +2637,7 @@ mod test {
         let response = warp::test::request()
             .method("GET")
             .path("/images")
-            .header("authorization", format!("Bearer {}", token))
+            .header("authorization", format!("Bearer {token}"))
             .reply(&routes)
             .await;
 
@@ -2671,7 +2670,7 @@ mod test {
                 Variant::Original,
             ] {
                 let data = images
-                    .get(&format!("2021-{:02}-01T00:00:00Z", number).parse()?)
+                    .get(&format!("2021-{number:02}-01T00:00:00Z").parse()?)
                     .unwrap();
 
                 if matches!(variant, Variant::Still(_) | Variant::Original)
@@ -2679,7 +2678,7 @@ mod test {
                 {
                     let response = warp::test::request()
                         .method("GET")
-                        .path(&format!("/image/{}/{}", variant, data.hash))
+                        .path(&format!("/image/{variant}/{}", data.hash))
                         .reply(&routes)
                         .await;
 
@@ -2754,13 +2753,9 @@ mod test {
 
                         assert!(
                             close_enough(pixel, info.color),
-                            "expected {:?}; got {:?} for {}/{} at ({},{})",
+                            "expected {:?}; got {pixel:?} for {variant}/{} at ({x},{y})",
                             info.color,
-                            pixel,
-                            variant,
                             data.hash,
-                            x,
-                            y
                         );
                     }
                 }

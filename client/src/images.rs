@@ -116,7 +116,7 @@ pub fn images(props: ImagesProps) -> View<G> {
         }),
 
         template: move |(index, hash)| {
-            let url = format!("{}/image/small/{}", root, hash);
+            let url = format!("{root}/image/small/{hash}");
 
             let images = images.get();
 
@@ -189,7 +189,7 @@ pub fn images(props: ImagesProps) -> View<G> {
                     // Videos and "motion photo" images are rendered as HTML5 video elements which display their
                     // poster image by default and play a preview clip on mouse over.
                     Medium::ImageWithVideo | Medium::Video => {
-                        let video_url = format!("{}/image/small-video/{}", root, hash);
+                        let video_url = format!("{root}/image/small-video/{hash}");
 
                         view! {
                             video(src=video_url,

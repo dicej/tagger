@@ -100,14 +100,11 @@ pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 's
 
                     async move {
                         let mut request = client.get(format!(
-                            "{}/{}{}",
-                            root,
-                            uri,
+                            "{root}/{uri}{}",
                             if let Some(filter) = Option::<TagExpression>::from(filter.deref()) {
                                 format!(
-                                    "{}filter={}",
+                                    "{}filter={filter}",
                                     if uri.contains('?') { '&' } else { '?' },
-                                    filter
                                 )
                             } else {
                                 String::new()
@@ -115,7 +112,7 @@ pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 's
                         ));
 
                         if let Some(token) = token.deref() {
-                            request = request.header("authorization", &format!("Bearer {}", token));
+                            request = request.header("authorization", &format!("Bearer {token}"));
                         }
 
                         let response = request.send().await?;
@@ -131,7 +128,7 @@ pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 's
                     }
                 }
                 .unwrap_or_else(move |e| {
-                    log::error!("error retrieving {}: {:?}", uri, e);
+                    log::error!("error retrieving {uri}: {e:?}");
                 }),
             )
         }
@@ -260,7 +257,7 @@ fn try_anonymous_login(
 
     wasm_bindgen_futures::spawn_local(
         async move {
-            let response = client.get(format!("{}/token", root)).send().await?;
+            let response = client.get(format!("{root}/token")).send().await?;
 
             if response.status() == StatusCode::UNAUTHORIZED {
                 on_unauthorized();
@@ -277,7 +274,7 @@ fn try_anonymous_login(
             Ok::<_, Error>(())
         }
         .unwrap_or_else(move |e| {
-            log::error!("error logging in anonymously: {:?}", e);
+            log::error!("error logging in anonymously: {e:?}");
         }),
     );
 }
@@ -300,8 +297,7 @@ fn main() -> Result<()> {
     panic::set_hook(Box::new(console_error_panic_hook::hook));
 
     // Send logging output to the console
-    log::set_logger(&wasm_bindgen_console_logger::DEFAULT_LOGGER)
-        .map_err(|e| anyhow!("{:?}", e))?;
+    log::set_logger(&wasm_bindgen_console_logger::DEFAULT_LOGGER).map_err(|e| anyhow!("{e:?}"))?;
 
     log::set_max_level(log::LevelFilter::Info);
 
@@ -315,8 +311,8 @@ fn main() -> Result<()> {
     // Assume the Tagger server we want to connect to is the same as the host from which this app was loaded
     let root = Rc::<str>::from(format!(
         "{}//{}",
-        location.protocol().map_err(|e| anyhow!("{:?}", e))?,
-        location.host().map_err(|e| anyhow!("{:?}", e))?
+        location.protocol().map_err(|e| anyhow!("{e:?}"))?,
+        location.host().map_err(|e| anyhow!("{e:?}"))?
     ));
 
     let client = Client::new();
@@ -408,7 +404,7 @@ fn main() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    log::warn!("unable to decode state: {:?}", e);
+                    log::warn!("unable to decode state: {e:?}");
                 }
             }
         }
@@ -443,7 +439,7 @@ fn main() -> Result<()> {
                     let _ = location.set_hash(&hash);
                 }
                 Err(e) => {
-                    log::warn!("unable to encode state: {:?}", e);
+                    log::warn!("unable to encode state: {e:?}");
                 }
             }
         }

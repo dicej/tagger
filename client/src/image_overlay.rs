@@ -107,7 +107,7 @@ pub fn image_overlay(props: ImageOverlayProps) -> View<G> {
                 let images = images.get();
 
                 if let Some(image) = images.response.images.get(index) {
-                    let url = format!("{}/image/large/{}", root, image.hash);
+                    let url = format!("{root}/image/large/{}", image.hash);
 
                     let medium = image.medium;
 
@@ -167,7 +167,7 @@ pub fn image_overlay(props: ImageOverlayProps) -> View<G> {
                         view! {}
                     };
 
-                    let original_url = format!("{}/image/original/{}", root, image.hash);
+                    let original_url = format!("{root}/image/original/{}", image.hash);
 
                     let show_video = match medium {
                         Medium::ImageWithVideo => playing,
@@ -188,7 +188,7 @@ pub fn image_overlay(props: ImageOverlayProps) -> View<G> {
                     }
 
                     let image = if show_video {
-                        let video_url = format!("{}/image/large-video/{}", root, image.hash);
+                        let video_url = format!("{root}/image/large-video/{}", image.hash);
 
                         view! {
                             video(src=video_url,
