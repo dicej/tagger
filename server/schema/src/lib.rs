@@ -24,7 +24,7 @@ pub static DDL_STATEMENTS: &[&str] = &[
        datetime        TEXT NOT NULL,
        video_offset    INTEGER,
        ordinal         TEXT,
-       duplicate_group INTEGER NOT NULL DEFAULT 0,
+       duplicate_group TEXT,
        duplicate_index INTEGER NOT NULL DEFAULT 0
      )",
     "CREATE TABLE IF NOT EXISTS tags (

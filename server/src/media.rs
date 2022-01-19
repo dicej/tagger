@@ -7,6 +7,7 @@ use {
     anyhow::{anyhow, Error, Result},
     bytes::{Bytes, BytesMut},
     futures::{stream, Stream, StreamExt, TryStreamExt},
+    hex::FromHex,
     http::{header, status::StatusCode, Response},
     hyper::Body,
     image::{imageops::FilterType, GenericImageView, ImageFormat, Rgba},
@@ -16,11 +17,13 @@ use {
     std::{
         collections::VecDeque,
         convert::{TryFrom, TryInto},
+        fmt::{self, Display},
         fs::File,
         io::{Seek, SeekFrom, Write},
         mem,
         ops::DerefMut,
         path::{Path, PathBuf},
+        str::FromStr,
         time::Duration,
     },
     tagger_shared::{Size, Variant},
@@ -58,6 +61,7 @@ const MAX_AVERAGE_ABSOLUTE_DIFFERENCE: usize = 5;
 const ORDINAL_WIDTH: usize = 4;
 const ORDINAL_HEIGHT: usize = 4;
 const ORDINAL_CHANNEL_COUNT: usize = 3;
+pub const ORDINAL_LENGTH: usize = ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT;
 
 /// Pair of a media item hash and one of the files where that item was found
 #[derive(Debug)]
@@ -311,8 +315,8 @@ pub async fn deduplicate<'a>(
     }
 }
 
-fn ordinal(iter: impl Iterator<Item = (u32, u32, Rgba<u8>)>) -> Vec<u8> {
-    let mut ordinal = vec![0u8; ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT];
+fn image_ordinal(iter: impl Iterator<Item = (u32, u32, Rgba<u8>)>) -> Vec<u8> {
+    let mut ordinal = vec![0u8; ORDINAL_LENGTH];
 
     for (x, y, Rgba(color)) in iter {
         let offset = usize::try_from(y / 2).unwrap() * ORDINAL_CHANNEL_COUNT;
@@ -332,6 +336,46 @@ fn ordinal(iter: impl Iterator<Item = (u32, u32, Rgba<u8>)>) -> Vec<u8> {
     ordinal
 }
 
+#[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Hash)]
+pub struct Ordinal {
+    pub video_length_seconds: Option<u64>,
+    pub image_ordinal: Vec<u8>,
+}
+
+impl Display for Ordinal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(length) = self.video_length_seconds {
+            write!(f, "{length}-")?;
+        }
+
+        for v in &self.image_ordinal {
+            write!(f, "{v:02x}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl FromStr for Ordinal {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut split = s.split('-');
+
+        Ok(if let (Some(a), Some(b)) = (split.next(), split.next()) {
+            Ordinal {
+                video_length_seconds: Some(a.parse()?),
+                image_ordinal: Vec::from_hex(b)?,
+            }
+        } else {
+            Ordinal {
+                video_length_seconds: None,
+                image_ordinal: Vec::from_hex(s)?,
+            }
+        })
+    }
+}
+
 /// Calculate the perceptual ordinal of the media item at the specified `path`.
 pub async fn perceptual_ordinal(
     image_lock: &AsyncRwLock<()>,
@@ -340,8 +384,8 @@ pub async fn perceptual_ordinal(
     hash: &str,
     path: &str,
     video_offset: Option<i64>,
-) -> Result<String> {
-    let ordinal = ordinal(
+) -> Result<Ordinal> {
+    let image_ordinal = image_ordinal(
         webp::Decoder::new(
             &content(
                 &mut thumbnail(
@@ -366,22 +410,20 @@ pub async fn perceptual_ordinal(
             FilterType::Lanczos3,
         )
         .pixels(),
-    )
-    .iter()
-    .map(|v| format!("{v:02x}"))
-    .collect::<Vec<_>>()
-    .concat();
+    );
 
-    Ok(if video_offset == Some(0) {
-        format!(
-            "{}-{ordinal}",
-            video_track_data(&[image_dir, path].iter().collect::<PathBuf>(), 0)
-                .await?
-                .duration
-                .as_secs()
-        )
-    } else {
-        ordinal
+    Ok(Ordinal {
+        video_length_seconds: if video_offset == Some(0) {
+            Some(
+                video_track_data(&[image_dir, path].iter().collect::<PathBuf>(), 0)
+                    .await?
+                    .duration
+                    .as_secs(),
+            )
+        } else {
+            None
+        },
+        image_ordinal,
     })
 }
 
@@ -1060,7 +1102,7 @@ mod test {
     #[test]
     fn ordinals() {
         let ordinal = |value| {
-            ordinal(
+            image_ordinal(
                 iter::repeat(Rgba([value; 4]))
                     .enumerate()
                     .map(|(i, p)| {
@@ -1074,87 +1116,92 @@ mod test {
             )
         };
 
-        assert_eq!(
-            ordinal(0u8),
-            vec![0u8; ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT]
-        );
+        assert_eq!(ordinal(0u8), vec![0u8; ORDINAL_LENGTH]);
 
         assert_eq!(
             ordinal(0b1111_1111_u8),
-            vec![0b1111_1111_u8; ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT]
+            vec![0b1111_1111_u8; ORDINAL_LENGTH]
         );
 
         assert_eq!(
             ordinal(0b1111_0000_u8),
             iter::repeat(0b1111_1111_u8)
-                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
-                .chain(
-                    iter::repeat(0u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
-                )
+                .take(ORDINAL_LENGTH / 2)
+                .chain(iter::repeat(0u8))
+                .take(ORDINAL_LENGTH)
                 .collect::<Vec<_>>()
         );
 
         assert_eq!(
             ordinal(0b0000_1111_u8),
             iter::repeat(0u8)
-                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
-                .chain(
-                    iter::repeat(0b1111_1111_u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
-                )
+                .take(ORDINAL_LENGTH / 2)
+                .chain(iter::repeat(0b1111_1111_u8))
+                .take(ORDINAL_LENGTH)
                 .collect::<Vec<_>>()
         );
 
         assert_eq!(
             ordinal(0b1100_0000_u8),
             iter::repeat(0b1111_1111_u8)
-                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
-                .chain(
-                    iter::repeat(0u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT * 3) / 4)
-                )
+                .take(ORDINAL_LENGTH / 4)
+                .chain(iter::repeat(0u8))
+                .take(ORDINAL_LENGTH)
                 .collect::<Vec<_>>()
         );
 
         assert_eq!(
             ordinal(0b0011_0000_u8),
             iter::repeat(0u8)
-                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
-                .chain(
-                    iter::repeat(0b1111_1111u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
-                )
-                .chain(
-                    iter::repeat(0u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
-                )
+                .take(ORDINAL_LENGTH / 4)
+                .chain(iter::repeat(0b1111_1111u8).take(ORDINAL_LENGTH / 4))
+                .chain(iter::repeat(0u8))
+                .take(ORDINAL_LENGTH)
                 .collect::<Vec<_>>()
         );
 
         assert_eq!(
             ordinal(0b0000_1100_u8),
             iter::repeat(0u8)
-                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 2)
-                .chain(
-                    iter::repeat(0b1111_1111u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
-                )
-                .chain(
-                    iter::repeat(0u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
-                )
+                .take(ORDINAL_LENGTH / 2)
+                .chain(iter::repeat(0b1111_1111u8).take(ORDINAL_LENGTH / 4))
+                .chain(iter::repeat(0u8))
+                .take(ORDINAL_LENGTH)
                 .collect::<Vec<_>>()
         );
 
         assert_eq!(
             ordinal(0b0000_0011_u8),
             iter::repeat(0_u8)
-                .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT * 3) / 4)
-                .chain(
-                    iter::repeat(0b1111_1111u8)
-                        .take((ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT) / 4)
-                )
+                .take((ORDINAL_LENGTH * 3) / 4)
+                .chain(iter::repeat(0b1111_1111u8))
+                .take(ORDINAL_LENGTH)
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            image_ordinal(
+                iter::repeat(Rgba([0u8; 4]))
+                    .take(7)
+                    .chain(iter::repeat(Rgba([0b0001_0000u8, 0u8, 0u8, 0u8])).take(2))
+                    .chain(iter::repeat(Rgba([0u8; 4])))
+                    .enumerate()
+                    .map(|(i, p)| {
+                        (
+                            (i % ORDINAL_WIDTH).try_into().unwrap(),
+                            (i / ORDINAL_WIDTH).try_into().unwrap(),
+                            p,
+                        )
+                    })
+                    .take(ORDINAL_WIDTH * ORDINAL_HEIGHT),
+            ),
+            iter::repeat(0_u8)
+                .take(18)
+                .chain(iter::once(0b1000_0000u8))
+                .chain(iter::repeat(0u8).take(2))
+                .chain(iter::once(1u8))
+                .chain(iter::repeat(0u8))
+                .take(ORDINAL_LENGTH)
                 .collect::<Vec<_>>()
         );
     }

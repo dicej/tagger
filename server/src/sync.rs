@@ -2,21 +2,22 @@
 //! items on the filesystem.
 
 use {
-    crate::media::{FileData, ItemData},
+    crate::media::{FileData, ItemData, Ordinal, ORDINAL_LENGTH},
     anyhow::{anyhow, Error, Result},
     chrono::{DateTime, Datelike, NaiveDateTime, Utc},
-    futures::{future::BoxFuture, stream, FutureExt, StreamExt, TryStreamExt},
+    futures::{future::BoxFuture, FutureExt, TryStreamExt},
     lazy_static::lazy_static,
     regex::Regex,
     rexiv2::Metadata as ExifMetadata,
     sha2::{Digest, Sha256},
     sqlx::{Connection, SqliteConnection},
     std::{
-        collections::HashMap,
+        collections::{BTreeMap, HashSet},
         convert::{TryFrom, TryInto},
         fs::File,
         ops::DerefMut,
         path::{Path, PathBuf},
+        str::FromStr,
         sync::{
             atomic::{AtomicU64, Ordering::Relaxed},
             Arc,
@@ -248,175 +249,67 @@ async fn deduplicate(
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
-    // First, find the items for which we have not yet calculated an ordinal, calculate the ordinals,
-    // and group the items by their ordinals.
+    // First, collect all items, calculate any missing ordinals, and sorting by ordinal
 
-    let unhashed = sqlx::query!(
-        "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
+    let rows = sqlx::query!(
+        "SELECT i.hash, i.video_offset, i.ordinal, min(p.path) as \"path!: String\" \
          FROM images i \
          INNER JOIN paths p \
          ON i.hash = p.hash \
-         WHERE i.ordinal IS NULL \
          GROUP BY i.hash"
     )
     .fetch(conn.lock().await.deref_mut())
     .try_collect::<Vec<_>>()
     .await?;
 
-    let mut dirty = HashMap::<_, Vec<_>>::new();
+    let mut new = HashSet::new();
+    let mut all = BTreeMap::<_, Vec<_>>::new();
 
-    for row in unhashed {
-        let ordinal = crate::media::perceptual_ordinal(
-            image_lock,
-            image_dir,
-            cache_dir,
-            &row.hash,
-            &row.path,
-            row.video_offset,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            warn!(
-                "error calculating perceptual ordinal for {}: {:?}",
-                row.hash, e
-            );
-
-            // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will never
-            // change) and don't bother trying again.  Instead, record the ordinal as "(unknown)" and move on.
-            "(unknown)".into()
-        });
-
-        dirty.entry(ordinal).or_default().push(ItemData {
-            hash: row.hash,
-            file: FileData {
-                path: row.path,
-                video_offset: row.video_offset,
-            },
-        });
-    }
-
-    if !dirty.is_empty() {
-        info!(
-            "calculated {} unique perceptual ordinals for {} items",
-            dirty.len(),
-            dirty.values().map(|v| v.len()).sum::<usize>()
-        );
-    }
-
-    // Next, for each ordinal, collect all the new and old items with that ordinal and deduplicate them, recording
-    // the results in the database.
-
-    let mut item_count = 0;
-    let duplicate_count = Arc::new(AtomicU64::new(0));
-
-    for (ordinal, dirty) in dirty {
-        let potential_duplicates = sqlx::query!(
-            "SELECT i.hash, i.video_offset, min(p.path) as \"path!: String\" \
-             FROM images i \
-             INNER JOIN paths p \
-             ON i.hash = p.hash \
-             WHERE i.ordinal = ?1 \
-             GROUP BY i.hash",
-            ordinal
-        )
-        .fetch(conn.lock().await.deref_mut())
-        .map_ok(|row| ItemData {
-            hash: row.hash,
-            file: FileData {
-                path: row.path,
-                video_offset: row.video_offset,
-            },
-        })
-        .chain(stream::iter(dirty).map(Ok))
-        .try_collect::<Vec<_>>()
-        .await?;
-
-        item_count += potential_duplicates.len();
-
-        let duplicates =
-            crate::media::deduplicate(image_lock, image_dir, cache_dir, &potential_duplicates)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(
-                        "error deduplicating for perceptual ordinal {}: {:?}",
-                        ordinal, e
-                    );
-
-                    // If anything goes wrong deduplicating, assume there's no point in trying again (i.e. assume
-                    // none of the files will change and the error was deterministic).  Instead, we assume none of
-                    // the items is a duplicate of the others.
-                    potential_duplicates.iter().map(|item| vec![item]).collect()
-                });
-
-        let duplicate_count = duplicate_count.clone();
-
-        let duplicates = duplicates
-            .iter()
-            .map(|duplicates| {
-                duplicates
-                    .iter()
-                    .map(|image| image.hash.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        // Note that we use a transaction here to ensure everything for this ordinal is updated atomically.  If any
-        // part fails or is interrupted, we can just try again in the next pass without worrying about inconsistent
-        // state.
-        conn.lock()
+    for row in rows {
+        let ordinal = if let Some(ordinal) = row.ordinal {
+            Ordinal::from_str(&ordinal)?
+        } else {
+            let ordinal = crate::media::perceptual_ordinal(
+                image_lock,
+                image_dir,
+                cache_dir,
+                &row.hash,
+                &row.path,
+                row.video_offset,
+            )
             .await
-            .transaction(move |conn| {
-                async move {
-                    for (group, duplicates) in duplicates.iter().enumerate() {
-                        match &duplicates[..] {
-                            [hash] => {
-                                sqlx::query!(
-                                    "UPDATE images \
-                                     SET \
-                                     ordinal = ?1, \
-                                     duplicate_group = 0, \
-                                     duplicate_index = 0 \
-                                     WHERE hash = ?2",
-                                    ordinal,
-                                    hash,
-                                )
-                                .execute(&mut *conn)
-                                .await?;
-                            }
+            .unwrap_or_else(|e| {
+                warn!(
+                    "error calculating perceptual ordinal for {}: {:?}",
+                    row.hash, e
+                );
 
-                            _ => {
-                                duplicate_count
-                                    .fetch_add(u64::try_from(duplicates.len()).unwrap(), Relaxed);
-
-                                for (index, hash) in duplicates.iter().enumerate() {
-                                    let group = i64::try_from(group + 1).unwrap();
-                                    let index = i64::try_from(index).unwrap();
-
-                                    sqlx::query!(
-                                        "UPDATE images \
-                                         SET \
-                                         ordinal = ?1, \
-                                         duplicate_group = ?2, \
-                                         duplicate_index = ?3 \
-                                         WHERE hash = ?4",
-                                        ordinal,
-                                        group,
-                                        index,
-                                        hash,
-                                    )
-                                    .execute(&mut *conn)
-                                    .await?;
-                                }
-                            }
-                        }
-                    }
-
-                    Ok::<_, Error>(())
+                // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will never
+                // change) and don't bother trying again.  Instead, record the ordinal as all zeros and move on.
+                Ordinal {
+                    video_length_seconds: None,
+                    image_ordinal: vec![0u8; ORDINAL_LENGTH],
                 }
-                .boxed()
-            })
-            .await?;
+            });
+
+            new.insert(ordinal.clone());
+
+            ordinal
+        };
+
+        all.entry(ordinal).or_default().push(ItemData {
+            hash: row.hash,
+            file: FileData {
+                path: row.path,
+                video_offset: row.video_offset,
+            },
+        });
     }
+
+    // TODO
+
+    let item_count = 0;
+    let duplicate_count = Arc::new(AtomicU64::new(0));
 
     Ok(DeduplicationSummary {
         item_count: item_count.try_into().unwrap(),
