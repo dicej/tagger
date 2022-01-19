@@ -4,9 +4,9 @@ A simple photo and video organizer for the web
 
 ## Summary
 
-This is web app for organizing and browsing photo and video collections.  Media
-are organized by date by default, and users may add custom tags for querying and
-access control.
+This is a web app for organizing and browsing photo and video collections.
+Media are organized by date by default, and users may add custom tags for
+querying and access control.
 
 This app doesn't (currently) support uploading media items.  Instead, it watches
 a directory waiting for new media items to appear.  This is intended to work in
