@@ -64,7 +64,8 @@ use {
 pub use {
     auth::hash_password,
     media::{
-        deduplicate, perceptual_ordinal, preload_cache, preload_cache_all, FileData, ItemData,
+        deduplicate, perceptual_ordinal, preload_cache, preload_cache_all, FileData, Item,
+        ItemData, Ordinal,
     },
     sync::sync,
 };

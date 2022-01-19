@@ -12,9 +12,11 @@ use {
     hyper::Body,
     image::{imageops::FilterType, GenericImageView, ImageFormat, Rgba},
     mp4parse::{CodecType, MediaContext, SampleEntry, Track, TrackType},
+    num_bigint::BigUint,
     rexiv2::{Metadata as ExifMetadata, Orientation},
     sqlx::SqliteConnection,
     std::{
+        cmp::Ordering,
         collections::VecDeque,
         convert::{TryFrom, TryInto},
         fmt::{self, Display},
@@ -63,15 +65,23 @@ const ORDINAL_HEIGHT: usize = 4;
 const ORDINAL_CHANNEL_COUNT: usize = 3;
 pub const ORDINAL_LENGTH: usize = ORDINAL_WIDTH * ORDINAL_HEIGHT * ORDINAL_CHANNEL_COUNT;
 
+#[derive(Debug, Clone)]
+pub struct Item {
+    pub data: ItemData,
+    pub ordinal: Ordinal,
+    pub duplicate_group: Option<String>,
+    pub duplicate_index: Option<i64>,
+}
+
 /// Pair of a media item hash and one of the files where that item was found
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItemData {
     pub hash: String,
     pub file: FileData,
 }
 
 /// Metadata about a media item file
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileData {
     /// Filesystem path where the file can be found
     pub path: String,
@@ -239,8 +249,8 @@ pub async fn deduplicate<'a>(
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
-    potential_duplicates: &'a [ItemData],
-) -> Result<Vec<Vec<&'a ItemData>>> {
+    potential_duplicates: &'a [Item],
+) -> Result<Vec<Vec<&'a Item>>> {
     if potential_duplicates.len() == 1 {
         return Ok(vec![potential_duplicates.iter().collect()]);
     }
@@ -249,17 +259,17 @@ pub async fn deduplicate<'a>(
         .then(|item| async move {
             Ok::<_, Error>((
                 item,
-                quality(image_dir, &item.file.path).await?,
+                quality(image_dir, &item.data.file.path).await?,
                 Vec::from(
                     &webp::Decoder::new(
                         &content(
                             &mut thumbnail(
                                 Some(image_lock),
                                 image_dir,
-                                &item.file.path,
+                                &item.data.file.path,
                                 cache_dir,
                                 Size::Small,
-                                &item.hash,
+                                &item.data.hash,
                             )
                             .await?
                             .0,
@@ -267,7 +277,7 @@ pub async fn deduplicate<'a>(
                         .await?,
                     )
                     .decode()
-                    .ok_or_else(|| anyhow!("unable to decode {}", &item.file.path))?
+                    .ok_or_else(|| anyhow!("unable to decode {}", &item.data.file.path))?
                         as &[u8],
                 ),
             ))
@@ -336,10 +346,34 @@ fn image_ordinal(iter: impl Iterator<Item = (u32, u32, Rgba<u8>)>) -> Vec<u8> {
     ordinal
 }
 
-#[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Hash)]
+#[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Hash, Debug)]
 pub struct Ordinal {
     pub video_length_seconds: Option<u64>,
     pub image_ordinal: Vec<u8>,
+}
+
+impl Ordinal {
+    pub fn is_similar_to(&self, other: &Ordinal) -> bool {
+        if self.video_length_seconds == other.video_length_seconds {
+            let a = BigUint::from_bytes_be(&self.image_ordinal);
+            let b = BigUint::from_bytes_be(&other.image_ordinal);
+
+            // Define epsilon to correspond to an average absolute difference per channel of 2^3:
+            let epsilon = BigUint::from_bytes_be(
+                &[255u8; 3 * ((ORDINAL_WIDTH * ORDINAL_HEIGHT) / 8) * ORDINAL_CHANNEL_COUNT],
+            );
+
+            match a.cmp(&b) {
+                Ordering::Equal => true,
+
+                Ordering::Less => b - a < epsilon,
+
+                Ordering::Greater => a - b < epsilon,
+            }
+        } else {
+            false
+        }
+    }
 }
 
 impl Display for Ordinal {

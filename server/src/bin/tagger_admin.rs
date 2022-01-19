@@ -4,7 +4,7 @@ use {
     anyhow::Result,
     futures::stream::TryStreamExt,
     structopt::StructOpt,
-    tagger_server::{FileData, ItemData},
+    tagger_server::{FileData, Item, ItemData, Ordinal},
     tagger_shared::tag_expression::TagExpression,
     tokio::sync::RwLock as AsyncRwLock,
 };
@@ -194,11 +194,19 @@ async fn main() -> Result<()> {
 
                     println!("perceptual ordinal for {hash} is {ordinal}");
 
-                    items.push(ItemData {
-                        hash,
-                        file: FileData {
-                            video_offset: row.video_offset,
-                            path: row.path,
+                    items.push(Item {
+                        ordinal: Ordinal {
+                            video_length_seconds: None,
+                            image_ordinal: Vec::new(),
+                        },
+                        duplicate_group: None,
+                        duplicate_index: None,
+                        data: ItemData {
+                            hash,
+                            file: FileData {
+                                video_offset: row.video_offset,
+                                path: row.path,
+                            },
                         },
                     });
                 } else {

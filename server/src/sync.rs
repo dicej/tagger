@@ -2,7 +2,7 @@
 //! items on the filesystem.
 
 use {
-    crate::media::{FileData, ItemData, Ordinal, ORDINAL_LENGTH},
+    crate::media::{FileData, Item, ItemData, Ordinal, ORDINAL_LENGTH},
     anyhow::{anyhow, Error, Result},
     chrono::{DateTime, Datelike, NaiveDateTime, Utc},
     futures::{future::BoxFuture, FutureExt, TryStreamExt},
@@ -12,14 +12,14 @@ use {
     sha2::{Digest, Sha256},
     sqlx::{Connection, SqliteConnection},
     std::{
-        collections::{BTreeMap, HashSet},
+        collections::{BTreeMap, HashMap},
         convert::{TryFrom, TryInto},
         fs::File,
         ops::DerefMut,
         path::{Path, PathBuf},
         str::FromStr,
         sync::{
-            atomic::{AtomicU64, Ordering::Relaxed},
+            atomic::{AtomicUsize, Ordering::Relaxed},
             Arc,
         },
         time::Instant,
@@ -73,10 +73,10 @@ struct Metadata {
 /// See also [deduplicate].
 struct DeduplicationSummary {
     /// Number of media items visited during deduplication
-    item_count: u64,
+    item_count: usize,
 
     /// Number of items found which are considered duplicates
-    duplicate_count: u64,
+    duplicate_count: usize,
 }
 
 /// Extract relevant metadata from the EXIF content found in the file at `path`.
@@ -241,6 +241,152 @@ fn find_new<'a>(
     .boxed()
 }
 
+async fn deduplicate_dirty(
+    conn: &AsyncMutex<SqliteConnection>,
+    image_lock: &AsyncRwLock<()>,
+    image_dir: &str,
+    cache_dir: &str,
+    dirty: HashMap<String, Item>,
+    all: BTreeMap<Ordinal, Vec<Item>>,
+) -> Result<DeduplicationSummary> {
+    let item_count = Arc::new(AtomicUsize::new(0));
+    let duplicate_count = Arc::new(AtomicUsize::new(0));
+    let dirty = Arc::new(AsyncMutex::new(dirty));
+
+    // Iterate over all items in order, grouping together any with similar ordinals, and finally divide each of
+    // those groups into groups of duplicates.
+    //
+    // Add any whose group or index has changed to the `dirty` collection so we can update the database later.
+
+    let deduplicate_similar = {
+        let item_count = item_count.clone();
+        let duplicate_count = duplicate_count.clone();
+        let dirty = dirty.clone();
+
+        move |similar: Vec<Item>| {
+            let item_count = item_count.clone();
+            let duplicate_count = duplicate_count.clone();
+            let dirty = dirty.clone();
+
+            async move {
+                let duplicates =
+                    crate::media::deduplicate(image_lock, image_dir, cache_dir, &similar)
+                        .await
+                        .unwrap_or_else(|e| {
+                            warn!(
+                                "error deduplicating group [{}]: {:?}",
+                                similar
+                                    .iter()
+                                    .map(|item| &item.data.hash as &str)
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                e
+                            );
+
+                            // If anything goes wrong deduplicating, assume there's no point in trying again
+                            // (i.e. assume none of the files will change and the error was deterministic).
+                            // Instead, we consider all the items to be unique.
+                            similar.iter().map(|item| vec![item]).collect()
+                        });
+
+                for (group, duplicates) in duplicates.into_iter().enumerate() {
+                    let alone = duplicates.len() == 1;
+
+                    let duplicate_group = if alone {
+                        None
+                    } else {
+                        duplicates
+                            .first()
+                            .map(|item| format!("{}-{group}", item.ordinal))
+                    };
+
+                    for (index, item) in duplicates.into_iter().enumerate() {
+                        let duplicate_index = if alone {
+                            None
+                        } else {
+                            Some(i64::try_from(index).unwrap())
+                        };
+
+                        if item.duplicate_group != duplicate_group
+                            || item.duplicate_index != duplicate_index
+                        {
+                            item_count.fetch_add(1, Relaxed);
+
+                            if !alone {
+                                duplicate_count.fetch_add(1, Relaxed);
+                            }
+
+                            dirty.lock().await.insert(
+                                item.data.hash.clone(),
+                                Item {
+                                    duplicate_group: duplicate_group.clone(),
+                                    duplicate_index,
+                                    ordinal: item.ordinal.clone(),
+                                    data: item.data.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let mut similar = Vec::<Item>::new();
+
+    for (ordinal, items) in all {
+        if let Some(last) = similar.last() {
+            if last.ordinal.is_similar_to(&ordinal) {
+                similar.extend(items);
+            } else {
+                deduplicate_similar(similar).await;
+                similar = items;
+            }
+        } else {
+            similar = items;
+        }
+    }
+
+    deduplicate_similar(similar).await;
+
+    // Finally, update the database in a single transaction so that if it fails or is interrupted, we can try again
+    // in the next pass without worrying about inconsistent state.
+
+    conn.lock()
+        .await
+        .transaction(move |conn| {
+            async move {
+                for item in dirty.lock().await.values() {
+                    let ordinal = item.ordinal.to_string();
+
+                    sqlx::query!(
+                        "UPDATE images \
+                         SET \
+                         ordinal = ?1, \
+                         duplicate_group = ?2, \
+                         duplicate_index = ?3 \
+                         WHERE hash = ?4",
+                        ordinal,
+                        item.duplicate_group,
+                        item.duplicate_index,
+                        item.data.hash,
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+                }
+
+                Ok::<_, Error>(())
+            }
+            .boxed()
+        })
+        .await?;
+
+    Ok(DeduplicationSummary {
+        item_count: item_count.load(Relaxed),
+        duplicate_count: duplicate_count.load(Relaxed),
+    })
+}
+
 /// Query the database for items for which we have not yet calculated a perceptual ordinal (e.g. files that have been
 /// newly added), calculate their ordinals, and look for duplicates among all files which have similar ordinals.
 async fn deduplicate(
@@ -249,10 +395,16 @@ async fn deduplicate(
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
-    // First, collect all items, calculate any missing ordinals, and sorting by ordinal
+    // First, collect all items, calculating any missing ordinals.
 
     let rows = sqlx::query!(
-        "SELECT i.hash, i.video_offset, i.ordinal, min(p.path) as \"path!: String\" \
+        "SELECT \
+         i.hash, \
+         i.video_offset, \
+         i.ordinal, \
+         i.duplicate_group, \
+         i.duplicate_index, \
+         min(p.path) as \"path!: String\" \
          FROM images i \
          INNER JOIN paths p \
          ON i.hash = p.hash \
@@ -262,59 +414,71 @@ async fn deduplicate(
     .try_collect::<Vec<_>>()
     .await?;
 
-    let mut new = HashSet::new();
+    let mut dirty = HashMap::new();
     let mut all = BTreeMap::<_, Vec<_>>::new();
 
     for row in rows {
-        let ordinal = if let Some(ordinal) = row.ordinal {
-            Ordinal::from_str(&ordinal)?
+        let (ordinal, is_dirty) = if let Some(ordinal) = &row.ordinal {
+            (Ordinal::from_str(ordinal)?, false)
         } else {
-            let ordinal = crate::media::perceptual_ordinal(
-                image_lock,
-                image_dir,
-                cache_dir,
-                &row.hash,
-                &row.path,
-                row.video_offset,
+            (
+                crate::media::perceptual_ordinal(
+                    image_lock,
+                    image_dir,
+                    cache_dir,
+                    &row.hash,
+                    &row.path,
+                    row.video_offset,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "error calculating perceptual ordinal for {}: {:?}",
+                        row.hash, e
+                    );
+
+                    // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will
+                    // never change) and don't bother trying again.  Instead, record the ordinal as all zeros and
+                    // move on.
+                    Ordinal {
+                        video_length_seconds: None,
+                        image_ordinal: vec![0u8; ORDINAL_LENGTH],
+                    }
+                }),
+                true,
             )
-            .await
-            .unwrap_or_else(|e| {
-                warn!(
-                    "error calculating perceptual ordinal for {}: {:?}",
-                    row.hash, e
-                );
-
-                // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will never
-                // change) and don't bother trying again.  Instead, record the ordinal as all zeros and move on.
-                Ordinal {
-                    video_length_seconds: None,
-                    image_ordinal: vec![0u8; ORDINAL_LENGTH],
-                }
-            });
-
-            new.insert(ordinal.clone());
-
-            ordinal
         };
 
-        all.entry(ordinal).or_default().push(ItemData {
-            hash: row.hash,
-            file: FileData {
-                path: row.path,
-                video_offset: row.video_offset,
+        let item = Item {
+            data: ItemData {
+                hash: row.hash,
+                file: FileData {
+                    path: row.path,
+                    video_offset: row.video_offset,
+                },
             },
-        });
+            ordinal: ordinal.clone(),
+            duplicate_group: row.duplicate_group,
+            duplicate_index: row.duplicate_index,
+        };
+
+        if is_dirty {
+            dirty.insert(item.data.hash.clone(), item.clone());
+        }
+
+        all.entry(ordinal).or_default().push(item);
     }
 
-    // TODO
-
-    let item_count = 0;
-    let duplicate_count = Arc::new(AtomicU64::new(0));
-
-    Ok(DeduplicationSummary {
-        item_count: item_count.try_into().unwrap(),
-        duplicate_count: duplicate_count.load(Relaxed),
-    })
+    if dirty.is_empty() {
+        // No new items present -- nothing else to do.
+        Ok(DeduplicationSummary {
+            item_count: 0,
+            duplicate_count: 0,
+        })
+    } else {
+        // Found new items -- recalculate duplicates accordingly.
+        deduplicate_dirty(conn, image_lock, image_dir, cache_dir, dirty, all).await
+    }
 }
 
 /// Synchronize the Tagger database with the filesystem.

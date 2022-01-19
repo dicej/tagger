@@ -435,6 +435,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
             filter_chain: List::Nil,
             unfiltered_tags: unfiltered_tags.clone(),
             on_unauthorized: on_unauthorized.clone(),
+            show_menu: show_menu.clone(),
         },
         filtered_tags: unfiltered_tags,
         category: None,

@@ -220,6 +220,8 @@ pub struct TagMenuCommonProps {
 
     /// Callback to invoke if the server responds to any request with 401 Unauthorized
     pub on_unauthorized: Rc<dyn Fn()>,
+
+    pub show_menu: Signal<bool>,
 }
 
 /// Properties for populating and rendering the `TagSubMenu` component
@@ -250,6 +252,7 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
                 filter_chain,
                 unfiltered_tags,
                 on_unauthorized,
+                show_menu,
             },
         tag,
     } = props;
@@ -273,6 +276,7 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
                     filter_chain: filter_chain.clone(),
                     unfiltered_tags: unfiltered_tags.clone(),
                     on_unauthorized: on_unauthorized.clone(),
+                    show_menu: show_menu.clone(),
                 },
                 filtered_tags: watch::<TagsResponse, _>(
                     Signal::new("tags".into()).into_handle(),
@@ -348,6 +352,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 filter_chain,
                 unfiltered_tags,
                 on_unauthorized,
+                show_menu,
             },
         filtered_tags,
         category,
@@ -385,6 +390,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let root = root.clone();
                 let filter = filter.clone();
                 let on_unauthorized = on_unauthorized.clone();
+                let show_menu = show_menu.clone();
 
                 move |category| {
                     let tag_menu = TagMenuProps {
@@ -396,6 +402,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                             filter_chain: filter_chain.clone(),
                             unfiltered_tags: unfiltered_tags.clone(),
                             on_unauthorized: on_unauthorized.clone(),
+                            show_menu: show_menu.clone(),
                         },
                         filtered_tags: filtered_tags.clone(),
                         category: Some(category.clone()),
@@ -467,6 +474,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                     filter_chain: filter_chain.clone(),
                     unfiltered_tags: unfiltered_tags.clone(),
                     on_unauthorized: on_unauthorized.clone(),
+                    show_menu: show_menu.clone(),
                 },
                 tag: tag.clone(),
             };
@@ -484,6 +492,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let filter = filter.clone();
                 let filter_state = filter_state.clone();
                 let tag = tag.clone();
+                let show_menu = show_menu.clone();
 
                 move |_| {
                     let mut new_filter = filter.get().deref().clone();
@@ -496,6 +505,8 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
 
                         filter.set(new_filter);
                     }
+
+                    show_menu.set(false);
                 }
             };
 
@@ -503,6 +514,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let filter_chain = filter_chain.clone();
                 let filter = filter.clone();
                 let filter_state = filter_state.clone();
+                let show_menu = show_menu.clone();
 
                 move |_| {
                     let mut new_filter = filter.get().deref().clone();
@@ -515,6 +527,8 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
 
                         filter.set(new_filter);
                     }
+
+                    show_menu.set(false);
                 }
             };
 
