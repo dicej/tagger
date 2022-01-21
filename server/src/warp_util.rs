@@ -19,7 +19,7 @@ struct StatusCodeU16(#[serde(getter = "StatusCode::as_u16")] u16);
 
 /// Simple error type which may be trivially converted to an HTTP response
 #[derive(Clone, Serialize, Debug, thiserror::Error)]
-#[error("HTTP {}: {}", status, message)]
+#[error("HTTP {status}: {message}")]
 pub struct HttpError {
     /// Error message to be used as the HTTP response body
     pub message: Cow<'static, str>,

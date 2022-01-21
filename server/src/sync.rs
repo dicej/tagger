@@ -18,10 +18,6 @@ use {
         ops::DerefMut,
         path::{Path, PathBuf},
         str::FromStr,
-        sync::{
-            atomic::{AtomicUsize, Ordering::Relaxed},
-            Arc,
-        },
         time::Instant,
     },
     tokio::{
@@ -218,9 +214,8 @@ fn find_new<'a>(
                                         Ok(data) => Some(data),
                                         Err(e) => {
                                             warn!(
-                                                "unable to get metadata for {}: {:?}",
-                                                path.to_string_lossy(),
-                                                e
+                                                "unable to get metadata for {}: {e:?}",
+                                                path.to_string_lossy()
                                             );
 
                                             None
@@ -241,94 +236,38 @@ fn find_new<'a>(
     .boxed()
 }
 
+/// Scan the collection of media items in `all`, grouping them by similarity and deduplicating each group with at
+/// least one `dirty` item in it, recording the results in the database.
 async fn deduplicate_dirty(
     conn: &AsyncMutex<SqliteConnection>,
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
-    dirty: HashMap<String, Item>,
+    mut dirty: HashMap<String, Item>,
     all: BTreeMap<Ordinal, Vec<Item>>,
 ) -> Result<DeduplicationSummary> {
-    let item_count = Arc::new(AtomicUsize::new(0));
-    let duplicate_count = Arc::new(AtomicUsize::new(0));
-    let dirty = Arc::new(AsyncMutex::new(dirty));
+    let new_count = dirty.len();
 
-    // Iterate over all items in order, grouping together any with similar ordinals, and finally divide each of
-    // those groups into groups of duplicates.
-    //
-    // Add any whose group or index has changed to the `dirty` collection so we can update the database later.
+    info!("{new_count} new items since the previous deduplication");
 
-    let deduplicate_similar = {
-        let item_count = item_count.clone();
-        let duplicate_count = duplicate_count.clone();
-        let dirty = dirty.clone();
+    // Iterate over all items in order, grouping together any with similar ordinals and identifying which of those
+    // groups need to be deduplicated.
 
-        move |similar: Vec<Item>| {
-            let item_count = item_count.clone();
-            let duplicate_count = duplicate_count.clone();
-            let dirty = dirty.clone();
+    let mut dirty_groups = Vec::new();
 
-            async move {
-                let duplicates =
-                    crate::media::deduplicate(image_lock, image_dir, cache_dir, &similar)
-                        .await
-                        .unwrap_or_else(|e| {
-                            warn!(
-                                "error deduplicating group [{}]: {:?}",
-                                similar
-                                    .iter()
-                                    .map(|item| &item.data.hash as &str)
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                e
-                            );
-
-                            // If anything goes wrong deduplicating, assume there's no point in trying again
-                            // (i.e. assume none of the files will change and the error was deterministic).
-                            // Instead, we consider all the items to be unique.
-                            similar.iter().map(|item| vec![item]).collect()
-                        });
-
-                for (group, duplicates) in duplicates.into_iter().enumerate() {
-                    let alone = duplicates.len() == 1;
-
-                    let duplicate_group = if alone {
-                        None
-                    } else {
-                        duplicates
-                            .first()
-                            .map(|item| format!("{}-{group}", item.ordinal))
-                    };
-
-                    for (index, item) in duplicates.into_iter().enumerate() {
-                        let duplicate_index = if alone {
-                            None
-                        } else {
-                            Some(i64::try_from(index).unwrap())
-                        };
-
-                        if item.duplicate_group != duplicate_group
-                            || item.duplicate_index != duplicate_index
-                        {
-                            item_count.fetch_add(1, Relaxed);
-
-                            if !alone {
-                                duplicate_count.fetch_add(1, Relaxed);
-                            }
-
-                            dirty.lock().await.insert(
-                                item.data.hash.clone(),
-                                Item {
-                                    duplicate_group: duplicate_group.clone(),
-                                    duplicate_index,
-                                    ordinal: item.ordinal.clone(),
-                                    data: item.data.clone(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
+    let mut maybe_add = |similar: Vec<Item>| {
+        // We assume that if there are no dirty items in this group of similar items, then there is no need to
+        // deduplicate it again.
+        //
+        // TODO: If items have been removed from a duplicate group, there may be gaps in the sequence of indexes or
+        // the group may be left with only one item in it.  In either case, we should deduplicate again even though
+        // the set of similar items has no dirty items in it.  This isn't urgent, though, since it doesn't affect
+        // any client-visible behavior -- it's just a matter of keeping the database tidy.
+        if similar
+            .iter()
+            .any(|item| dirty.contains_key(&item.data.hash))
+        {
+            dirty_groups.push(similar)
         }
     };
 
@@ -339,7 +278,7 @@ async fn deduplicate_dirty(
             if last.ordinal.is_similar_to(&ordinal) {
                 similar.extend(items);
             } else {
-                deduplicate_similar(similar).await;
+                maybe_add(similar);
                 similar = items;
             }
         } else {
@@ -347,16 +286,95 @@ async fn deduplicate_dirty(
         }
     }
 
-    deduplicate_similar(similar).await;
+    if !similar.is_empty() {
+        maybe_add(similar);
+    }
+
+    // Next, deduplicate each of the groups identified above, and add any whose duplicate group or index has
+    // changed to the `dirty` collection so we can update the database later.
+
+    let mut duplicate_count = 0;
+
+    let group_count = dirty_groups.len();
+
+    for (group_index, similar) in dirty_groups.into_iter().enumerate() {
+        info!(
+            "({} of {group_count}) deduplicating similar items [{}]",
+            group_index,
+            similar
+                .iter()
+                .map(|item| &item.data.hash as &str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let duplicates = crate::media::deduplicate(image_lock, image_dir, cache_dir, &similar)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    "error deduplicating group [{}]: {e:?}",
+                    similar
+                        .iter()
+                        .map(|item| &item.data.hash as &str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+
+                // If anything goes wrong deduplicating, assume there's no point in trying again
+                // (i.e. assume none of the files will change and the error was deterministic).
+                // Instead, we consider all the items to be unique.
+                similar.iter().map(|item| vec![item]).collect()
+            });
+
+        for (group, duplicates) in duplicates.into_iter().enumerate() {
+            let alone = duplicates.len() == 1;
+
+            let duplicate_group = if alone {
+                None
+            } else {
+                duplicates
+                    .first()
+                    .map(|item| format!("{}-{group}", item.ordinal))
+            };
+
+            for (index, item) in duplicates.into_iter().enumerate() {
+                let duplicate_index = if alone {
+                    None
+                } else {
+                    Some(i64::try_from(index).unwrap())
+                };
+
+                if item.duplicate_group != duplicate_group
+                    || item.duplicate_index != duplicate_index
+                {
+                    if !alone {
+                        duplicate_count += 1;
+                    }
+
+                    dirty.insert(
+                        item.data.hash.clone(),
+                        Item {
+                            duplicate_group: duplicate_group.clone(),
+                            duplicate_index,
+                            ordinal: item.ordinal.clone(),
+                            data: item.data.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
 
     // Finally, update the database in a single transaction so that if it fails or is interrupted, we can try again
     // in the next pass without worrying about inconsistent state.
+
+    let item_count = dirty.len();
 
     conn.lock()
         .await
         .transaction(move |conn| {
             async move {
-                for item in dirty.lock().await.values() {
+                for item in dirty.values() {
                     let ordinal = item.ordinal.to_string();
 
                     sqlx::query!(
@@ -382,8 +400,8 @@ async fn deduplicate_dirty(
         .await?;
 
     Ok(DeduplicationSummary {
-        item_count: item_count.load(Relaxed),
-        duplicate_count: duplicate_count.load(Relaxed),
+        item_count,
+        duplicate_count,
     })
 }
 
@@ -433,8 +451,8 @@ async fn deduplicate(
                 .await
                 .unwrap_or_else(|e| {
                     warn!(
-                        "error calculating perceptual ordinal for {}: {:?}",
-                        row.hash, e
+                        "error calculating perceptual ordinal for {}: {e:?}",
+                        row.hash
                     );
 
                     // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will
@@ -471,6 +489,8 @@ async fn deduplicate(
 
     if dirty.is_empty() {
         // No new items present -- nothing else to do.
+        info!("no new items found to deduplicate");
+
         Ok(DeduplicationSummary {
             item_count: 0,
             duplicate_count: 0,
@@ -500,10 +520,7 @@ pub async fn sync(
     preload: bool,
     deduplicate: bool,
 ) -> Result<()> {
-    info!(
-        "starting sync (preload: {}; deduplicate: {})",
-        preload, deduplicate
-    );
+    info!("starting sync (preload: {preload}; deduplicate: {deduplicate})");
 
     let then = Instant::now();
 
@@ -547,12 +564,8 @@ pub async fn sync(
                     .await?;
 
             info!(
-                "({} of {}) insert {} (hash {}; data {:?})",
-                index + 1,
-                new_len,
-                path,
-                hash,
-                data
+                "({} of {new_len}) insert {path} (hash {hash}; data {data:?})",
+                index + 1
             );
 
             conn.lock()

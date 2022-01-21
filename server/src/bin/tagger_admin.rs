@@ -4,7 +4,7 @@ use {
     anyhow::Result,
     futures::stream::TryStreamExt,
     structopt::StructOpt,
-    tagger_server::{FileData, Item, ItemData, Ordinal},
+    tagger_server::{FileData, Item, ItemData},
     tagger_shared::tag_expression::TagExpression,
     tokio::sync::RwLock as AsyncRwLock,
 };
@@ -195,10 +195,7 @@ async fn main() -> Result<()> {
                     println!("perceptual ordinal for {hash} is {ordinal}");
 
                     items.push(Item {
-                        ordinal: Ordinal {
-                            video_length_seconds: None,
-                            image_ordinal: Vec::new(),
-                        },
+                        ordinal,
                         duplicate_group: None,
                         duplicate_index: None,
                         data: ItemData {
@@ -212,6 +209,23 @@ async fn main() -> Result<()> {
                 } else {
                     println!("no item found for {hash}");
                 }
+            }
+
+            items.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
+
+            let mut previous = None::<&Item>;
+
+            for item in &items {
+                if let Some(previous) = previous {
+                    println!(
+                        "is {} similar to {}? {}",
+                        previous.ordinal,
+                        item.ordinal,
+                        previous.ordinal.is_similar_to(&item.ordinal)
+                    );
+                }
+
+                previous = Some(item);
             }
 
             let groups =

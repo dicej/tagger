@@ -374,8 +374,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                                 tag.category.as_deref(),
                             ) {
                                 log::error!(
-                                    "cannot add tag {} since it belongs to an immutable category",
-                                    tag
+                                    "cannot add tag {tag} since it belongs to an immutable category",
                                 )
                             } else {
                                 let images = images.get();

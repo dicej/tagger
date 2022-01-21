@@ -116,7 +116,7 @@ pub fn images(props: ImagesProps) -> View<G> {
         }),
 
         template: move |(index, hash)| {
-            let url = format!("{}/image/small/{}", root, hash);
+            let url = format!("{root}/image/small/{hash}");
 
             let images = images.get();
 

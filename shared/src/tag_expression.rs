@@ -253,9 +253,9 @@ impl Display for TagTree {
             } else {
                 f.write_str(",")?;
             }
-            write!(f, "{}=>", tag)?;
+            write!(f, "{tag}=>")?;
             if let TagState::Included(tree) = state {
-                write!(f, "{}", tree)?;
+                write!(f, "{tree}")?;
             } else {
                 f.write_str("excluded")?;
             }

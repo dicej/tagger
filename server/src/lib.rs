@@ -2753,13 +2753,9 @@ mod test {
 
                         assert!(
                             close_enough(pixel, info.color),
-                            "expected {:?}; got {:?} for {}/{} at ({},{})",
+                            "expected {:?}; got {pixel:?} for {variant}/{} at ({x},{y})",
                             info.color,
-                            pixel,
-                            variant,
                             data.hash,
-                            x,
-                            y
                         );
                     }
                 }

@@ -100,14 +100,11 @@ pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 's
 
                     async move {
                         let mut request = client.get(format!(
-                            "{}/{}{}",
-                            root,
-                            uri,
+                            "{root}/{uri}{}",
                             if let Some(filter) = Option::<TagExpression>::from(filter.deref()) {
                                 format!(
-                                    "{}filter={}",
+                                    "{}filter={filter}",
                                     if uri.contains('?') { '&' } else { '?' },
-                                    filter
                                 )
                             } else {
                                 String::new()
