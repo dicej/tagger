@@ -1293,17 +1293,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-bigint"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93ab6289c7b344a8a9f60f88d80aa20032336fe78da341afc91c8a2341fc75f"
-dependencies = [
- "autocfg",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "num-integer"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1966,7 +1955,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "692ca13de57ce0613a363c8c2f1de925adebc81b04c923ac60c5488bb44abe4b"
 dependencies = [
  "chrono",
- "num-bigint 0.2.6",
+ "num-bigint",
  "num-traits",
 ]
 
@@ -2261,7 +2250,6 @@ dependencies = [
  "maplit",
  "mime",
  "mp4parse",
- "num-bigint 0.4.3",
  "pretty_env_logger",
  "rand",
  "regex",

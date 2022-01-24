@@ -23,7 +23,7 @@ pub static DDL_STATEMENTS: &[&str] = &[
        hash            TEXT NOT NULL PRIMARY KEY,
        datetime        TEXT NOT NULL,
        video_offset    INTEGER,
-       ordinal         TEXT,
+       perceptual_hash TEXT,
        duplicate_group TEXT,
        duplicate_index INTEGER
      )",

@@ -111,7 +111,9 @@ async fn main() -> Result<()> {
 
     // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
     // concurrently.  However, it's way too conservative since it prevents more than one task from writing any
-    // cache files concurrently -- even unrelated ones.  We should use separate locks per image hash.
+    // cache files concurrently -- even unrelated ones.  We should use separate locks per image hash (or one lock
+    // which can provide simultaneous guards for distinct image hashes).
+    // [async-condvar-fair](https://crates.io/crates/async-condvar-fair) may be useful for that purpose.
     let image_lock = Arc::new(AsyncRwLock::new(()));
 
     let (restart_tx, mut restart_rx) = mpsc::channel(2);

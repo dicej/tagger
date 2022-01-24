@@ -2,7 +2,7 @@
 //! items on the filesystem.
 
 use {
-    crate::media::{FileData, Item, ItemData, Ordinal, ORDINAL_LENGTH},
+    crate::media::{FileData, Item, ItemData, PerceptualHash, PERCEPTUAL_HASH_LENGTH},
     anyhow::{anyhow, Error, Result},
     chrono::{DateTime, Datelike, NaiveDateTime, Utc},
     futures::{future::BoxFuture, FutureExt, TryStreamExt},
@@ -12,7 +12,7 @@ use {
     sha2::{Digest, Sha256},
     sqlx::{Connection, SqliteConnection},
     std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         convert::{TryFrom, TryInto},
         fs::File,
         ops::DerefMut,
@@ -236,6 +236,42 @@ fn find_new<'a>(
     .boxed()
 }
 
+fn group_similar(items: &[Item]) -> Vec<HashSet<&Item>> {
+    let mut map = BTreeMap::<_, VecDeque<_>>::new();
+
+    for item in items {
+        map.entry(item.perceptual_hash.ordinal())
+            .or_default()
+            .push_back(item);
+    }
+
+    let mut items = map.into_iter().collect::<VecDeque<_>>();
+
+    let mut similar = HashMap::<&Item, HashSet<&Item>>::new();
+
+    while let Some((ordinal, mut my_items)) = items.pop_front() {
+        let others = items
+            .iter()
+            .take_while(|(o, _)| ordinal.is_similar_to(o))
+            .map(|(_, i)| i.iter())
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+
+        while let Some(item) = my_items.pop_front() {
+            for other in my_items.iter().chain(others.iter()) {
+                if item.perceptual_hash.is_similar_to(&other.perceptual_hash) {
+                    similar.entry(item).or_default().insert(other);
+
+                    similar.entry(other).or_default().insert(item);
+                }
+            }
+        }
+    }
+
+    crate::media::group_similar(similar)
+}
+
 /// Scan the collection of media items in `all`, grouping them by similarity and deduplicating each group with at
 /// least one `dirty` item in it, recording the results in the database.
 async fn deduplicate_dirty(
@@ -244,51 +280,23 @@ async fn deduplicate_dirty(
     image_dir: &str,
     cache_dir: &str,
     mut dirty: HashMap<String, Item>,
-    all: BTreeMap<Ordinal, Vec<Item>>,
+    all: Vec<Item>,
 ) -> Result<DeduplicationSummary> {
     let new_count = dirty.len();
 
-    info!("{new_count} new items since the previous deduplication");
+    info!("{new_count} new items since previous deduplication");
 
-    // Iterate over all items in order, grouping together any with similar ordinals and identifying which of those
-    // groups need to be deduplicated.
+    // First, group all the items according to similarity, and identify which groups contain at least one dirty
+    // item.
 
-    let mut dirty_groups = Vec::new();
-
-    let mut maybe_add = |similar: Vec<Item>| {
-        // We assume that if there are no dirty items in this group of similar items, then there is no need to
-        // deduplicate it again.
-        //
-        // TODO: If items have been removed from a duplicate group, there may be gaps in the sequence of indexes or
-        // the group may be left with only one item in it.  In either case, we should deduplicate again even though
-        // the set of similar items has no dirty items in it.  This isn't urgent, though, since it doesn't affect
-        // any client-visible behavior -- it's just a matter of keeping the database tidy.
-        if similar
-            .iter()
-            .any(|item| dirty.contains_key(&item.data.hash))
-        {
-            dirty_groups.push(similar)
-        }
-    };
-
-    let mut similar = Vec::<Item>::new();
-
-    for (ordinal, items) in all {
-        if let Some(last) = similar.last() {
-            if last.ordinal.is_similar_to(&ordinal) {
-                similar.extend(items);
-            } else {
-                maybe_add(similar);
-                similar = items;
-            }
-        } else {
-            similar = items;
-        }
-    }
-
-    if !similar.is_empty() {
-        maybe_add(similar);
-    }
+    let dirty_groups = group_similar(&all)
+        .into_iter()
+        .filter(|similar| {
+            similar
+                .iter()
+                .any(|item| dirty.contains_key(&item.data.hash))
+        })
+        .collect::<Vec<_>>();
 
     // Next, deduplicate each of the groups identified above, and add any whose duplicate group or index has
     // changed to the `dirty` collection so we can update the database later.
@@ -323,7 +331,7 @@ async fn deduplicate_dirty(
                 // If anything goes wrong deduplicating, assume there's no point in trying again
                 // (i.e. assume none of the files will change and the error was deterministic).
                 // Instead, we consider all the items to be unique.
-                similar.iter().map(|item| vec![item]).collect()
+                similar.iter().map(|&item| vec![item]).collect()
             });
 
         for (group, duplicates) in duplicates.into_iter().enumerate() {
@@ -334,7 +342,7 @@ async fn deduplicate_dirty(
             } else {
                 duplicates
                     .first()
-                    .map(|item| format!("{}-{group}", item.ordinal))
+                    .map(|item| format!("{}-{group}", item.data.hash))
             };
 
             for (index, item) in duplicates.into_iter().enumerate() {
@@ -356,7 +364,7 @@ async fn deduplicate_dirty(
                         Item {
                             duplicate_group: duplicate_group.clone(),
                             duplicate_index,
-                            ordinal: item.ordinal.clone(),
+                            perceptual_hash: item.perceptual_hash.clone(),
                             data: item.data.clone(),
                         },
                     );
@@ -375,16 +383,16 @@ async fn deduplicate_dirty(
         .transaction(move |conn| {
             async move {
                 for item in dirty.values() {
-                    let ordinal = item.ordinal.to_string();
+                    let perceptual_hash = item.perceptual_hash.to_string();
 
                     sqlx::query!(
                         "UPDATE images \
                          SET \
-                         ordinal = ?1, \
+                         perceptual_hash = ?1, \
                          duplicate_group = ?2, \
                          duplicate_index = ?3 \
                          WHERE hash = ?4",
-                        ordinal,
+                        perceptual_hash,
                         item.duplicate_group,
                         item.duplicate_index,
                         item.data.hash,
@@ -405,21 +413,21 @@ async fn deduplicate_dirty(
     })
 }
 
-/// Query the database for items for which we have not yet calculated a perceptual ordinal (e.g. files that have been
-/// newly added), calculate their ordinals, and look for duplicates among all files which have similar ordinals.
+/// Query the database for items for which we have not yet calculated a perceptual hash (e.g. files that have been
+/// newly added), calculate their p-hashes, and look for duplicates among all files which have similar p-hashes.
 async fn deduplicate(
     conn: &AsyncMutex<SqliteConnection>,
     image_lock: &AsyncRwLock<()>,
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
-    // First, collect all items, calculating any missing ordinals.
+    // First, collect all items, calculating any missing perceptual hashes.
 
     let rows = sqlx::query!(
         "SELECT \
          i.hash, \
          i.video_offset, \
-         i.ordinal, \
+         i.perceptual_hash, \
          i.duplicate_group, \
          i.duplicate_index, \
          min(p.path) as \"path!: String\" \
@@ -433,14 +441,14 @@ async fn deduplicate(
     .await?;
 
     let mut dirty = HashMap::new();
-    let mut all = BTreeMap::<_, Vec<_>>::new();
+    let mut all = Vec::new();
 
     for row in rows {
-        let (ordinal, is_dirty) = if let Some(ordinal) = &row.ordinal {
-            (Ordinal::from_str(ordinal)?, false)
+        let (perceptual_hash, is_dirty) = if let Some(perceptual_hash) = &row.perceptual_hash {
+            (PerceptualHash::from_str(perceptual_hash)?, false)
         } else {
             (
-                crate::media::perceptual_ordinal(
+                crate::media::perceptual_hash(
                     image_lock,
                     image_dir,
                     cache_dir,
@@ -450,17 +458,14 @@ async fn deduplicate(
                 )
                 .await
                 .unwrap_or_else(|e| {
-                    warn!(
-                        "error calculating perceptual ordinal for {}: {e:?}",
-                        row.hash
-                    );
+                    warn!("error calculating perceptual hash for {}: {e:?}", row.hash);
 
-                    // If we can't calculate the ordinal now, assume we never will be able to (i.e. the file will
-                    // never change) and don't bother trying again.  Instead, record the ordinal as all zeros and
+                    // If we can't calculate the p-hash now, assume we never will be able to (i.e. the file will
+                    // never change) and don't bother trying again.  Instead, record the p-hash as all zeros and
                     // move on.
-                    Ordinal {
+                    PerceptualHash {
                         video_length_seconds: None,
-                        image_ordinal: vec![0u8; ORDINAL_LENGTH],
+                        image_hash: vec![0u8; PERCEPTUAL_HASH_LENGTH],
                     }
                 }),
                 true,
@@ -475,7 +480,7 @@ async fn deduplicate(
                     video_offset: row.video_offset,
                 },
             },
-            ordinal: ordinal.clone(),
+            perceptual_hash: perceptual_hash.clone(),
             duplicate_group: row.duplicate_group,
             duplicate_index: row.duplicate_index,
         };
@@ -484,7 +489,7 @@ async fn deduplicate(
             dirty.insert(item.data.hash.clone(), item.clone());
         }
 
-        all.entry(ordinal).or_default().push(item);
+        all.push(item);
     }
 
     if dirty.is_empty() {

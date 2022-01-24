@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
                 .fetch_optional(&mut conn)
                 .await?
                 {
-                    let ordinal = tagger_server::perceptual_ordinal(
+                    let perceptual_hash = tagger_server::perceptual_hash(
                         &image_lock,
                         &image_directory,
                         &cache_directory,
@@ -192,10 +192,13 @@ async fn main() -> Result<()> {
                     )
                     .await?;
 
-                    println!("perceptual ordinal for {hash} is {ordinal}");
+                    println!(
+                        "perceptual hash for {hash} is {perceptual_hash} and ordinal is {:?}",
+                        perceptual_hash.ordinal()
+                    );
 
                     items.push(Item {
-                        ordinal,
+                        perceptual_hash,
                         duplicate_group: None,
                         duplicate_index: None,
                         data: ItemData {
@@ -211,26 +214,13 @@ async fn main() -> Result<()> {
                 }
             }
 
-            items.sort_by(|a, b| a.ordinal.cmp(&b.ordinal));
-
-            let mut previous = None::<&Item>;
-
-            for item in &items {
-                if let Some(previous) = previous {
-                    println!(
-                        "is {} similar to {}? {}",
-                        previous.ordinal,
-                        item.ordinal,
-                        previous.ordinal.is_similar_to(&item.ordinal)
-                    );
-                }
-
-                previous = Some(item);
-            }
-
-            let groups =
-                tagger_server::deduplicate(&image_lock, &image_directory, &cache_directory, &items)
-                    .await?;
+            let groups = tagger_server::deduplicate(
+                &image_lock,
+                &image_directory,
+                &cache_directory,
+                &items.iter().collect(),
+            )
+            .await?;
 
             println!("{groups:#?}");
         }
