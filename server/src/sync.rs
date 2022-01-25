@@ -308,7 +308,7 @@ async fn deduplicate_dirty(
     for (group_index, similar) in dirty_groups.into_iter().enumerate() {
         info!(
             "({} of {group_count}) deduplicating similar items [{}]",
-            group_index,
+            group_index + 1,
             similar
                 .iter()
                 .map(|item| &item.data.hash as &str)
@@ -334,15 +334,13 @@ async fn deduplicate_dirty(
                 similar.iter().map(|&item| vec![item]).collect()
             });
 
-        for (group, duplicates) in duplicates.into_iter().enumerate() {
+        for duplicates in duplicates {
             let alone = duplicates.len() == 1;
 
             let duplicate_group = if alone {
                 None
             } else {
-                duplicates
-                    .first()
-                    .map(|item| format!("{}-{group}", item.data.hash))
+                duplicates.first().map(|item| item.data.hash.clone())
             };
 
             for (index, item) in duplicates.into_iter().enumerate() {
@@ -443,10 +441,23 @@ async fn deduplicate(
     let mut dirty = HashMap::new();
     let mut all = Vec::new();
 
+    let dirty_count = rows
+        .iter()
+        .filter(|row| row.perceptual_hash.is_none())
+        .count();
+    let mut dirty_index = 1;
+
     for row in rows {
         let (perceptual_hash, is_dirty) = if let Some(perceptual_hash) = &row.perceptual_hash {
             (PerceptualHash::from_str(perceptual_hash)?, false)
         } else {
+            info!(
+                "({dirty_index} of {dirty_count}) calculating perceptual hash for {}",
+                row.hash
+            );
+
+            dirty_index += 1;
+
             (
                 crate::media::perceptual_hash(
                     image_lock,
