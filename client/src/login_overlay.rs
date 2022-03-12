@@ -1,9 +1,9 @@
 //! This module provides the `LoginOverlay` component, which prompts the user to enter their login credentials.
 
 use {
+    crate::client::Client,
     anyhow::Error,
     futures::TryFutureExt,
-    reqwest::{Client, StatusCode},
     std::{ops::Deref, rc::Rc},
     sycamore::prelude::{component, view, Signal, View},
     tagger_shared::{GrantType, TokenRequest, TokenSuccess},
@@ -14,14 +14,8 @@ use {
 /// Properties used to populate and render the `LoginOverlay` component, including reactive variables shared with
 /// other parts of the application
 pub struct LoginOverlayProps {
-    /// Base URL for requesting images from the server
-    pub root: Rc<str>,
-
     /// `reqwest` client for making OAuth 2 requests to the Tagger server
     pub client: Client,
-
-    /// The most recent access token received from the server, if any
-    pub token: Signal<Option<String>>,
 
     /// Whether the overlay should be visible or hidden
     pub show_log_in: Signal<bool>,
@@ -40,9 +34,7 @@ pub struct LoginOverlayProps {
 #[component(LoginOverlay<G>)]
 pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
     let LoginOverlayProps {
-        root,
         client,
-        token,
         show_log_in,
         log_in_error,
         user_name,
@@ -58,54 +50,7 @@ pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
                 if event.key().deref() == "Enter" {
-                    wasm_bindgen_futures::spawn_local(
-                        {
-                            let user_name = user_name.get();
-                            let password = password.get();
-                            let show_log_in = show_log_in.clone();
-                            let log_in_error = log_in_error.clone();
-                            let token = token.clone();
-                            let client = client.clone();
-                            let root = root.clone();
-
-                            async move {
-                                let response = client
-                                    .post(format!("{root}/token"))
-                                    .form(&TokenRequest {
-                                        grant_type: GrantType::Password,
-                                        username: user_name.trim().into(),
-                                        password: password.trim().into(),
-                                    })
-                                    .send()
-                                    .await?;
-
-                                if response.status() == StatusCode::UNAUTHORIZED {
-                                    log_in_error.set(Some("Invalid user name or password".into()));
-                                } else {
-                                    show_log_in.set(false);
-
-                                    token.set(Some(
-                                        response
-                                            .error_for_status()?
-                                            .json::<TokenSuccess>()
-                                            .await?
-                                            .access_token,
-                                    ));
-                                }
-
-                                Ok::<_, Error>(())
-                            }
-                        }
-                        .unwrap_or_else({
-                            let log_in_error = log_in_error.clone();
-
-                            move |e| {
-                                log::error!("error logging in: {e:?}");
-
-                                log_in_error.set(Some("Error communicating with server".into()));
-                            }
-                        }),
-                    );
+                    client.log_in();
                 }
             }
         }

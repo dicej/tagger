@@ -6,6 +6,9 @@ authors = ["Joel Dice <joel.dice@gmail.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+demo = ["base64"]
+
 [dependencies]
 tagger-shared = { path = "../shared" }
 wasm-bindgen-futures = "0.4"
@@ -23,3 +26,4 @@ jsonwebtoken = "7"
 chrono = { version = "0.4", features = ["wasmbind"] }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["Window", "Location", "Document", "KeyboardEvent", "MouseEvent", "TouchList", "Touch", "EventTarget", "HtmlVideoElement", "HtmlSelectElement", "Storage"] }
+base64 = { version = "0.13", optional = true }

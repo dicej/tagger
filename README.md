@@ -9,11 +9,11 @@ Media are organized by date by default, and users may add custom tags for
 querying and access control.
 
 This app doesn't (currently) support uploading media items.  Instead, it watches
-a directory waiting for new media items to appear.  This is intended to work in
-tandem with e.g. [Syncthing](https://syncthing.net/) such that items from your
-phone and/or other devices are continuously synced to the server running the
-`Tagger` back end.  Media items will appear in your collection automatically as
-they are added to the filesystem.
+a directory waiting for new items to appear.  This is intended to work in tandem
+with e.g. [Syncthing](https://syncthing.net/) such that items from your phone
+and/or other devices are continuously synced to the server running the `Tagger`
+back end.  Items will appear in your collection automatically as they are added
+to the filesystem.
 
 ## Features
 

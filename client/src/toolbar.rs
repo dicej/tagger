@@ -2,13 +2,13 @@
 
 use {
     crate::{
+        client::Client,
         images::ImagesState,
         pagination::{Pagination, PaginationProps},
         tag_menu::{List, TagMenu, TagMenuCommonProps, TagMenuProps},
     },
     anyhow::Error,
     futures::TryFutureExt,
-    reqwest::{Client, StatusCode},
     std::{collections::HashSet, ops::Deref, rc::Rc},
     sycamore::prelude::{
         self as syc, component, view, Keyed, KeyedProps, ReadSignal, Signal, View,
@@ -20,46 +20,6 @@ use {
     wasm_bindgen::JsCast,
     web_sys::{Event, HtmlSelectElement, KeyboardEvent},
 };
-
-/// Send a PATCH /tags request to the Tagger server to add or remove tags to/from media items.
-///
-/// The request is sent using the specified `client`, using `token` for authorization and `root`/tags as the URL.
-/// The body is `patches`, serialized as JSON.  If the server returns 401 Unauthorized, `on_unauthorized` will be
-/// invoked.
-fn patch_tags(
-    client: Client,
-    token: Signal<Option<String>>,
-    root: Rc<str>,
-    patches: Vec<Patch>,
-    on_unauthorized: impl Fn() + Clone + 'static,
-) {
-    wasm_bindgen_futures::spawn_local(
-        {
-            async move {
-                let mut request = client.patch(format!("{root}/tags"));
-
-                if let Some(token) = token.get().deref() {
-                    request = request.header("authorization", &format!("Bearer {token}"));
-                }
-
-                let response = request.json(&patches).send().await?;
-
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    on_unauthorized();
-                } else {
-                    response.error_for_status()?;
-
-                    token.trigger_subscribers();
-                }
-
-                Ok::<_, Error>(())
-            }
-        }
-        .unwrap_or_else(move |e| {
-            log::error!("error patching tags: {e:?}");
-        }),
-    )
-}
 
 /// Attempt to find the specified `category` in `tags`, and if it is present, return whether it is flagged as
 /// immutable (i.e. the server says it will not allow tags in that category to be added to or removed from media
@@ -88,14 +48,8 @@ fn is_immutable_category(tags: &TagsResponse, category: Option<&str>) -> bool {
 
 /// Properties for populating and rendering the `Toolbar` component
 pub struct ToolbarProps {
-    /// Base URL for sending HTTP requests to the Tagger server
-    pub root: Rc<str>,
-
-    /// `reqwest` client for making HTTP requests to the server
+    /// Client for making HTTP requests to the server
     pub client: Client,
-
-    /// Most recent access token received from the server
-    pub token: Signal<Option<String>>,
 
     /// Indicates whether the UI is currently in "selecting" mode, i.e. the user is selecting items to modify
     pub selecting: Signal<bool>,
@@ -117,9 +71,6 @@ pub struct ToolbarProps {
 
     /// The timestamp (and possibly hash) indicating where to start in the item list when displaying thumbnails
     pub start: Signal<Option<ImageKey>>,
-
-    /// Callback to invoke if the server responds to any request with 401 Unauthorized
-    pub on_unauthorized: Rc<dyn Fn()>,
 }
 
 /// Define the `Toolbar` component, which hosts various tool icons, menus, and status notifications.
@@ -127,9 +78,7 @@ pub struct ToolbarProps {
 #[allow(clippy::redundant_closure)]
 pub fn toolbar(props: ToolbarProps) -> View<G> {
     let ToolbarProps {
-        root,
         client,
-        token,
         selecting,
         open_log_in,
         items_per_page,
@@ -137,22 +86,11 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         filter,
         images,
         start,
-        on_unauthorized,
     } = props;
 
     // The `TagMenu` component needs to know the set of tags (across all media items accessible to this user)
     // available from the server.
-    let unfiltered_tags = crate::watch::<TagsResponse, _>(
-        Signal::new("tags".into()).into_handle(),
-        client.clone(),
-        token.clone(),
-        root.clone(),
-        Signal::new(TagTree::default()).into_handle(),
-        {
-            let on_unauthorized = on_unauthorized.clone();
-            move || on_unauthorized()
-        },
-    );
+    let unfiltered_tags = client.watch_tags(Signal::new(TagTree::default()).into_handle());
 
     let pagination = PaginationProps {
         images: images.clone(),
@@ -168,21 +106,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         move |_| show_menu.set(!*show_menu.get())
     };
 
-    // We only enable selection mode if the server has given us an access token which says we may add and remove
-    // tags to/from media items.
-    let may_select = syc::create_selector({
-        let token = token.handle();
-
-        move || {
-            if let Some(token) = token.get().deref() {
-                jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
-                    .map(|data| data.claims.may_patch)
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        }
-    });
+    let may_select = client.may_select();
 
     let toggle_selecting = {
         let selecting = selecting.clone();
@@ -202,23 +126,15 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
     };
 
     let logged_in = syc::create_selector({
-        let token = token.handle();
+        let client = client.clone();
 
-        move || crate::logged_in(token.get().deref())
+        move || client.is_logged_in()
     });
 
     let log_out = {
-        let token = token.clone();
-        let root = root.clone();
         let client = client.clone();
-        let open_log_in = open_log_in.clone();
 
-        move |_| {
-            crate::try_anonymous_login(token.clone(), client.clone(), root.clone(), {
-                let open_log_in = open_log_in.clone();
-                move || open_log_in()
-            })
-        }
+        move |_| client.try_anonymous_login()
     };
 
     let open_log_in_event = move |_| open_log_in();
@@ -269,21 +185,15 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
 
         template: {
             let client = client.clone();
-            let token = token.clone();
-            let root = root.clone();
             let images = images.clone();
             let unfiltered_tags = unfiltered_tags.clone();
-            let on_unauthorized = on_unauthorized.clone();
 
             move |tag| {
                 let remove = {
                     let client = client.clone();
-                    let token = token.clone();
-                    let root = root.clone();
                     let tag = tag.clone();
                     let unfiltered_tags = unfiltered_tags.clone();
                     let images = images.clone();
-                    let on_unauthorized = on_unauthorized.clone();
 
                     move |_| {
                         if !is_immutable_category(
@@ -292,10 +202,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                         ) {
                             let images = images.get();
 
-                            patch_tags(
-                                client.clone(),
-                                token.clone(),
-                                root.clone(),
+                            client.patch_tags(
                                 images
                                     .response
                                     .images
@@ -314,10 +221,6 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                                         }
                                     })
                                     .collect(),
-                                {
-                                    let on_unauthorized = on_unauthorized.clone();
-                                    move || on_unauthorized()
-                                },
                             )
                         }
                     }
@@ -357,12 +260,9 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
     let add_tag_value = Signal::new(String::new());
 
     let add_tag_key = {
-        let root = root.clone();
         let add_tag_value = add_tag_value.clone();
-        let token = token.clone();
         let client = client.clone();
         let unfiltered_tags = unfiltered_tags.clone();
-        let on_unauthorized = on_unauthorized.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
@@ -379,10 +279,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                             } else {
                                 let images = images.get();
 
-                                patch_tags(
-                                    client.clone(),
-                                    token.clone(),
-                                    root.clone(),
+                                client.patch_tags(
                                     images
                                         .response
                                         .images
@@ -406,10 +303,6 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
                                             }
                                         })
                                         .collect(),
-                                    {
-                                        let on_unauthorized = on_unauthorized.clone();
-                                        move || on_unauthorized()
-                                    },
                                 )
                             }
                         }
@@ -428,12 +321,9 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
     let tag_menu = TagMenuProps {
         common: TagMenuCommonProps {
             client,
-            token,
-            root,
             filter: filter.clone(),
             filter_chain: List::Nil,
             unfiltered_tags: unfiltered_tags.clone(),
-            on_unauthorized: on_unauthorized.clone(),
             show_menu: show_menu.clone(),
         },
         filtered_tags: unfiltered_tags,

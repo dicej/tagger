@@ -6,8 +6,7 @@
 //! `tagger_shared::tag_expression::TagTree`, which we use heavily in this module.
 
 use {
-    crate::watch,
-    reqwest::Client,
+    crate::client::Client,
     std::{cmp::Ordering, collections::HashMap, ops::Deref, rc::Rc, sync::Arc},
     sycamore::prelude::{
         self as syc, component, view, Keyed, KeyedProps, ReadSignal, Signal, View,
@@ -200,14 +199,8 @@ fn filter_state(filter_chain: &List<Tag>, filter: &TagTree, tag: &Tag) -> Filter
 
 /// Properties common to [TagSubMenuProps] and [TagMenuProps]
 pub struct TagMenuCommonProps {
-    /// `reqwest` client for making HTTP requests to the Tagger server
+    /// Client for making HTTP requests to the Tagger server
     pub client: Client,
-
-    /// Most recent access token received from the server
-    pub token: Signal<Option<String>>,
-
-    /// Base URL for requesting tag data from the server
-    pub root: Rc<str>,
 
     /// The current filter specified by the user, represented as a `TagTree`
     pub filter: Signal<TagTree>,
@@ -217,9 +210,6 @@ pub struct TagMenuCommonProps {
 
     /// The most recent raw, unfiltered set of tags received from the server
     pub unfiltered_tags: ReadSignal<TagsResponse>,
-
-    /// Callback to invoke if the server responds to any request with 401 Unauthorized
-    pub on_unauthorized: Rc<dyn Fn()>,
 
     pub show_menu: Signal<bool>,
 }
@@ -246,12 +236,9 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
         common:
             TagMenuCommonProps {
                 client,
-                token,
-                root,
                 filter,
                 filter_chain,
                 unfiltered_tags,
-                on_unauthorized,
                 show_menu,
             },
         tag,
@@ -261,33 +248,20 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
         let tag = tag.clone();
         let filter_chain = filter_chain.clone();
         let filter = filter.clone();
-        let on_unauthorized = on_unauthorized.clone();
 
         move || {
             let filter_chain = List::Cons(Rc::new((tag.clone(), filter_chain.clone())));
-            let on_unauthorized = on_unauthorized.clone();
 
             TagMenuProps {
                 common: TagMenuCommonProps {
                     client: client.clone(),
-                    token: token.clone(),
-                    root: root.clone(),
                     filter: filter.clone(),
                     filter_chain: filter_chain.clone(),
                     unfiltered_tags: unfiltered_tags.clone(),
-                    on_unauthorized: on_unauthorized.clone(),
                     show_menu: show_menu.clone(),
                 },
-                filtered_tags: watch::<TagsResponse, _>(
-                    Signal::new("tags".into()).into_handle(),
-                    client.clone(),
-                    token.clone(),
-                    root.clone(),
+                filtered_tags: client.watch_tags(
                     Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
-                    {
-                        let on_unauthorized = on_unauthorized.clone();
-                        move || on_unauthorized()
-                    },
                 ),
                 category: None,
             }
@@ -346,12 +320,9 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
         common:
             TagMenuCommonProps {
                 client,
-                token,
-                root,
                 filter,
                 filter_chain,
                 unfiltered_tags,
-                on_unauthorized,
                 show_menu,
             },
         filtered_tags,
@@ -386,22 +357,16 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let unfiltered_tags = unfiltered_tags.clone();
                 let filtered_tags = filtered_tags.clone();
                 let client = client.clone();
-                let token = token.clone();
-                let root = root.clone();
                 let filter = filter.clone();
-                let on_unauthorized = on_unauthorized.clone();
                 let show_menu = show_menu.clone();
 
                 move |category| {
                     let tag_menu = TagMenuProps {
                         common: TagMenuCommonProps {
                             client: client.clone(),
-                            token: token.clone(),
-                            root: root.clone(),
                             filter: filter.clone(),
                             filter_chain: filter_chain.clone(),
                             unfiltered_tags: unfiltered_tags.clone(),
-                            on_unauthorized: on_unauthorized.clone(),
                             show_menu: show_menu.clone(),
                         },
                         filtered_tags: filtered_tags.clone(),
@@ -468,12 +433,9 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
             let sub_menu = TagSubMenuProps {
                 common: TagMenuCommonProps {
                     client: client.clone(),
-                    token: token.clone(),
-                    root: root.clone(),
                     filter: filter.clone(),
                     filter_chain: filter_chain.clone(),
                     unfiltered_tags: unfiltered_tags.clone(),
-                    on_unauthorized: on_unauthorized.clone(),
                     show_menu: show_menu.clone(),
                 },
                 tag: tag.clone(),

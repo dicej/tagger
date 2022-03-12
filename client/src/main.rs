@@ -27,6 +27,7 @@
 
 use {
     crate::{
+        client::Client,
         image_overlay::{Direction, ImageOverlay, ImageOverlayProps, Select},
         images::{ImageState, Images, ImagesProps, ImagesState},
         login_overlay::{LoginOverlay, LoginOverlayProps},
@@ -36,7 +37,6 @@ use {
     anyhow::{anyhow, Error, Result},
     chrono::Utc,
     futures::future::TryFutureExt,
-    reqwest::{Client, StatusCode},
     serde_derive::{Deserialize, Serialize},
     std::{cell::Cell, convert::TryFrom, ops::Deref, panic, rc::Rc},
     sycamore::prelude::{self as syc, view, ReadSignal, Signal},
@@ -48,6 +48,7 @@ use {
     web_sys::KeyboardEvent,
 };
 
+mod client;
 mod image_overlay;
 mod images;
 mod login_overlay;
@@ -57,85 +58,6 @@ mod toolbar;
 
 /// Number of media items to show per page by default
 const DEFAULT_ITEMS_PER_PAGE: u32 = 100;
-
-/// Create a `ReadSignal` which resolves to the JSON response body returned from the specified URI.
-///
-/// The request will include an HTTP "Bearer" authorization header with the specified auth token.  Any time either
-/// `uri`, `token`, or `filter` change, the request will be resent and the signal re-fired with the response unless
-/// the response status is 401 Unauthorized, in which case the signal is set to `Default::default()` and
-/// `on_unauthorized` is called.
-///
-/// The full request URL is formed using `root`/`uri`, with `filter` appended as a query parameter if it is
-/// non-empty.
-pub fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'static>(
-    uri: ReadSignal<String>,
-    client: Client,
-    token: Signal<Option<String>>,
-    root: Rc<str>,
-    filter: ReadSignal<TagTree>,
-    on_unauthorized: F,
-) -> ReadSignal<T> {
-    let signal = Signal::new(T::default());
-
-    syc::create_effect({
-        let signal = signal.clone();
-
-        move || {
-            // Note that we must use `wasm_bindgen_futures::spawn_local` to make the asynchronous HTTP request, but
-            // we must call `{Read}Signal::get()` on our signals in the closure called by Sycamore (not the closure
-            // called by wasm_bindgen) since Sycamore uses thread local state to track context, and that state
-            // won't be available when wasm_bindgen calls our nested closure.
-
-            let client = client.clone();
-            let token = token.get();
-            let filter = filter.get();
-            let uri = uri.get();
-            let root = root.clone();
-            let signal = signal.clone();
-            let on_unauthorized = on_unauthorized.clone();
-
-            wasm_bindgen_futures::spawn_local(
-                {
-                    let uri = uri.clone();
-
-                    async move {
-                        let mut request = client.get(format!(
-                            "{root}/{uri}{}",
-                            if let Some(filter) = Option::<TagExpression>::from(filter.deref()) {
-                                format!(
-                                    "{}filter={filter}",
-                                    if uri.contains('?') { '&' } else { '?' },
-                                )
-                            } else {
-                                String::new()
-                            }
-                        ));
-
-                        if let Some(token) = token.deref() {
-                            request = request.header("authorization", &format!("Bearer {token}"));
-                        }
-
-                        let response = request.send().await?;
-
-                        if response.status() == StatusCode::UNAUTHORIZED {
-                            signal.set(T::default());
-                            on_unauthorized();
-                        } else {
-                            signal.set(response.error_for_status()?.json::<T>().await?);
-                        }
-
-                        Ok::<_, Error>(())
-                    }
-                }
-                .unwrap_or_else(move |e| {
-                    log::error!("error retrieving {uri}: {e:?}");
-                }),
-            )
-        }
-    });
-
-    signal.into_handle()
-}
 
 /// Call `fun` with the old and new values of `handle` whenever it changes.
 fn watch_changes<A: Eq>(handle: ReadSignal<A>, fun: impl Fn(&Rc<A>, &Rc<A>) + 'static) {
@@ -147,7 +69,7 @@ fn watch_changes<A: Eq>(handle: ReadSignal<A>, fun: impl Fn(&Rc<A>, &Rc<A>) + 's
     // won't fire when we need it to.
     //
     // There's nothing special about `wasm_bindgen_futures::spawn_local` here (i.e. we don't need to do any
-    // asynchronous I/O) -- it's just a convenient way to postpone running a closure until the currentl Sycamore
+    // asynchronous I/O) -- it's just a convenient way to postpone running a closure until the current Sycamore
     // thread local state has been discarded.
     wasm_bindgen_futures::spawn_local(async move {
         syc::create_effect(move || {
@@ -205,6 +127,47 @@ fn fold<A, B>(
     signal.into_handle()
 }
 
+/// Credentials to use to log in to a demo account
+///
+/// See `State::demo` for details.
+#[cfg(feature = "demo")]
+struct DemoCredentials {
+    user_name: String,
+    password: String,
+}
+
+#[cfg(feature = "demo")]
+impl FromStr for DemoCredentials {
+    type Err = Error;
+
+    /// Parse a `DemoCredentials` from a string of the form "<base64 user name>:<base64 password>".
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut split = s.split(':');
+
+        if let (Some(a), Some(b)) = (split.next(), split.next()) {
+            Ok(Self {
+                user_name: String::from_utf8(&base64::decode_config(a)?, base64::URL_SAFE)?,
+                password: String::from_utf8(&base64::decode_config(b)?, base64::URL_SAFE)?,
+            })
+        } else {
+            Err(anyhow!("unable to parse {s} as DemoCredentials"))
+        }
+    }
+}
+
+#[cfg(feature = "demo")]
+impl Display for DemoCredentials {
+    /// Format a `DemoCredentials` using the format described in `DemoCredentials::from_str`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}:{}",
+            base64::encode_config(self.user_name.as_bytes(), base64::URL_SAFE),
+            base64::encode_config(self.password.as_bytes(), base64::URL_SAFE),
+        )
+    }
+}
+
 /// Represents the state of this application (e.g. which item the user is looking at, etc.)
 ///
 /// This is used for URI-based "routing", e.g. https://[hostname]/#s=2022-01-10T01%3A17%3A10Z&ipp=1000
@@ -225,58 +188,14 @@ struct State {
     /// The number of items per page to display (assume [DEFAULT_ITEMS_PER_PAGE] if unspecified)
     #[serde(rename = "ipp")]
     items_per_page: Option<u32>,
-}
 
-/// Return true iff the specified `token` exists and is not an "anonymous" token.
-///
-/// The tagger server may be configured to allow anonymous access (i.e. with empty credentials), in which case we
-/// may have a token with no subject claim, which means we aren't really logged in yet.
-fn logged_in(token: &Option<String>) -> bool {
-    if let Some(token) = token {
-        jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
-            .map(|data| data.claims.subject.is_some())
-            .unwrap_or(false)
-    } else {
-        false
-    }
-}
-
-/// Attempt to log in with empty credentials, setting `token` to the resulting access token on success, or else
-/// calling `on_unauthorized` on 401 Unauthorized.
-///
-/// The OAuth 2 authentication URL is formed using `root`/token.
-fn try_anonymous_login(
-    token: Signal<Option<String>>,
-    client: Client,
-    root: Rc<str>,
-    on_unauthorized: impl Fn() + 'static,
-) {
-    if token.get_untracked().is_some() {
-        token.set(None);
-    }
-
-    wasm_bindgen_futures::spawn_local(
-        async move {
-            let response = client.get(format!("{root}/token")).send().await?;
-
-            if response.status() == StatusCode::UNAUTHORIZED {
-                on_unauthorized();
-            } else {
-                token.set(Some(
-                    response
-                        .error_for_status()?
-                        .json::<TokenSuccess>()
-                        .await?
-                        .access_token,
-                ));
-            }
-
-            Ok::<_, Error>(())
-        }
-        .unwrap_or_else(move |e| {
-            log::error!("error logging in anonymously: {e:?}");
-        }),
-    );
+    /// Credentials to use to log in to a demo account, if any
+    ///
+    /// When this is specified, the app will operate in "demo" mode, meaning the user will be allowed to add or
+    /// remove tags to/from media items locally, but those changes will not be persisted to the server and will be
+    /// reset if user leaves or refreshes the page.
+    #[cfg(feature = "demo")]
+    demo: Option<DemoCredentials>,
 }
 
 /// Start this application.
@@ -315,58 +234,10 @@ fn main() -> Result<()> {
         location.host().map_err(|e| anyhow!("{e:?}"))?
     ));
 
-    let client = Client::new();
-
     let show_log_in = Signal::new(false);
     let log_in_error = Signal::new(None);
     let user_name = Signal::new(String::new());
     let password = Signal::new(String::new());
-
-    let open_log_in = {
-        let show_log_in = show_log_in.clone();
-        let log_in_error = log_in_error.clone();
-        let user_name = user_name.clone();
-        let password = password.clone();
-
-        move || {
-            user_name.set(String::new());
-            password.set(String::new());
-            log_in_error.set(None);
-            show_log_in.set(true);
-        }
-    };
-
-    // First, check local storage to see if there's an existing access token we can use to talk to the server.  If
-    // not, try to log in anonymously.  If either of those things fail, pop up the login overlay so the user can
-    // provide credentials.
-    if let Ok(Some(storage)) = window.local_storage() {
-        if let Ok(Some(stored_token)) = storage.get("token") {
-            token.set(Some(stored_token));
-        } else {
-            try_anonymous_login(
-                token.clone(),
-                client.clone(),
-                root.clone(),
-                open_log_in.clone(),
-            );
-        }
-    }
-
-    // Whenever the access token changes, save it to local storage (or delete it if we've logged out)
-    syc::create_effect({
-        let token = token.handle();
-        let window = window.clone();
-
-        move || {
-            if let Ok(Some(storage)) = window.local_storage() {
-                let _ = if let Some(token) = token.get().deref() {
-                    storage.set("token", token)
-                } else {
-                    storage.delete("token")
-                };
-            }
-        }
-    });
 
     // The current image being viewed in the lightbox, if any
     let overlay_image = Signal::new(None);
@@ -386,12 +257,22 @@ fn main() -> Result<()> {
     // The number of thumbnails to display per page
     let items_per_page = Signal::new(DEFAULT_ITEMS_PER_PAGE);
 
+    let client = Client::new(
+        token.clone(),
+        root,
+        filter.handle(),
+        show_log_in.clone(),
+        log_in_error.clone(),
+    );
+
     // Extract any routing information in the URI from the "hash" portion (e.g. if the user has bookmarked a
     // specific image)
     if let Ok(hash) = location.hash() {
         if let Some(hash) = hash.strip_prefix('#') {
             match serde_urlencoded::from_str::<State>(hash) {
                 Ok(state) => {
+                    client.init(&state);
+
                     overlay_image.set(state.overlay_image);
                     filter.set(state.filter.unwrap_or_default());
 
@@ -409,6 +290,8 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    client.try_login()?;
 
     // Whenever the application state changes, encode it as a "route" and update the URI
     syc::create_effect({
@@ -464,25 +347,6 @@ fn main() -> Result<()> {
         }
     });
 
-    // Whenever the server tells us our token is no longer valid, show the login overlay (but also try to log in
-    // anonymously in the background in case the server allows that)
-    let on_unauthorized = {
-        let open_log_in = open_log_in.clone();
-        let client = client.clone();
-        let token = token.clone();
-        let root = root.clone();
-
-        move || {
-            let was_logged_in = logged_in(token.get().deref());
-
-            try_anonymous_login(token.clone(), client.clone(), root.clone(), || ());
-
-            if was_logged_in {
-                open_log_in();
-            }
-        }
-    };
-
     // How many items are currently selected for modification
     let selected_count = Signal::new(0);
 
@@ -495,29 +359,7 @@ fn main() -> Result<()> {
     // currently selected.  We also wire that state to derived state (e.g. `selected_count`) here to ensure they
     // automatically stay in sync.
     let images = fold(
-        watch::<ImagesResponse, _>(
-            syc::create_selector({
-                let start = start.clone();
-                let items_per_page = items_per_page.clone();
-
-                move || {
-                    format!(
-                        "images?{}",
-                        serde_urlencoded::to_string(ImagesQuery {
-                            start: start.get().deref().clone(),
-                            limit: Some(*items_per_page.get()),
-                            filter: None // will be added by `watch`
-                        })
-                        .unwrap()
-                    )
-                }
-            }),
-            client.clone(),
-            token.clone(),
-            root.clone(),
-            filter.handle(),
-            on_unauthorized.clone(),
-        ),
+        client.watch_images(filter.handle(), start.handle(), items_per_page.handle()),
         ImagesState::default(),
         {
             let selected_count = selected_count.clone();
@@ -695,12 +537,10 @@ fn main() -> Result<()> {
         client,
         token,
         selecting: selecting.clone(),
-        open_log_in: Rc::new(open_log_in),
         items_per_page,
         selected_count: selected_count.handle(),
         filter,
         images: images.clone(),
-        on_unauthorized: Rc::new(on_unauthorized),
         start,
     };
 
