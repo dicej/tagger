@@ -256,25 +256,6 @@ fn bind_filter_clause<'a>(
     })
 }
 
-/// If the specified `auth` claims include a non-empty `Authorization::filter` field, modify the supplied `filter`
-/// in place, either replacing it with the one from `auth` if the former is empty, or combining them together using
-/// the AND operator.
-///
-/// This ensures that whatever filter was provided by the user is constrained to what that user has permission to
-/// access.
-fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
-    if let Some(user_filter) = &auth.filter {
-        if let Some(inner) = filter.take() {
-            *filter = Some(TagExpression::And(
-                Box::new(inner),
-                Box::new(user_filter.clone()),
-            ));
-        } else {
-            *filter = Some(user_filter.clone());
-        }
-    }
-}
-
 /// Abbreviation for `Response::builder()`
 fn response() -> response::Builder {
     Response::builder()

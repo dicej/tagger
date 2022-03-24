@@ -121,6 +121,16 @@ impl TagExpression {
             TagExpression::Tag(a) => a == tag,
         }
     }
+
+    /// Evaluate this boolean expression to determine whether it matches the specified `tags`.
+    pub fn evaluate_set(&self, tags: &HashSet<Tag>) -> bool {
+        match self {
+            TagExpression::Or(a, b) => a.evaluate(tags) || b.evaluate(tags),
+            TagExpression::And(a, b) => a.evaluate(tags) && b.evaluate(tags),
+            TagExpression::Not(a) => !a.evaluate(tags),
+            TagExpression::Tag(a) => tags.contains(a),
+        }
+    }
 }
 
 impl FromStr for TagExpression {

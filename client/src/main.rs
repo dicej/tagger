@@ -172,22 +172,22 @@ impl Display for DemoCredentials {
 ///
 /// This is used for URI-based "routing", e.g. https://[hostname]/#s=2022-01-10T01%3A17%3A10Z&ipp=1000
 #[derive(Serialize, Deserialize, Debug)]
-struct State {
+pub struct State {
     /// The index of the media item the user is currently looking at, if any
     #[serde(rename = "oi")]
-    overlay_image: Option<usize>,
+    pub overlay_image: Option<usize>,
 
     /// The tag expression the user is currently using to filter items, if any
     #[serde(rename = "f")]
-    filter: Option<TagTree>,
+    pub filter: Option<TagTree>,
 
     /// The timestamp (and possibly hash) indicating where to start in the item list when displaying thumbnails
     #[serde(rename = "s")]
-    start: Option<ImageKey>,
+    pub start: Option<ImageKey>,
 
     /// The number of items per page to display (assume [DEFAULT_ITEMS_PER_PAGE] if unspecified)
     #[serde(rename = "ipp")]
-    items_per_page: Option<u32>,
+    pub items_per_page: Option<u32>,
 
     /// Credentials to use to log in to a demo account, if any
     ///
@@ -195,7 +195,7 @@ struct State {
     /// remove tags to/from media items locally, but those changes will not be persisted to the server and will be
     /// reset if user leaves or refreshes the page.
     #[cfg(feature = "demo")]
-    demo: Option<DemoCredentials>,
+    pub demo: Option<DemoCredentials>,
 }
 
 /// Start this application.
@@ -257,22 +257,12 @@ fn main() -> Result<()> {
     // The number of thumbnails to display per page
     let items_per_page = Signal::new(DEFAULT_ITEMS_PER_PAGE);
 
-    let client = Client::new(
-        token.clone(),
-        root,
-        filter.handle(),
-        show_log_in.clone(),
-        log_in_error.clone(),
-    );
-
     // Extract any routing information in the URI from the "hash" portion (e.g. if the user has bookmarked a
     // specific image)
-    if let Ok(hash) = location.hash() {
+    let state = if let Ok(hash) = location.hash() {
         if let Some(hash) = hash.strip_prefix('#') {
             match serde_urlencoded::from_str::<State>(hash) {
                 Ok(state) => {
-                    client.init(&state);
-
                     overlay_image.set(state.overlay_image);
                     filter.set(state.filter.unwrap_or_default());
 
@@ -283,13 +273,30 @@ fn main() -> Result<()> {
                     if let Some(state_items_per_page) = state.items_per_page {
                         items_per_page.set(state_items_per_page);
                     }
+
+                    Some(state)
                 }
                 Err(e) => {
                     log::warn!("unable to decode state: {e:?}");
+
+                    None
                 }
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
+
+    let client = Client::new(
+        state.as_ref(),
+        token.clone(),
+        root,
+        filter.handle(),
+        show_log_in.clone(),
+        log_in_error.clone(),
+    );
 
     client.try_login()?;
 

@@ -12,13 +12,14 @@ pub struct HttpClient {
 }
 
 #[cfg(feature = "demo")]
-pub type Client = DemoClient;
+pub type Client = demo::DemoClient;
 
 #[cfg(not(feature = "demo"))]
 pub type Client = HttpClient;
 
 impl HttpClient {
-    fn new(
+    pub fn new(
+        _state: Option<&State>,
         token: Signal<Option<String>>,
         root: Rc<str>,
         show_log_in: Signal<bool>,
@@ -357,101 +358,326 @@ impl HttpClient {
 }
 
 #[cfg(feature = "demo")]
-#[derive(Clone)]
-struct DemoClient {
-    client: HttpClient,
-    in_demo_mode: Rc<Cell<bool>>,
-}
+mod demo {
+    use super::*;
 
-#[cfg(feature = "demo")]
-impl DemoClient {
-    fn new(
-        token: Signal<Option<String>>,
-        root: Rc<str>,
-        show_log_in: Signal<bool>,
-        log_in_error: Signal<Option<String>>,
-        user_name: Signal<String>,
-        password: Signal<String>,
-    ) -> Self {
-        Self {
-            client: HttpClient::new(token, root, show_log_in, log_in_error, user_name, password),
-            in_demo_mode: Rc::new(Cell::new(false)),
+    const IMAGE_LIMIT: u32 = 10_000;
+
+    #[derive(Clone)]
+    struct DemoPatch {
+        to_add: HashMap<Arc<str>, HashSet<Tag>>,
+        to_remove: HashMap<Arc<str>, HashSet<Tag>>,
+    }
+
+    #[derive(Clone)]
+    struct DemoState {
+        images: ReadSignal<ImagesResponse>,
+        tags: ReadSignal<TagsResponse>,
+        patch: Signal<DemoPatch>,
+    }
+
+    impl DemoState {
+        fn images_and_tag_counts(
+            &self,
+            filter: &ReadSignal<TagTree>,
+            token: &ReadSignal<Option<String>>,
+            start: ReadSignal<Option<ImageKey>>,
+            items_per_page: ReadSignal<u32>,
+        ) -> (
+            ImagesResponse,
+            HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>,
+        ) {
+            let patch = self.patch.get();
+            let images = self.images.get();
+
+            let mut filter = Option::<TagExpression>::from(filter.get().deref());
+
+            if let Ok(auth) = jsonwebtoken::dangerous_insecure_decode::<Authorization>(token) {
+                tagger_shared::maybe_wrap_filter(&mut filter, &auth);
+            }
+
+            let mut tag_counts = HashMap::new();
+
+            let mut builder = ImagesResponseBuilder::new(
+                start.get().deref().as_ref(),
+                *items_per_page.get().deref().into(),
+            );
+
+            for image in &images.images {
+                let tags = image
+                    .tags
+                    .iter()
+                    .filter(|tag| match patch.to_remove.get(&image.hash) {
+                        Some(to_remove) => !to_remove.contains(tag),
+                        _ => true,
+                    })
+                    .chain(patch.to_add.get(&image.hash).iter().flatten())
+                    .cloned()
+                    .collect();
+
+                for tag in &tags {
+                    *tag_counts
+                        .entry(tag.category.clone())
+                        .or_default()
+                        .entry(tag.value.clone())
+                        .or_default() += 1;
+                }
+
+                if filter
+                    .as_ref()
+                    .map(|filter| filter.evaluate_set(&tags))
+                    .unwrap_or(true)
+                {
+                    builder.consider(&image.key(), || ImageData {
+                        hash: image.hash.clone(),
+                        datetime: image.datetime,
+                        medium: image.medium,
+                        duplicates: image.duplicates.clone(),
+                        tags,
+                    });
+                }
+            }
+
+            (builder.build(), tag_counts)
+        }
+
+        fn tags(
+            &self,
+            tag_counts: &HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>,
+        ) -> TagsResponse {
+            filter_tags(None, self.tags.get().deref(), tag_counts)
         }
     }
 
-    pub fn init(&self, state: &State) {
-        if Some(DemoCredentials {
-            user_name,
-            password,
-        }) = &state.demo
-        {
-            self.user_name.set(user_name.clone());
-            self.password.set(password.clone());
-            self.in_demo_mode.set(true);
-            self.client.log_in();
-            // todo: display a banner message explaining that in demo mode any changes will be lost if the user
-            // leaves or refreshes the page.
-        }
-    }
-
-    pub fn may_select(&self) -> ReadSignal<bool> {
-        if self.in_demo_mode.get() {
-            Signal::new(true).into_handle()
+    fn filter_tags(
+        category: Option<Arc<str>>,
+        tags: &TagsResponse,
+        tag_counts: &HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>,
+    ) -> TagsResponse {
+        let new_categories = if category.is_none() {
+            tag_counts.iter().filter_map(|(category, tags)| {
+                if !tags.categories.contains_key(&category) {
+                    Some((
+                        category.clone(),
+                        TagsResponse {
+                            immutable: None,
+                            categories: HashMap::new(),
+                            tags: tags.clone(),
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
         } else {
-            self.client.may_select()
+            None
+        };
+
+        TagsResponse {
+            immutable: tags.immutable,
+
+            categories: tags
+                .categories
+                .iter()
+                .filter_map(|(name, tags)| {
+                    let tags = filter_tags(Some(name.clone()), tags, tag_counts);
+
+                    if tags.categories.is_empty() && tags.tags.is_empty() {
+                        None
+                    } else {
+                        Some((name.clone(), tags))
+                    }
+                })
+                .chain(new_categories.into_iter().flatten())
+                .collect(),
+
+            tags: tag_counts.get(&category).cloned().or_default(),
         }
     }
 
-    pub fn patch_tags(&self, patches: Vec<Patch>) {
-        if self.in_demo_mode.get() {
-            todo!()
-        } else {
-            self.client.patch_tags(patches)
-        }
+    #[derive(Clone)]
+    struct DemoClient {
+        client: HttpClient,
+        demo_state: Option<DemoState>,
     }
 
-    pub fn watch_tags(&self, filter: ReadSignal<TagTree>) -> ReadSignal<TagsResponse> {
-        if self.in_demo_mode.get() {
-            todo!()
-        } else {
-            self.client.watch_tags(filter)
-        }
-    }
+    impl DemoClient {
+        pub fn new(
+            state: Option<&State>,
+            token: Signal<Option<String>>,
+            root: Rc<str>,
+            show_log_in: Signal<bool>,
+            log_in_error: Signal<Option<String>>,
+            user_name: Signal<String>,
+            password: Signal<String>,
+        ) -> Self {
+            let client = HttpClient::new(
+                token,
+                root,
+                show_log_in,
+                log_in_error,
+                user_name.clone(),
+                password.clone(),
+            );
 
-    pub fn watch_images(
-        &self,
-        filter: ReadSignal<TagTree>,
-        start: ReadSignal<Option<ImageKey>>,
-        items_per_page: ReadSignal<u32>,
-    ) -> ReadSignal<ImagesResponse> {
-        if self.in_demo_mode.get() {
-            todo!()
-        } else {
-            self.client.watch_images(filter, start, items_per_page)
-        }
-    }
+            Self {
+                client: client.clone(),
+                demo_state: state.and_then(|state| {
+                    state.demo.as_ref().map(|credentials| {
+                        user_name.set(credentials.user_name.clone());
+                        password.set(credentials.password.clone());
+                        client.log_in();
 
-    pub fn try_login(&self) -> Result<()> {
-        if self.in_demo_mode.get() {
-            Ok(())
-        } else {
-            self.client.try_login()
-        }
-    }
+                        // todo: display a banner message explaining that in demo mode any changes will be lost if
+                        // the user leaves or refreshes the page.
 
-    pub fn log_in(&self) {
-        if !self.in_demo_mode.get() {
-            self.client.log_in();
+                        DemoState {
+                            images: client.watch_images(
+                                Signal::new(TagTree::default()).into_handle(),
+                                Signal::new(None).into_handle(),
+                                Signal::new(IMAGE_LIMIT).into_handle(),
+                            ),
+                            tags: client.watch_tags(Signal::new(TagTree::default()).into_handle()),
+                            patch: Signal::new(DemoPatch {
+                                to_add: HashMap::new(),
+                                to_remove: HashMap::new(),
+                            }),
+                        }
+                    })
+                }),
+            }
         }
-    }
 
-    pub fn try_anonymous_login(&self) {
-        if !self.in_demo_mode.get() {
-            self.client.try_anonymous_login();
+        pub fn may_select(&self) -> ReadSignal<bool> {
+            if self.demo_state.is_some() {
+                Signal::new(true).into_handle()
+            } else {
+                self.client.may_select()
+            }
         }
-    }
 
-    pub fn is_logged_in(&self) -> bool {
-        (!self.in_demo_mode.get()) && self.client.is_logged_in()
+        pub fn patch_tags(&self, patches: Vec<Patch>) {
+            if let Some(demo_state) = self.demo_state.as_ref() {
+                let new = demo_state.patch.get_untracked().as_ref().clone();
+
+                for patch in patches {
+                    let hash = Arc::from(&patch.hash);
+
+                    match patch.action {
+                        Action::Add => {
+                            new.to_add
+                                .entry(hash.clone())
+                                .or_default()
+                                .insert(patch.tag.clone());
+
+                            let remove = if let Some(tags) = new.to_remove.get_mut(&hash) {
+                                tags.remove(&patch.tag);
+
+                                tags.is_empty();
+                            } else {
+                                false
+                            };
+
+                            if remove {
+                                new.to_remove.remove(&hash);
+                            }
+                        }
+
+                        Action::Remove => {
+                            new.to_remove
+                                .entry(hash.clone())
+                                .or_default()
+                                .insert(patch.tag.clone());
+
+                            let remove = if let Some(tags) = new.to_add.get_mut(&hash) {
+                                tags.remove(&patch.tag);
+
+                                tags.is_empty();
+                            } else {
+                                false
+                            };
+
+                            if remove {
+                                new.to_add.remove(&hash);
+                            }
+                        }
+                    }
+                }
+
+                demo_state.patch.set(new);
+            } else {
+                self.client.patch_tags(patches)
+            }
+        }
+
+        pub fn watch_tags(&self, filter: ReadSignal<TagTree>) -> ReadSignal<TagsResponse> {
+            if let Some(demo_state) = self.demo_state.as_ref() {
+                sync::create_selector({
+                    let demo_state = demo_state.clone();
+                    let token = self.client.token.handle();
+
+                    move || {
+                        demo_state.tags(
+                            &demo_state
+                                .images_and_tag_counts(
+                                    &filter,
+                                    &token,
+                                    &Signal::new(None).into_handle(),
+                                    &Signal::new(IMAGE_LIMIT).into_handle(),
+                                )
+                                .1,
+                        )
+                    }
+                })
+            } else {
+                self.client.watch_tags(filter)
+            }
+        }
+
+        pub fn watch_images(
+            &self,
+            filter: ReadSignal<TagTree>,
+            start: ReadSignal<Option<ImageKey>>,
+            items_per_page: ReadSignal<u32>,
+        ) -> ReadSignal<ImagesResponse> {
+            if let Some(demo_state) = self.demo_state.as_ref() {
+                sync::create_selector({
+                    let demo_state = demo_state.clone();
+                    let token = self.client.token.handle();
+
+                    move || {
+                        demo_state
+                            .images_and_tag_counts(&filter, &token, &start, &items_per_page)
+                            .0
+                    }
+                })
+            } else {
+                self.client.watch_images(filter, start, items_per_page)
+            }
+        }
+
+        pub fn try_login(&self) -> Result<()> {
+            if self.demo_state.is_some() {
+                Ok(())
+            } else {
+                self.client.try_login()
+            }
+        }
+
+        pub fn log_in(&self) {
+            if self.demo_state.is_none() {
+                self.client.log_in();
+            }
+        }
+
+        pub fn try_anonymous_login(&self) {
+            if self.demo_state.is_none() {
+                self.client.try_anonymous_login();
+            }
+        }
+
+        pub fn is_logged_in(&self) -> bool {
+            self.demo_state.is_none() && self.client.is_logged_in()
+        }
     }
 }

@@ -101,14 +101,9 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
     // Next, scan the map in reverse chronological order, consolidating duplicates and building `ImageData` objects
     // out of each row that falls within the requested interval.
 
-    let mut images = Vec::with_capacity(limit);
-    let mut later = VecDeque::with_capacity(limit + 1);
-    let mut total = 0;
-    let mut start = 0;
-    let mut previous = None;
-    let mut earliest_start = None;
-    let mut earlier_count = 0;
     let mut duplicates_seen = HashSet::new();
+
+    let mut builder = ImagesResponseBuilder::new(query.start.cloned(), limit);
 
     for (mut key, (ref row, duplicate_group)) in row_map.iter().rev() {
         let mut row = row;
@@ -134,62 +129,27 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
 
         total += 1;
 
-        if query
-            .start
-            .as_ref()
-            .map(|start| key < start)
-            .unwrap_or(true)
-        {
-            if images.len() < limit {
-                images.push(ImageData {
-                    hash: key.hash.clone().unwrap(),
+        builder.consider(key, || ImageData {
+            hash: key.hash.clone().unwrap(),
 
-                    datetime: key.datetime,
+            datetime: key.datetime,
 
-                    medium: match row.get::<Option<i64>, _>(2) {
-                        Some(0) => Medium::Video,
-                        Some(_) => Medium::ImageWithVideo,
-                        None => Medium::Image,
-                    },
+            medium: match row.get::<Option<i64>, _>(2) {
+                Some(0) => Medium::Video,
+                Some(_) => Medium::ImageWithVideo,
+                None => Medium::Image,
+            },
 
-                    duplicates: my_duplicates,
+            duplicates: my_duplicates,
 
-                    tags: row
-                        .get::<&str, _>(5)
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(Tag::from_str)
-                        .collect::<Result<HashSet<_>>>()?,
-                });
-            } else {
-                if earlier_count == 0 {
-                    earliest_start = previous;
-                }
-
-                earlier_count = (earlier_count + 1) % limit;
-            }
-        } else {
-            start += 1;
-
-            if later.len() > limit {
-                later.pop_front();
-            }
-
-            later.push_back(key.clone());
-        }
-
-        previous = Some(key);
+            tags: row
+                .get::<&str, _>(5)
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(Tag::from_str)
+                .collect::<Result<HashSet<_>>>()?,
+        });
     }
 
-    Ok(ImagesResponse {
-        start,
-        total,
-        later_start: if later.len() > limit {
-            later.pop_front()
-        } else {
-            None
-        },
-        earliest_start: earliest_start.cloned(),
-        images,
-    })
+    Ok(builder.build())
 }

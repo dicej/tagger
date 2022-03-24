@@ -292,6 +292,77 @@ pub struct ImagesResponse {
     pub images: Vec<ImageData>,
 }
 
+pub struct ImagesResponseBuilder {
+    start_key: Option<ImageKey>,
+    limit: usize,
+    images: Vec<ImageData>,
+    later: VecDeque<ImageKey>,
+    total: u32,
+    start: u32,
+    previous: Option<ImageKey>,
+    earliest_start: Option<ImageKey>,
+    earlier_count: u32,
+}
+
+impl ImagesResponseBuilder {
+    pub fn new(start_key: Option<ImageKey>, limit: usize) -> Self {
+        Self {
+            start_key,
+            limit,
+            images: Vec::with_capacity(limit),
+            later: VecDeque::with_capacity(limit + 1),
+            total: 0,
+            start: 0,
+            previous: None,
+            earliest_start: None,
+            earlier_count: 0,
+        }
+    }
+
+    pub fn consider(&mut self, key: &ImageKey, fun: impl FnOnce() -> ImageData) {
+        if self
+            .start_key
+            .as_ref()
+            .map(|start| key < start)
+            .unwrap_or(true)
+        {
+            if self.images.len() < self.limit {
+                self.images.push(fun());
+            } else {
+                if self.earlier_count == 0 {
+                    self.earliest_start = self.previous;
+                }
+
+                self.earlier_count = (self.earlier_count + 1) % self.limit;
+            }
+        } else {
+            self.start += 1;
+
+            if self.later.len() > self.limit {
+                self.later.pop_front();
+            }
+
+            self.later.push_back(key.clone());
+        }
+
+        self.previous = Some(key.clone());
+    }
+
+    pub fn build(self) -> ImagesResponse {
+        ImagesResponse {
+            start: self.start,
+            total: self.total,
+            later_start: if self.later.len() > self.limit {
+                self.later.pop_front()
+            } else {
+                None
+            },
+            earliest_start: self.earliest_start,
+            images: self.images,
+        }
+    }
+}
+
 /// Represents different resolutions available for a given media item in addition to the original resolution
 #[derive(Debug, Copy, Clone)]
 pub enum Size {
@@ -412,4 +483,23 @@ pub struct Authorization {
     /// Whether this user may add and remove tags to/from items to which they have access
     #[serde(rename = "pat")]
     pub may_patch: bool,
+}
+
+/// If the specified `auth` claims include a non-empty `Authorization::filter` field, modify the supplied `filter`
+/// in place, either replacing it with the one from `auth` if the former is empty, or combining them together using
+/// the AND operator.
+///
+/// This ensures that whatever filter was provided by the user is constrained to what that user has permission to
+/// access.
+pub fn maybe_wrap_filter(filter: &mut Option<TagExpression>, auth: &Authorization) {
+    if let Some(user_filter) = &auth.filter {
+        if let Some(inner) = filter.take() {
+            *filter = Some(TagExpression::And(
+                Box::new(inner),
+                Box::new(user_filter.clone()),
+            ));
+        } else {
+            *filter = Some(user_filter.clone());
+        }
+    }
 }
