@@ -2,11 +2,8 @@
 
 use {
     crate::client::Client,
-    anyhow::Error,
-    futures::TryFutureExt,
-    std::{ops::Deref, rc::Rc},
+    std::ops::Deref,
     sycamore::prelude::{component, view, Signal, View},
-    tagger_shared::{GrantType, TokenRequest, TokenSuccess},
     wasm_bindgen::JsCast,
     web_sys::{Event, KeyboardEvent},
 };
@@ -41,17 +38,10 @@ pub fn login_overlay(props: LoginOverlayProps) -> View<G> {
         password,
     } = props;
 
-    let on_key = {
-        let user_name = user_name.clone();
-        let password = password.clone();
-        let show_log_in = show_log_in.clone();
-        let log_in_error = log_in_error.clone();
-
-        move |event: Event| {
-            if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
-                if event.key().deref() == "Enter" {
-                    client.log_in();
-                }
+    let on_key = move |event: Event| {
+        if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
+            if event.key().deref() == "Enter" {
+                client.log_in();
             }
         }
     };

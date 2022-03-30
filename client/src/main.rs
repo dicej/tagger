@@ -34,16 +34,12 @@ use {
         pagination::{Pagination, PaginationProps},
         toolbar::{Toolbar, ToolbarProps},
     },
-    anyhow::{anyhow, Error, Result},
+    anyhow::{anyhow, Result},
     chrono::Utc,
-    futures::future::TryFutureExt,
     serde_derive::{Deserialize, Serialize},
     std::{cell::Cell, convert::TryFrom, ops::Deref, panic, rc::Rc},
     sycamore::prelude::{self as syc, view, ReadSignal, Signal},
-    tagger_shared::{
-        tag_expression::{TagExpression, TagTree},
-        Authorization, ImageKey, ImagesQuery, ImagesResponse, TokenSuccess,
-    },
+    tagger_shared::{tag_expression::TagTree, ImageKey, ImagesResponse},
     wasm_bindgen::{closure::Closure, JsCast},
     web_sys::KeyboardEvent,
 };
@@ -259,44 +255,40 @@ fn main() -> Result<()> {
 
     // Extract any routing information in the URI from the "hash" portion (e.g. if the user has bookmarked a
     // specific image)
-    let state = if let Ok(hash) = location.hash() {
-        if let Some(hash) = hash.strip_prefix('#') {
-            match serde_urlencoded::from_str::<State>(hash) {
-                Ok(state) => {
-                    overlay_image.set(state.overlay_image);
-                    filter.set(state.filter.unwrap_or_default());
-
-                    if let Some(state_start) = state.start {
-                        start.set(Some(state_start));
-                    }
-
-                    if let Some(state_items_per_page) = state.items_per_page {
-                        items_per_page.set(state_items_per_page);
-                    }
-
-                    Some(state)
-                }
+    let state = location.hash().ok().and_then(|hash| {
+        hash.strip_prefix('#')
+            .and_then(|hash| match serde_urlencoded::from_str::<State>(hash) {
+                Ok(state) => Some(state),
                 Err(e) => {
                     log::warn!("unable to decode state: {e:?}");
 
                     None
                 }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+            })
+    });
 
     let client = Client::new(
         state.as_ref(),
-        token.clone(),
-        root,
-        filter.handle(),
+        token,
+        root.clone(),
         show_log_in.clone(),
         log_in_error.clone(),
+        user_name.clone(),
+        password.clone(),
     );
+
+    if let Some(state) = state {
+        overlay_image.set(state.overlay_image);
+        filter.set(state.filter.unwrap_or_default());
+
+        if let Some(state_start) = state.start {
+            start.set(Some(state_start));
+        }
+
+        if let Some(state_items_per_page) = state.items_per_page {
+            items_per_page.set(state_items_per_page);
+        }
+    }
 
     client.try_login()?;
 
@@ -530,9 +522,7 @@ fn main() -> Result<()> {
     };
 
     let login_overlay = LoginOverlayProps {
-        root: root.clone(),
         client: client.clone(),
-        token: token.clone(),
         show_log_in,
         log_in_error,
         user_name,
@@ -540,9 +530,7 @@ fn main() -> Result<()> {
     };
 
     let toolbar = ToolbarProps {
-        root: root.clone(),
         client,
-        token,
         selecting: selecting.clone(),
         items_per_page,
         selected_count: selected_count.handle(),

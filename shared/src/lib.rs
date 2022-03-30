@@ -15,7 +15,7 @@ use {
     serde::{Deserializer, Serializer},
     serde_derive::{Deserialize, Serialize},
     std::{
-        collections::{HashMap, HashSet},
+        collections::{HashMap, HashSet, VecDeque},
         fmt::{self, Display},
         str::FromStr,
         sync::Arc,
@@ -301,7 +301,7 @@ pub struct ImagesResponseBuilder {
     start: u32,
     previous: Option<ImageKey>,
     earliest_start: Option<ImageKey>,
-    earlier_count: u32,
+    earlier_count: usize,
 }
 
 impl ImagesResponseBuilder {
@@ -319,7 +319,11 @@ impl ImagesResponseBuilder {
         }
     }
 
-    pub fn consider(&mut self, key: &ImageKey, fun: impl FnOnce() -> ImageData) {
+    pub fn consider<E, F: FnOnce() -> Result<ImageData, E>>(
+        &mut self,
+        key: &ImageKey,
+        fun: F,
+    ) -> Result<(), E> {
         if self
             .start_key
             .as_ref()
@@ -327,10 +331,10 @@ impl ImagesResponseBuilder {
             .unwrap_or(true)
         {
             if self.images.len() < self.limit {
-                self.images.push(fun());
+                self.images.push(fun()?);
             } else {
                 if self.earlier_count == 0 {
-                    self.earliest_start = self.previous;
+                    self.earliest_start = self.previous.clone();
                 }
 
                 self.earlier_count = (self.earlier_count + 1) % self.limit;
@@ -346,9 +350,11 @@ impl ImagesResponseBuilder {
         }
 
         self.previous = Some(key.clone());
+
+        Ok(())
     }
 
-    pub fn build(self) -> ImagesResponse {
+    pub fn build(mut self) -> ImagesResponse {
         ImagesResponse {
             start: self.start,
             total: self.total,

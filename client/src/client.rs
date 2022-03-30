@@ -1,8 +1,20 @@
-use reqwest::{Client, StatusCode};
+use {
+    crate::State,
+    anyhow::{anyhow, Error, Result},
+    futures::TryFutureExt,
+    reqwest::StatusCode,
+    std::{ops::Deref, rc::Rc},
+    sycamore::prelude::{self as syc, ReadSignal, Signal},
+    tagger_shared::{
+        tag_expression::{TagExpression, TagTree},
+        Authorization, GrantType, ImageKey, ImagesQuery, ImagesResponse, Patch, TagsResponse,
+        TokenRequest, TokenSuccess,
+    },
+};
 
 #[derive(Clone)]
 pub struct HttpClient {
-    client: Client,
+    client: reqwest::Client,
     token: Signal<Option<String>>,
     root: Rc<str>,
     show_log_in: Signal<bool>,
@@ -28,9 +40,9 @@ impl HttpClient {
         password: Signal<String>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: reqwest::Client::new(),
+            token,
             root,
-            filter,
             show_log_in,
             log_in_error,
             user_name,
@@ -38,15 +50,11 @@ impl HttpClient {
         }
     }
 
-    pub fn init(&self, _state: &State) {
-        // ignore
-    }
-
     pub fn may_select(&self) -> ReadSignal<bool> {
         // We only enable selection mode if the server has given us an access token which says we may add and
         // remove tags to/from media items.
         syc::create_selector({
-            let token = token.handle();
+            let token = self.token.handle();
 
             move || {
                 if let Some(token) = token.get().deref() {
@@ -71,9 +79,9 @@ impl HttpClient {
                 let client = self.clone();
 
                 async move {
-                    let mut request = client.client.patch(format!("{root}/tags"));
+                    let mut request = client.client.patch(format!("{}/tags", client.root));
 
-                    if let Some(token) = client.token.get().deref() {
+                    if let Some(token) = client.token.get_untracked().deref() {
                         request = request.header("authorization", &format!("Bearer {token}"));
                     }
 
@@ -97,10 +105,7 @@ impl HttpClient {
     }
 
     pub fn watch_tags(&self, filter: ReadSignal<TagTree>) -> ReadSignal<TagsResponse> {
-        self.watch(
-            Signal::new("tags".into()).into_handle(),
-            Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
-        );
+        self.watch(Signal::new("tags".into()).into_handle(), filter)
     }
 
     pub fn watch_images(
@@ -135,14 +140,13 @@ impl HttpClient {
             if let Ok(Some(stored_token)) = storage.get("token") {
                 self.token.set(Some(stored_token));
             } else {
-                self.try_anonymous_login(self);
+                self.try_anonymous_login();
             }
         }
 
         // Whenever the access token changes, save it to local storage (or delete it if we've logged out)
         syc::create_effect({
             let token = self.token.handle();
-            let window = window.clone();
 
             move || {
                 if let Ok(Some(storage)) = window.local_storage() {
@@ -162,7 +166,7 @@ impl HttpClient {
         self.try_anonymous_login_with_fn({
             let client = self.clone();
 
-            move || client.open_log_in()
+            move || client.open_login()
         })
     }
 
@@ -172,14 +176,15 @@ impl HttpClient {
                 let client = self.clone();
 
                 async move {
-                    let request = client
-                        .client
-                        .post(format!("{root}/token"))
-                        .form(&TokenRequest {
-                            grant_type: GrantType::Password,
-                            username: client.user_name.trim().into(),
-                            password: client.password.trim().into(),
-                        });
+                    let request =
+                        client
+                            .client
+                            .post(format!("{}/token", client.root))
+                            .form(&TokenRequest {
+                                grant_type: GrantType::Password,
+                                username: client.user_name.get_untracked().trim().into(),
+                                password: client.password.get_untracked().trim().into(),
+                            });
 
                     client.user_name.set(String::new());
                     client.password.set(String::new());
@@ -222,7 +227,7 @@ impl HttpClient {
     /// The tagger server may be configured to allow anonymous access (i.e. with empty credentials), in which case
     /// we may have a token with no subject claim, which means we aren't really logged in yet.
     pub fn is_logged_in(&self) -> bool {
-        if let Some(token) = self.token.get().deref() {
+        if let Some(token) = self.token.get_untracked().deref() {
             jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
                 .map(|data| data.claims.subject.is_some())
                 .unwrap_or(false)
@@ -231,7 +236,7 @@ impl HttpClient {
         }
     }
 
-    fn open_login(&self) {
+    pub fn open_login(&self) {
         self.user_name.set(String::new());
         self.password.set(String::new());
         self.log_in_error.set(None);
@@ -241,10 +246,10 @@ impl HttpClient {
     fn on_unauthorized(&self) {
         let was_logged_in = self.is_logged_in();
 
-        self.try_anonymous_login(token.clone(), client.clone(), root.clone(), || ());
+        self.try_anonymous_login_with_fn(|| ());
 
         if was_logged_in {
-            open_log_in();
+            self.open_login();
         }
     }
 
@@ -257,7 +262,7 @@ impl HttpClient {
     ///
     /// The full request URL is formed using `root`/`uri`, with `filter` appended as a query parameter if it is
     /// non-empty.
-    fn watch<T: Default + for<'de> serde::Deserialize<'de>, F: Fn() + Clone + 'static>(
+    fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
         &self,
         uri: ReadSignal<String>,
         filter: ReadSignal<TagTree>,
@@ -265,6 +270,7 @@ impl HttpClient {
         let signal = Signal::new(T::default());
 
         syc::create_effect({
+            let client = self.clone();
             let signal = signal.clone();
 
             move || {
@@ -273,7 +279,8 @@ impl HttpClient {
                 // closure called by wasm_bindgen) since Sycamore uses thread local state to track context, and
                 // that state won't be available when wasm_bindgen calls our nested closure.
 
-                let client = self.clone();
+                let client = client.clone();
+                let token = client.token.get();
                 let uri = uri.get();
                 let filter = filter.get();
                 let signal = signal.clone();
@@ -284,7 +291,8 @@ impl HttpClient {
 
                         async move {
                             let mut request = client.client.get(format!(
-                                "{root}/{uri}{}",
+                                "{}/{uri}{}",
+                                client.root,
                                 if let Some(filter) = Option::<TagExpression>::from(filter.deref())
                                 {
                                     format!(
@@ -296,7 +304,7 @@ impl HttpClient {
                                 }
                             ));
 
-                            if let Some(token) = client.token.deref() {
+                            if let Some(token) = token.deref() {
                                 request =
                                     request.header("authorization", &format!("Bearer {token}"));
                             }
@@ -328,18 +336,24 @@ impl HttpClient {
     ///
     /// The OAuth 2 authentication URL is formed using `root`/token.
     fn try_anonymous_login_with_fn(&self, on_unauthorized: impl Fn() + 'static) {
-        if token.get_untracked().is_some() {
-            token.set(None);
+        if self.token.get_untracked().is_some() {
+            self.token.set(None);
         }
+
+        let client = self.clone();
 
         wasm_bindgen_futures::spawn_local(
             async move {
-                let response = client.get(format!("{root}/token")).send().await?;
+                let response = client
+                    .client
+                    .get(format!("{}/token", client.root))
+                    .send()
+                    .await?;
 
                 if response.status() == StatusCode::UNAUTHORIZED {
                     on_unauthorized();
                 } else {
-                    token.set(Some(
+                    client.token.set(Some(
                         response
                             .error_for_status()?
                             .json::<TokenSuccess>()
@@ -359,7 +373,7 @@ impl HttpClient {
 
 #[cfg(feature = "demo")]
 mod demo {
-    use super::*;
+    use {super::*, std::convert::Infallible};
 
     const IMAGE_LIMIT: u32 = 10_000;
 
@@ -428,12 +442,14 @@ mod demo {
                     .map(|filter| filter.evaluate_set(&tags))
                     .unwrap_or(true)
                 {
-                    builder.consider(&image.key(), || ImageData {
-                        hash: image.hash.clone(),
-                        datetime: image.datetime,
-                        medium: image.medium,
-                        duplicates: image.duplicates.clone(),
-                        tags,
+                    builder.consider::<Infallible, _>(&image.key(), || {
+                        Ok(ImageData {
+                            hash: image.hash.clone(),
+                            datetime: image.datetime,
+                            medium: image.medium,
+                            duplicates: image.duplicates.clone(),
+                            tags,
+                        })
                     });
                 }
             }
@@ -678,6 +694,13 @@ mod demo {
 
         pub fn is_logged_in(&self) -> bool {
             self.demo_state.is_none() && self.client.is_logged_in()
+        }
+
+        pub fn open_login(&self) {
+            // todo: don't give user this option when in demo mode
+            if self.demo_state.is_none() {
+                self.client.open_login();
+            }
         }
     }
 }

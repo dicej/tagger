@@ -369,7 +369,7 @@ async fn routes(
                         let conn = conn.clone();
 
                         move |auth: Arc<Authorization>, mut query: ImagesQuery| {
-                            maybe_wrap_filter(&mut query.filter, &auth);
+                            tagger_shared::maybe_wrap_filter(&mut query.filter, &auth);
 
                             let conn = conn.clone();
 
@@ -397,7 +397,7 @@ async fn routes(
                             let conn = conn.clone();
 
                             move |auth: Arc<Authorization>, mut query: TagsQuery| {
-                                maybe_wrap_filter(&mut query.filter, &auth);
+                                tagger_shared::maybe_wrap_filter(&mut query.filter, &auth);
 
                                 let conn = conn.clone();
 

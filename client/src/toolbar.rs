@@ -7,15 +7,13 @@ use {
         pagination::{Pagination, PaginationProps},
         tag_menu::{List, TagMenu, TagMenuCommonProps, TagMenuProps},
     },
-    anyhow::Error,
-    futures::TryFutureExt,
-    std::{collections::HashSet, ops::Deref, rc::Rc},
+    std::{collections::HashSet, ops::Deref},
     sycamore::prelude::{
         self as syc, component, view, Keyed, KeyedProps, ReadSignal, Signal, View,
     },
     tagger_shared::{
         tag_expression::{Tag, TagExpression, TagTree},
-        Action, Authorization, ImageKey, Patch, TagsResponse,
+        Action, ImageKey, Patch, TagsResponse,
     },
     wasm_bindgen::JsCast,
     web_sys::{Event, HtmlSelectElement, KeyboardEvent},
@@ -54,9 +52,6 @@ pub struct ToolbarProps {
     /// Indicates whether the UI is currently in "selecting" mode, i.e. the user is selecting items to modify
     pub selecting: Signal<bool>,
 
-    /// Callback to make the login overlay visible
-    pub open_log_in: Rc<dyn Fn()>,
-
     /// Number of media item thumbnails to show per page
     pub items_per_page: Signal<u32>,
 
@@ -80,7 +75,6 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
     let ToolbarProps {
         client,
         selecting,
-        open_log_in,
         items_per_page,
         selected_count,
         filter,
@@ -137,7 +131,11 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         move |_| client.try_anonymous_login()
     };
 
-    let open_log_in_event = move |_| open_log_in();
+    let open_log_in_event = {
+        let client = client.clone();
+
+        move |_| client.open_login()
+    };
 
     let set_items_per_page = {
         let items_per_page = items_per_page.clone();

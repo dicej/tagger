@@ -2,11 +2,11 @@
 //! optionally filtered sequence of media item metadata from the server.
 
 use {
-    anyhow::Result,
+    anyhow::{Error, Result},
     futures::TryStreamExt,
     sqlx::{query::Query, sqlite::SqliteArguments, Row, Sqlite, SqliteConnection},
     std::{
-        collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet},
         convert::TryFrom,
         fmt::Write,
         str::FromStr,
@@ -14,7 +14,7 @@ use {
     },
     tagger_shared::{
         tag_expression::{Tag, TagExpression},
-        ImageData, ImageKey, ImagesQuery, ImagesResponse, Medium,
+        ImageData, ImageKey, ImagesQuery, ImagesResponse, ImagesResponseBuilder, Medium,
     },
 };
 
@@ -103,7 +103,7 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
 
     let mut duplicates_seen = HashSet::new();
 
-    let mut builder = ImagesResponseBuilder::new(query.start.cloned(), limit);
+    let mut builder = ImagesResponseBuilder::new(query.start.clone(), limit);
 
     for (mut key, (ref row, duplicate_group)) in row_map.iter().rev() {
         let mut row = row;
@@ -127,28 +127,28 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
             }
         }
 
-        total += 1;
+        builder.consider::<Error, _>(key, || {
+            Ok(ImageData {
+                hash: key.hash.clone().unwrap(),
 
-        builder.consider(key, || ImageData {
-            hash: key.hash.clone().unwrap(),
+                datetime: key.datetime,
 
-            datetime: key.datetime,
+                medium: match row.get::<Option<i64>, _>(2) {
+                    Some(0) => Medium::Video,
+                    Some(_) => Medium::ImageWithVideo,
+                    None => Medium::Image,
+                },
 
-            medium: match row.get::<Option<i64>, _>(2) {
-                Some(0) => Medium::Video,
-                Some(_) => Medium::ImageWithVideo,
-                None => Medium::Image,
-            },
+                duplicates: my_duplicates,
 
-            duplicates: my_duplicates,
-
-            tags: row
-                .get::<&str, _>(5)
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(Tag::from_str)
-                .collect::<Result<HashSet<_>>>()?,
-        });
+                tags: row
+                    .get::<&str, _>(5)
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(Tag::from_str)
+                    .collect::<Result<HashSet<_>>>()?,
+            })
+        })?;
     }
 
     Ok(builder.build())
