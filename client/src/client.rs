@@ -373,11 +373,19 @@ impl HttpClient {
 
 #[cfg(feature = "demo")]
 mod demo {
-    use {super::*, std::convert::Infallible};
+    use {
+        super::*,
+        std::{
+            collections::{HashMap, HashSet},
+            convert::Infallible,
+            sync::Arc,
+        },
+        tagger_shared::{tag_expression::Tag, Action, ImageData, ImagesResponseBuilder},
+    };
 
     const IMAGE_LIMIT: u32 = 10_000;
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct DemoPatch {
         to_add: HashMap<Arc<str>, HashSet<Tag>>,
         to_remove: HashMap<Arc<str>, HashSet<Tag>>,
@@ -390,6 +398,8 @@ mod demo {
         patch: Signal<DemoPatch>,
     }
 
+    type TagCounts = HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>;
+
     impl DemoState {
         fn images_and_tag_counts(
             &self,
@@ -397,24 +407,23 @@ mod demo {
             token: &ReadSignal<Option<String>>,
             start: ReadSignal<Option<ImageKey>>,
             items_per_page: ReadSignal<u32>,
-        ) -> (
-            ImagesResponse,
-            HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>,
-        ) {
+        ) -> (ImagesResponse, TagCounts) {
             let patch = self.patch.get();
             let images = self.images.get();
 
             let mut filter = Option::<TagExpression>::from(filter.get().deref());
 
-            if let Ok(auth) = jsonwebtoken::dangerous_insecure_decode::<Authorization>(token) {
-                tagger_shared::maybe_wrap_filter(&mut filter, &auth);
+            if let Some(token) = token.get().deref() {
+                if let Ok(auth) = jsonwebtoken::dangerous_insecure_decode::<Authorization>(token) {
+                    tagger_shared::maybe_wrap_filter(&mut filter, &auth.claims);
+                }
             }
 
-            let mut tag_counts = HashMap::new();
+            let mut tag_counts = TagCounts::new();
 
             let mut builder = ImagesResponseBuilder::new(
-                start.get().deref().as_ref(),
-                *items_per_page.get().deref().into(),
+                start.get().deref().as_ref().cloned(),
+                (*items_per_page.get().deref()).try_into().unwrap(),
             );
 
             for image in &images.images {
@@ -425,9 +434,9 @@ mod demo {
                         Some(to_remove) => !to_remove.contains(tag),
                         _ => true,
                     })
-                    .chain(patch.to_add.get(&image.hash).iter().flatten())
+                    .chain(patch.to_add.get(&image.hash).iter().copied().flatten())
                     .cloned()
-                    .collect();
+                    .collect::<HashSet<_>>();
 
                 for tag in &tags {
                     *tag_counts
@@ -442,25 +451,24 @@ mod demo {
                     .map(|filter| filter.evaluate_set(&tags))
                     .unwrap_or(true)
                 {
-                    builder.consider::<Infallible, _>(&image.key(), || {
-                        Ok(ImageData {
-                            hash: image.hash.clone(),
-                            datetime: image.datetime,
-                            medium: image.medium,
-                            duplicates: image.duplicates.clone(),
-                            tags,
+                    assert!(builder
+                        .consider::<Infallible, _>(&image.key(), || {
+                            Ok(ImageData {
+                                hash: image.hash.clone(),
+                                datetime: image.datetime,
+                                medium: image.medium,
+                                duplicates: image.duplicates.clone(),
+                                tags,
+                            })
                         })
-                    });
+                        .is_ok());
                 }
             }
 
             (builder.build(), tag_counts)
         }
 
-        fn tags(
-            &self,
-            tag_counts: &HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>,
-        ) -> TagsResponse {
+        fn tags(&self, tag_counts: &TagCounts) -> TagsResponse {
             filter_tags(None, self.tags.get().deref(), tag_counts)
         }
     }
@@ -468,25 +476,32 @@ mod demo {
     fn filter_tags(
         category: Option<Arc<str>>,
         tags: &TagsResponse,
-        tag_counts: &HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>,
+        tag_counts: &TagCounts,
     ) -> TagsResponse {
         let new_categories = if category.is_none() {
-            tag_counts.iter().filter_map(|(category, tags)| {
-                if !tags.categories.contains_key(&category) {
-                    Some((
-                        category.clone(),
-                        TagsResponse {
-                            immutable: None,
-                            categories: HashMap::new(),
-                            tags: tags.clone(),
-                        },
-                    ))
-                } else {
-                    None
-                }
-            })
+            tag_counts
+                .iter()
+                .filter_map(|(category, inner_tags)| {
+                    if let Some(category) = category {
+                        if !tags.categories.contains_key(category) {
+                            Some((
+                                category.clone(),
+                                TagsResponse {
+                                    immutable: None,
+                                    categories: HashMap::new(),
+                                    tags: inner_tags.clone(),
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect::<HashMap<_, _>>()
         } else {
-            None
+            HashMap::new()
         };
 
         TagsResponse {
@@ -504,15 +519,15 @@ mod demo {
                         Some((name.clone(), tags))
                     }
                 })
-                .chain(new_categories.into_iter().flatten())
+                .chain(new_categories)
                 .collect(),
 
-            tags: tag_counts.get(&category).cloned().or_default(),
+            tags: tag_counts.get(&category).cloned().unwrap_or_default(),
         }
     }
 
     #[derive(Clone)]
-    struct DemoClient {
+    pub struct DemoClient {
         client: HttpClient,
         demo_state: Option<DemoState>,
     }
@@ -528,6 +543,7 @@ mod demo {
             password: Signal<String>,
         ) -> Self {
             let client = HttpClient::new(
+                state,
                 token,
                 root,
                 show_log_in,
@@ -542,7 +558,6 @@ mod demo {
                     state.demo.as_ref().map(|credentials| {
                         user_name.set(credentials.user_name.clone());
                         password.set(credentials.password.clone());
-                        client.log_in();
 
                         // todo: display a banner message explaining that in demo mode any changes will be lost if
                         // the user leaves or refreshes the page.
@@ -574,10 +589,10 @@ mod demo {
 
         pub fn patch_tags(&self, patches: Vec<Patch>) {
             if let Some(demo_state) = self.demo_state.as_ref() {
-                let new = demo_state.patch.get_untracked().as_ref().clone();
+                let mut new = demo_state.patch.get_untracked().as_ref().clone();
 
                 for patch in patches {
-                    let hash = Arc::from(&patch.hash);
+                    let hash = Arc::<str>::from(&patch.hash as &str);
 
                     match patch.action {
                         Action::Add => {
@@ -589,7 +604,7 @@ mod demo {
                             let remove = if let Some(tags) = new.to_remove.get_mut(&hash) {
                                 tags.remove(&patch.tag);
 
-                                tags.is_empty();
+                                tags.is_empty()
                             } else {
                                 false
                             };
@@ -608,7 +623,7 @@ mod demo {
                             let remove = if let Some(tags) = new.to_add.get_mut(&hash) {
                                 tags.remove(&patch.tag);
 
-                                tags.is_empty();
+                                tags.is_empty()
                             } else {
                                 false
                             };
@@ -628,7 +643,7 @@ mod demo {
 
         pub fn watch_tags(&self, filter: ReadSignal<TagTree>) -> ReadSignal<TagsResponse> {
             if let Some(demo_state) = self.demo_state.as_ref() {
-                sync::create_selector({
+                syc::create_selector({
                     let demo_state = demo_state.clone();
                     let token = self.client.token.handle();
 
@@ -638,8 +653,8 @@ mod demo {
                                 .images_and_tag_counts(
                                     &filter,
                                     &token,
-                                    &Signal::new(None).into_handle(),
-                                    &Signal::new(IMAGE_LIMIT).into_handle(),
+                                    Signal::new(None).into_handle(),
+                                    Signal::new(IMAGE_LIMIT).into_handle(),
                                 )
                                 .1,
                         )
@@ -657,13 +672,18 @@ mod demo {
             items_per_page: ReadSignal<u32>,
         ) -> ReadSignal<ImagesResponse> {
             if let Some(demo_state) = self.demo_state.as_ref() {
-                sync::create_selector({
+                syc::create_selector({
                     let demo_state = demo_state.clone();
                     let token = self.client.token.handle();
 
                     move || {
                         demo_state
-                            .images_and_tag_counts(&filter, &token, &start, &items_per_page)
+                            .images_and_tag_counts(
+                                &filter,
+                                &token,
+                                start.clone(),
+                                items_per_page.clone(),
+                            )
                             .0
                     }
                 })
@@ -674,6 +694,8 @@ mod demo {
 
         pub fn try_login(&self) -> Result<()> {
             if self.demo_state.is_some() {
+                self.client.log_in();
+
                 Ok(())
             } else {
                 self.client.try_login()
@@ -701,6 +723,96 @@ mod demo {
             if self.demo_state.is_none() {
                 self.client.open_login();
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use {super::*, maplit::hashset, tagger_shared::Medium};
+
+        #[test]
+        fn demo_client() -> Result<()> {
+            let image_count = 8;
+
+            let tags = (0..image_count)
+                .map(|index| Tag {
+                    category: None,
+                    value: index.to_string().into(),
+                })
+                .collect::<Box<[_]>>();
+
+            let images = Signal::new(ImagesResponse {
+                start: 0,
+                total: image_count,
+                later_start: None,
+                earliest_start: None,
+                images: (0..image_count)
+                    .map(|index| {
+                        Ok(ImageData {
+                            hash: index.to_string().into(),
+                            datetime: format!("2021-{:02}-01T00:00:00Z", index + 1).parse()?,
+                            medium: Medium::Image,
+                            duplicates: Vec::new(),
+                            tags: hashset![
+                                tags[usize::try_from(index).unwrap()].clone(),
+                                Tag {
+                                    category: Some("year".into()),
+                                    value: "2021".into()
+                                },
+                                Tag {
+                                    category: Some("month".into()),
+                                    value: (index + 1).to_string().into()
+                                }
+                            ],
+                        })
+                    })
+                    .collect::<Result<_>>()?,
+            });
+
+            let tags = Signal::new(TagsResponse {
+                immutable: None,
+                categories: [(
+                    "year".into(),
+                    TagsResponse {
+                        immutable: Some(true),
+                        categories: [(
+                            "month".into(),
+                            TagsResponse {
+                                immutable: Some(true),
+                                categories: HashMap::new(),
+                                tags: (0..image_count)
+                                    .map(|index| ((index + 1).to_string().into(), 1))
+                                    .collect(),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        tags: [("2021".into(), image_count)].into_iter().collect(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                tags: tags.iter().map(|tag| (tag.value.clone(), 1)).collect(),
+            });
+
+            let _client = DemoClient {
+                client: HttpClient {
+                    client: reqwest::Client::new(),
+                    token: Signal::new(None),
+                    root: Rc::from("(invalid)"),
+                    show_log_in: Signal::new(false),
+                    log_in_error: Signal::new(None),
+                    user_name: Signal::new(String::new()),
+                    password: Signal::new(String::new()),
+                },
+                demo_state: Some(DemoState {
+                    images: images.handle(),
+                    tags: tags.handle(),
+                    patch: Signal::new(DemoPatch::default()),
+                }),
+            };
+
+            todo!()
         }
     }
 }

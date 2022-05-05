@@ -34,10 +34,18 @@ use {
         pagination::{Pagination, PaginationProps},
         toolbar::{Toolbar, ToolbarProps},
     },
-    anyhow::{anyhow, Result},
+    anyhow::{anyhow, Error, Result},
     chrono::Utc,
     serde_derive::{Deserialize, Serialize},
-    std::{cell::Cell, convert::TryFrom, ops::Deref, panic, rc::Rc},
+    std::{
+        cell::Cell,
+        convert::TryFrom,
+        fmt::{self, Display},
+        ops::Deref,
+        panic,
+        rc::Rc,
+        str::FromStr,
+    },
     sycamore::prelude::{self as syc, view, ReadSignal, Signal},
     tagger_shared::{tag_expression::TagTree, ImageKey, ImagesResponse},
     wasm_bindgen::{closure::Closure, JsCast},
@@ -127,9 +135,10 @@ fn fold<A, B>(
 ///
 /// See `State::demo` for details.
 #[cfg(feature = "demo")]
-struct DemoCredentials {
-    user_name: String,
-    password: String,
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DemoCredentials {
+    pub user_name: String,
+    pub password: String,
 }
 
 #[cfg(feature = "demo")]
@@ -142,8 +151,8 @@ impl FromStr for DemoCredentials {
 
         if let (Some(a), Some(b)) = (split.next(), split.next()) {
             Ok(Self {
-                user_name: String::from_utf8(&base64::decode_config(a)?, base64::URL_SAFE)?,
-                password: String::from_utf8(&base64::decode_config(b)?, base64::URL_SAFE)?,
+                user_name: String::from_utf8(base64::decode_config(a, base64::URL_SAFE)?)?,
+                password: String::from_utf8(base64::decode_config(b, base64::URL_SAFE)?)?,
             })
         } else {
             Err(anyhow!("unable to parse {s} as DemoCredentials"))
@@ -167,7 +176,7 @@ impl Display for DemoCredentials {
 /// Represents the state of this application (e.g. which item the user is looking at, etc.)
 ///
 /// This is used for URI-based "routing", e.g. https://[hostname]/#s=2022-01-10T01%3A17%3A10Z&ipp=1000
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub struct State {
     /// The index of the media item the user is currently looking at, if any
     #[serde(rename = "oi")]
@@ -316,6 +325,7 @@ fn main() -> Result<()> {
                 } else {
                     Some(*items_per_page)
                 },
+                demo: None,
             }) {
                 Ok(hash) => {
                     let _ = location.set_hash(&hash);

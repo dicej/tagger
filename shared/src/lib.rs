@@ -216,7 +216,7 @@ pub struct ImagesQuery {
 }
 
 /// Represents the currently supported media item formats
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Medium {
     /// Simple static image (e.g. JPEG)
     Image,
@@ -229,7 +229,7 @@ pub enum Medium {
 }
 
 /// Metadata associated with a given media item
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct ImageData {
     /// The SHA-256 hash of the contents of the file
     pub hash: Arc<str>,
@@ -264,7 +264,7 @@ impl ImageData {
 }
 
 /// Represents the response to a GET /images request from a Tagger server
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
 pub struct ImagesResponse {
     /// Number of items which preceed this sequence of items (i.e. how many items the server knows about which
     /// are more recent than what the client requested via `ImagesQuery::start`)

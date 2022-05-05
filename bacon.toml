@@ -6,7 +6,7 @@ default_job = "clippy"
 [jobs]
 
 [jobs.clippy]
-command = ["cargo", "clippy", "--all-targets", "--color", "always"]
+command = ["cargo", "clippy", "--all-targets", "--all-features", "--color", "always"]
 need_stdout = false
 watch = ["build.rs", "tests", "benches", "examples"]
 

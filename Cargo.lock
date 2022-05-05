@@ -2221,6 +2221,7 @@ dependencies = [
  "futures",
  "jsonwebtoken",
  "log",
+ "maplit",
  "reqwest",
  "serde",
  "serde_derive",

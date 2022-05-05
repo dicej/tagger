@@ -264,8 +264,7 @@ fn group_similar(items: &[Item]) -> Vec<HashSet<&Item>> {
         let others = items
             .iter()
             .take_while(|(o, _)| ordinal.is_similar_to(o))
-            .map(|(_, i)| i.iter())
-            .flatten()
+            .flat_map(|(_, i)| i.iter())
             .copied()
             .collect::<Vec<_>>();
 
