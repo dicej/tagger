@@ -324,6 +324,8 @@ impl ImagesResponseBuilder {
         key: &ImageKey,
         fun: F,
     ) -> Result<(), E> {
+        self.total += 1;
+
         if self
             .start_key
             .as_ref()

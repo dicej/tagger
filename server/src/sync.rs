@@ -3,7 +3,10 @@
 
 use {
     crate::{
-        media::{self, FileData, Item, ItemData, PerceptualHash, PERCEPTUAL_HASH_LENGTH},
+        media::{
+            self, FileData, Item, ItemData, PerceptualHash, JPEG_EXTENSIONS, MPEG4_EXTENSIONS,
+            PERCEPTUAL_HASH_LENGTH,
+        },
         BUFFER_SIZE,
     },
     anyhow::{anyhow, Error, Result},
@@ -174,10 +177,8 @@ fn find_new<'a>(
                     // Some android phones "hide" files which have been "deleted" by prepending a ".trashed-"
                     // prefix to them.  We assume here that users don't want to see those.
                     if !lowercase.starts_with(".trashed-")
-                        && (lowercase.ends_with(".jpg")
-                            || lowercase.ends_with(".jpeg")
-                            || lowercase.ends_with(".mp4")
-                            || lowercase.ends_with(".mov"))
+                        && (MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext))
+                            || JPEG_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext)))
                     {
                         let mut path = dir_buf.clone();
                         path.push(name);
@@ -204,7 +205,8 @@ fn find_new<'a>(
 
                             if !found_bad {
                                 let metadata = task::block_in_place(|| {
-                                    if lowercase.ends_with(".mp4") || lowercase.ends_with(".mov") {
+                                    if MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext))
+                                    {
                                         mp4_metadata(&path)
                                     } else {
                                         exif_metadata(&path)

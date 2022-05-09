@@ -9,6 +9,7 @@ default_job = "clippy"
 command = ["cargo", "clippy", "--all-targets", "--all-features", "--color", "always"]
 need_stdout = false
 watch = ["build.rs", "tests", "benches", "examples"]
+on_success = "quit"
 
 [jobs.test]
 command = ["cargo", "test", "--release", "--color", "always"]

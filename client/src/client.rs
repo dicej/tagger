@@ -469,21 +469,17 @@ mod demo {
         }
 
         fn tags(&self, tag_counts: &TagCounts) -> TagsResponse {
-            filter_tags(None, self.tags.get().deref(), tag_counts)
-        }
-    }
+            let tags = self.tags.get();
 
-    fn filter_tags(
-        category: Option<Arc<str>>,
-        tags: &TagsResponse,
-        tag_counts: &TagCounts,
-    ) -> TagsResponse {
-        let new_categories = if category.is_none() {
-            tag_counts
-                .iter()
-                .filter_map(|(category, inner_tags)| {
-                    if let Some(category) = category {
-                        if !tags.categories.contains_key(category) {
+            let mut result = filter_tags(None, tags.deref(), tag_counts);
+
+            result
+                .categories
+                .extend(tag_counts.iter().filter_map(|(category, inner_tags)| {
+                    category.as_ref().and_then(|category| {
+                        if contains_category(tags.deref(), category) {
+                            None
+                        } else {
                             Some((
                                 category.clone(),
                                 TagsResponse {
@@ -492,18 +488,25 @@ mod demo {
                                     tags: inner_tags.clone(),
                                 },
                             ))
-                        } else {
-                            None
                         }
-                    } else {
-                        None
-                    }
-                })
-                .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
-        };
+                    })
+                }));
 
+            result
+        }
+    }
+
+    fn contains_category(tags: &TagsResponse, category: &str) -> bool {
+        tags.categories
+            .iter()
+            .any(|(cat, tags)| cat.deref() == category || contains_category(tags, category))
+    }
+
+    fn filter_tags(
+        category: Option<Arc<str>>,
+        tags: &TagsResponse,
+        tag_counts: &TagCounts,
+    ) -> TagsResponse {
         TagsResponse {
             immutable: tags.immutable,
 
@@ -519,7 +522,6 @@ mod demo {
                         Some((name.clone(), tags))
                     }
                 })
-                .chain(new_categories)
                 .collect(),
 
             tags: tag_counts.get(&category).cloned().unwrap_or_default(),
@@ -795,7 +797,7 @@ mod demo {
                 tags: tags.iter().map(|tag| (tag.value.clone(), 1)).collect(),
             });
 
-            let _client = DemoClient {
+            let client = DemoClient {
                 client: HttpClient {
                     client: reqwest::Client::new(),
                     token: Signal::new(None),
@@ -812,7 +814,22 @@ mod demo {
                 }),
             };
 
-            todo!()
+            let filter = Signal::new(TagTree::default());
+
+            let start = Signal::new(None);
+
+            let items_per_page = Signal::new(image_count);
+
+            let client_tags = client.watch_tags(filter.handle());
+
+            let client_images =
+                client.watch_images(filter.handle(), start.handle(), items_per_page.handle());
+
+            assert_eq!(images.get().deref(), client_images.get().deref());
+
+            assert_eq!(tags.get().deref(), client_tags.get().deref());
+
+            Ok(())
         }
     }
 }

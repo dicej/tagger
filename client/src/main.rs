@@ -34,22 +34,23 @@ use {
         pagination::{Pagination, PaginationProps},
         toolbar::{Toolbar, ToolbarProps},
     },
-    anyhow::{anyhow, Error, Result},
+    anyhow::{anyhow, Result},
     chrono::Utc,
     serde_derive::{Deserialize, Serialize},
-    std::{
-        cell::Cell,
-        convert::TryFrom,
-        fmt::{self, Display},
-        ops::Deref,
-        panic,
-        rc::Rc,
-        str::FromStr,
-    },
+    std::{cell::Cell, convert::TryFrom, ops::Deref, panic, rc::Rc},
     sycamore::prelude::{self as syc, view, ReadSignal, Signal},
     tagger_shared::{tag_expression::TagTree, ImageKey, ImagesResponse},
     wasm_bindgen::{closure::Closure, JsCast},
     web_sys::KeyboardEvent,
+};
+
+#[cfg(feature = "demo")]
+use {
+    anyhow::Error,
+    std::{
+        fmt::{self, Display},
+        str::FromStr,
+    },
 };
 
 mod client;
@@ -325,6 +326,7 @@ fn main() -> Result<()> {
                 } else {
                     Some(*items_per_page)
                 },
+                #[cfg(feature = "demo")]
                 demo: None,
             }) {
                 Ok(hash) => {

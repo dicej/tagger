@@ -1076,6 +1076,8 @@ mod test {
 
         let response = serde_json::from_slice::<ImagesResponse>(response.body())?;
 
+        tracing::info!("{response:?}");
+
         assert_eq!(response.start, 0);
         assert_eq!(response.total, MEDIA_COUNT);
         assert_eq!(response.later_start, None);
