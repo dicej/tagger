@@ -29,6 +29,13 @@ pub type Client = demo::DemoClient;
 #[cfg(not(feature = "demo"))]
 pub type Client = HttpClient;
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum LoginStatus {
+    In,
+    Out,
+    Demo,
+}
+
 impl HttpClient {
     pub fn new(
         _state: Option<&State>,
@@ -226,13 +233,19 @@ impl HttpClient {
     ///
     /// The tagger server may be configured to allow anonymous access (i.e. with empty credentials), in which case
     /// we may have a token with no subject claim, which means we aren't really logged in yet.
-    pub fn is_logged_in(&self) -> bool {
-        if let Some(token) = self.token.get_untracked().deref() {
+    pub fn login_status(&self) -> LoginStatus {
+        let logged_in = if let Some(token) = self.token.get().deref() {
             jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
                 .map(|data| data.claims.subject.is_some())
                 .unwrap_or(false)
         } else {
             false
+        };
+
+        if logged_in {
+            LoginStatus::In
+        } else {
+            LoginStatus::Out
         }
     }
 
@@ -244,7 +257,7 @@ impl HttpClient {
     }
 
     fn on_unauthorized(&self) {
-        let was_logged_in = self.is_logged_in();
+        let was_logged_in = self.login_status() == LoginStatus::In;
 
         self.try_anonymous_login_with_fn(|| ());
 
@@ -561,9 +574,6 @@ mod demo {
                         user_name.set(credentials.user_name.clone());
                         password.set(credentials.password.clone());
 
-                        // todo: display a banner message explaining that in demo mode any changes will be lost if
-                        // the user leaves or refreshes the page.
-
                         DemoState {
                             images: client.watch_images(
                                 Signal::new(TagTree::default()).into_handle(),
@@ -571,10 +581,7 @@ mod demo {
                                 Signal::new(IMAGE_LIMIT).into_handle(),
                             ),
                             tags: client.watch_tags(Signal::new(TagTree::default()).into_handle()),
-                            patch: Signal::new(DemoPatch {
-                                to_add: HashMap::new(),
-                                to_remove: HashMap::new(),
-                            }),
+                            patch: Signal::new(DemoPatch::default()),
                         }
                     })
                 }),
@@ -697,7 +704,6 @@ mod demo {
         pub fn try_login(&self) -> Result<()> {
             if self.demo_state.is_some() {
                 self.client.log_in();
-
                 Ok(())
             } else {
                 self.client.try_login()
@@ -707,23 +713,32 @@ mod demo {
         pub fn log_in(&self) {
             if self.demo_state.is_none() {
                 self.client.log_in();
+            } else {
+                unreachable!("UI should not give user this option")
             }
         }
 
         pub fn try_anonymous_login(&self) {
             if self.demo_state.is_none() {
                 self.client.try_anonymous_login();
+            } else {
+                unreachable!("UI should not give user this option")
             }
         }
 
-        pub fn is_logged_in(&self) -> bool {
-            self.demo_state.is_none() && self.client.is_logged_in()
+        pub fn login_status(&self) -> LoginStatus {
+            if self.demo_state.is_none() {
+                self.client.login_status()
+            } else {
+                LoginStatus::Demo
+            }
         }
 
         pub fn open_login(&self) {
-            // todo: don't give user this option when in demo mode
             if self.demo_state.is_none() {
                 self.client.open_login();
+            } else {
+                unreachable!("UI should not give user this option")
             }
         }
     }

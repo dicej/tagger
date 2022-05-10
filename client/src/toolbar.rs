@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        client::Client,
+        client::{Client, LoginStatus},
         images::ImagesState,
         pagination::{Pagination, PaginationProps},
         tag_menu::{List, TagMenu, TagMenuCommonProps, TagMenuProps},
@@ -119,11 +119,13 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         }
     };
 
-    let logged_in = syc::create_selector({
+    let login_status = syc::create_selector({
         let client = client.clone();
 
-        move || client.is_logged_in()
+        move || client.login_status()
     });
+
+    let login_status2 = login_status.clone();
 
     let log_out = {
         let client = client.clone();
@@ -356,14 +358,17 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
             }
 
             div(style=format!("display:{};", if *show_menu.get() { "block" } else { "none" })) {
-                (if *logged_in.get() {
-                    view! {
-                        div(class="link", on:click=log_out.clone()) { "log out" }
-                    }
-                } else {
-                    view! {
-                        div(class="link", on:click=open_log_in_event.clone()) { "log in" }
-                    }
+                (match *login_status.get() {
+                    LoginStatus::In =>
+                        view! {
+                            div(class="link", on:click=log_out.clone()) { "log out" }
+                        },
+                    LoginStatus::Out =>
+                        view! {
+                            div(class="link", on:click=open_log_in_event.clone()) { "log in" }
+                        },
+                    LoginStatus::Demo =>
+                        view! {}
                 })
 
                 label(for="items_per_page") { "items per page: " }
@@ -389,7 +394,21 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
 
             div(style=format!("display:{};", if *selecting2.get() { "block" } else { "none" })) {
                 (if *selected.get() {
+                    let login_status = login_status2.clone();
+
                     view! {
+                        div(style=format!("display:{};",
+                                          if let LoginStatus::Demo = *login_status.get() {
+                                              "block"
+                                          } else {
+                                              "none"
+                                          })) {
+                            em {
+                                "Demo Mode: Any changes you make will not be persisted -- \
+                                 they will be lost if you leave or refresh this page."
+                            }
+                        }
+
                         div {
                             "tags: " Keyed(KeyedProps {
                                 iterable: selected_tags.iterable.clone(),
