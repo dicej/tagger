@@ -36,6 +36,7 @@ use {
     },
     anyhow::{anyhow, Result},
     chrono::Utc,
+    serde::{Deserializer, Serializer},
     serde_derive::{Deserialize, Serialize},
     std::{cell::Cell, convert::TryFrom, ops::Deref, panic, rc::Rc},
     sycamore::prelude::{self as syc, view, ReadSignal, Signal},
@@ -136,7 +137,7 @@ fn fold<A, B>(
 ///
 /// See `State::demo` for details.
 #[cfg(feature = "demo")]
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Debug, Clone)]
 pub struct DemoCredentials {
     pub user_name: String,
     pub password: String,
@@ -171,6 +172,30 @@ impl Display for DemoCredentials {
             base64::encode_config(self.user_name.as_bytes(), base64::URL_SAFE),
             base64::encode_config(self.password.as_bytes(), base64::URL_SAFE),
         )
+    }
+}
+
+#[cfg(feature = "demo")]
+impl<'de> serde::Deserialize<'de> for DemoCredentials {
+    /// Deserialize a `DemoCredentials` using `DemoCredentials::from_str`
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "demo")]
+impl serde::Serialize for DemoCredentials {
+    /// Serialize a `DemoCredentials` using `DemoCredentials::fmt``
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -287,7 +312,15 @@ fn main() -> Result<()> {
         password.clone(),
     );
 
+    #[cfg(feature = "demo")]
+    let mut demo = None;
+
     if let Some(state) = state {
+        #[cfg(feature = "demo")]
+        {
+            demo = state.demo.clone();
+        }
+
         overlay_image.set(state.overlay_image);
         filter.set(state.filter.unwrap_or_default());
 
@@ -327,7 +360,7 @@ fn main() -> Result<()> {
                     Some(*items_per_page)
                 },
                 #[cfg(feature = "demo")]
-                demo: None,
+                demo: demo.clone(),
             }) {
                 Ok(hash) => {
                     let _ = location.set_hash(&hash);

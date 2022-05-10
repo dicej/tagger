@@ -14,7 +14,7 @@ futures = "0.3"
 hex = "0.4"
 http = "0.2"
 hyper = "0.14"
-image = "0.23"
+image = "0.24"
 lazy_static = "1"
 mime = "0.3"
 pretty_env_logger = "0.4"
@@ -34,7 +34,7 @@ jsonwebtoken = "7"
 rand = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = [ "macros", "rt-multi-thread", "fs", "time", "sync", "process" ] }
-tokio-util = "0.6"
+tokio-util = { version = "0.6", features = [ "codec" ] }
 tracing = { version = "0.1", features = [ "log" ] }
 warp = { version = "0.3", features = [ "tls" ] }
 webp = "0.2"

@@ -825,9 +825,134 @@ mod demo {
             let client_images =
                 client.watch_images(filter.handle(), start.handle(), items_per_page.handle());
 
-            assert_eq!(images.get().deref(), client_images.get().deref());
+            // To start with (before we've added or removed any tags), the client state should match the original
+            // state.
 
-            assert_eq!(tags.get().deref(), client_tags.get().deref());
+            // Poor man's clone
+            let mut images = serde_json::from_str::<ImagesResponse>(
+                &serde_json::to_string(images.get().deref()).unwrap(),
+            )
+            .unwrap();
+
+            let mut tags = serde_json::from_str::<TagsResponse>(
+                &serde_json::to_string(tags.get().deref()).unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(&images, client_images.get().deref());
+
+            assert_eq!(&tags, client_tags.get().deref());
+
+            // Now let's add a new tag to a couple of images and expect the client to include them
+
+            let tag = Tag {
+                category: None,
+                value: "foo".into(),
+            };
+
+            client.patch_tags(vec![
+                Patch {
+                    hash: "0".into(),
+                    tag: tag.clone(),
+                    action: Action::Add,
+                },
+                Patch {
+                    hash: "1".into(),
+                    tag: tag.clone(),
+                    action: Action::Add,
+                },
+            ]);
+
+            for index in 0..2 {
+                images.images[usize::try_from(index).unwrap()]
+                    .tags
+                    .insert(tag.clone());
+            }
+
+            assert_eq!(&images, client_images.get().deref());
+
+            tags.tags.insert(tag.value, 2);
+
+            assert_eq!(&tags, client_tags.get().deref());
+
+            // Now let's remove tags from a couple of images and expect the client to reflect that
+
+            client.patch_tags(vec![
+                Patch {
+                    hash: "4".into(),
+                    tag: Tag {
+                        category: None,
+                        value: "4".into(),
+                    },
+                    action: Action::Remove,
+                },
+                Patch {
+                    hash: "5".into(),
+                    tag: Tag {
+                        category: None,
+                        value: "5".into(),
+                    },
+                    action: Action::Remove,
+                },
+            ]);
+
+            for index in 4..6 {
+                images.images[index].tags.remove(&Tag {
+                    category: None,
+                    value: index.to_string().into(),
+                });
+            }
+
+            assert_eq!(&images, client_images.get().deref());
+
+            tags.tags.remove("4");
+            tags.tags.remove("5");
+
+            assert_eq!(&tags, client_tags.get().deref());
+
+            // Now add new tags with a new category
+
+            client.patch_tags(vec![
+                Patch {
+                    hash: "4".into(),
+                    tag: Tag {
+                        category: Some("um".into()),
+                        value: "whut".into(),
+                    },
+                    action: Action::Add,
+                },
+                Patch {
+                    hash: "5".into(),
+                    tag: Tag {
+                        category: Some("um".into()),
+                        value: "why".into(),
+                    },
+                    action: Action::Add,
+                },
+            ]);
+
+            for (index, value) in [(4, "whut"), (5, "why")] {
+                images.images[index].tags.insert(Tag {
+                    category: Some("um".into()),
+                    value: value.into(),
+                });
+            }
+
+            assert_eq!(&images, client_images.get().deref());
+
+            tags.categories.insert(
+                "um".into(),
+                TagsResponse {
+                    immutable: None,
+                    categories: HashMap::new(),
+                    tags: ["whut", "why"]
+                        .into_iter()
+                        .map(|tag| (tag.into(), 1))
+                        .collect(),
+                },
+            );
+
+            assert_eq!(&tags, client_tags.get().deref());
 
             Ok(())
         }
