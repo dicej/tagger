@@ -17,6 +17,8 @@
 //! * [image_overlay]: Overlay for viewing one high resolution media item at a time and browsing items sequentially
 //! (e.g. a lightbox)
 //!
+//! Additionally, there is the [client] module, which provides an API for communicating with the Tagger server.
+//!
 //! This top-level module ties all of the above modules together and also hosts code shared by those modules.
 //!
 //! If you're not yet familiar with how [Sycamore](https://crates.io/crates/sycamore) works (particularly how it

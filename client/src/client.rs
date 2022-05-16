@@ -1,3 +1,11 @@
+//! This module provides the `Client` type, which provides an API for communicating with the Tagger server,
+//! including authentication, media and tag queries, and tag updates.
+//!
+//! When the `demo` feature is enabled, the `Client` type also provides the alternative capability of simulating a
+//! Tagger server locally in the browser instead of connecting to a real one.  In that mode, any changes the user
+//! makes (e.g. adding or removing tags) affect only the local state and are lost if the user leaves or refreshes
+//! the page.
+
 use {
     crate::State,
     anyhow::{anyhow, Error, Result},
@@ -12,31 +20,59 @@ use {
     },
 };
 
+/// Represents the state of a connection (or connection-to-be) to a Tagger server
 #[derive(Clone)]
 pub struct HttpClient {
+    /// `reqwest` client for making HTTP requests to the server
     client: reqwest::Client,
+
+    /// Most recent authorization token received from the server, if any
     token: Signal<Option<String>>,
+
+    /// Root URL used to make HTTP requests to the server
     root: Rc<str>,
+
+    /// Indicates whether to prompt the user for login credentials (e.g. when loading the page for the first time
+    /// or on token expiration)
     show_log_in: Signal<bool>,
+
+    /// Error message to present to the user on login failure, if any
     log_in_error: Signal<Option<String>>,
+
+    /// Most recent user name provided by user for login
     user_name: Signal<String>,
+
+    /// Most recent password provided by user for login
     password: Signal<String>,
 }
 
+/// Type alias for [demo::DemoClient]
 #[cfg(feature = "demo")]
 pub type Client = demo::DemoClient;
 
+/// Type alias for [HttpClient]
 #[cfg(not(feature = "demo"))]
 pub type Client = HttpClient;
 
+/// Indicates whether the user is currently logged in, or else in demo mode -- in which case no login is necessary
+/// or desired
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum LoginStatus {
+    /// User is logged in
     In,
+
+    /// User is logged out
     Out,
+
+    /// App is in demo mode, so no login is necessary
     Demo,
 }
 
 impl HttpClient {
+    /// Create a new [HttpClient] with the specified configuration and signals.
+    ///
+    /// In this implementation, the `_state` parameter is ignored.  It is present only to match the API provided by
+    /// `demo::DemoClient` when the `demo` feature is enabled.
     pub fn new(
         _state: Option<&State>,
         token: Signal<Option<String>>,
@@ -57,9 +93,11 @@ impl HttpClient {
         }
     }
 
+    /// Return a `ReadSignal` which tracks whether the user has permission to add and remove tags to/from media
+    /// items on the server.
+    ///
+    /// This is based on the latest authorization token received from the server.
     pub fn may_select(&self) -> ReadSignal<bool> {
-        // We only enable selection mode if the server has given us an access token which says we may add and
-        // remove tags to/from media items.
         syc::create_selector({
             let token = self.token.handle();
 
@@ -78,8 +116,8 @@ impl HttpClient {
     /// Send a PATCH /tags request to the Tagger server to add or remove tags to/from media items.
     ///
     /// The request is sent using the specified `client`, using `token` for authorization and `root`/tags as the
-    /// URL.  The body is `patches`, serialized as JSON.  If the server returns 401 Unauthorized, `on_unauthorized`
-    /// will be invoked.
+    /// URL.  The body is `patches`, serialized as JSON.  If the server returns 401 Unauthorized, the user may be
+    /// prompted to log in again (see [HttpClient::show_log_in]).
     pub fn patch_tags(&self, patches: Vec<Patch>) {
         wasm_bindgen_futures::spawn_local(
             {
@@ -111,10 +149,20 @@ impl HttpClient {
         )
     }
 
+    /// Return a `ReadSignal` which tracks the latest response to GET /tags requests from the server
+    ///
+    /// `filter` represents the tag expression used to query a subset of tags.  Any time `filter` or the
+    /// `self.token` change, the client will send a new request and publish the result to the returned signal.
+    ///
+    /// See also [tagger_shared::TagsQuery].
     pub fn watch_tags(&self, filter: ReadSignal<TagTree>) -> ReadSignal<TagsResponse> {
         self.watch(Signal::new("tags".into()).into_handle(), filter)
     }
 
+    /// Return a `ReadSignal` which tracks the latest response to GET /images requests from the server
+    ///
+    /// See [tagger_shared::ImagesQuery] for the meanings of the parameters.  Whenever a parameter or the
+    /// `self.token` change, the client will send a new request and publish the result to the returned signal.
     pub fn watch_images(
         &self,
         filter: ReadSignal<TagTree>,
@@ -137,6 +185,10 @@ impl HttpClient {
         )
     }
 
+    /// Attempt to log the user in on initial page load.
+    ///
+    /// First, we'll try reusing the token found in local storage, if any.  Next, we'll try logging in anonymously.
+    /// Finally, we'll prompt the user for credentials.
     pub fn try_login(&self) -> Result<()> {
         let window = web_sys::window().ok_or_else(|| anyhow!("can't get browser window"))?;
 
@@ -169,6 +221,7 @@ impl HttpClient {
         Ok(())
     }
 
+    /// Attempt to log in to the server anonymously, and if that fails, prompt the user for credentials.
     pub fn try_anonymous_login(&self) {
         self.try_anonymous_login_with_fn({
             let client = self.clone();
@@ -177,6 +230,11 @@ impl HttpClient {
         })
     }
 
+    /// Attempt to log in to the server using the credentials provided by the user (see [HttpClient::user_name] and
+    /// [HttpClient::password]).
+    ///
+    /// This operation runs asynchronously; `self.token` is updated on success, and `self.log_in_error` is set on
+    /// 401 Unauthorized.
     pub fn log_in(&self) {
         wasm_bindgen_futures::spawn_local(
             {
@@ -229,7 +287,7 @@ impl HttpClient {
         );
     }
 
-    /// Return true iff the specified `token` exists and is not an "anonymous" token.
+    /// Return the current [LoginStatus] of the user.
     ///
     /// The tagger server may be configured to allow anonymous access (i.e. with empty credentials), in which case
     /// we may have a token with no subject claim, which means we aren't really logged in yet.
@@ -249,6 +307,8 @@ impl HttpClient {
         }
     }
 
+    /// Set `self.user_name`, `self.password`, `self.log_in_error`, and `self.show_log_in` to empty, empty, `None`,
+    /// and `true`, respectively.
     pub fn open_login(&self) {
         self.user_name.set(String::new());
         self.password.set(String::new());
@@ -256,6 +316,8 @@ impl HttpClient {
         self.show_log_in.set(true);
     }
 
+    /// Handle a 401 Unauthorized response from the server by attempting to log in again, prompting the user for
+    /// credentials if necessary.
     fn on_unauthorized(&self) {
         let was_logged_in = self.login_status() == LoginStatus::In;
 
@@ -269,12 +331,12 @@ impl HttpClient {
     /// Create a `ReadSignal` which resolves to the JSON response body returned from the specified URI.
     ///
     /// The request will include an HTTP "Bearer" authorization header with the specified auth token.  Any time
-    /// either `uri`, `token`, or `filter` change, the request will be resent and the signal re-fired with the
+    /// either `uri`, `self.token`, or `filter` change, the request will be resent and the signal re-fired with the
     /// response unless the response status is 401 Unauthorized, in which case the signal is set to
     /// `Default::default()` and `on_unauthorized` is called.
     ///
-    /// The full request URL is formed using `root`/`uri`, with `filter` appended as a query parameter if it is
-    /// non-empty.
+    /// The full request URL is formed using `self.root`/`uri`, with `filter` appended as a query parameter if it
+    /// is non-empty.
     fn watch<T: Default + for<'de> serde::Deserialize<'de>>(
         &self,
         uri: ReadSignal<String>,
@@ -347,7 +409,7 @@ impl HttpClient {
     /// Attempt to log in with empty credentials, setting `token` to the resulting access token on success, or else
     /// calling `on_unauthorized` on 401 Unauthorized.
     ///
-    /// The OAuth 2 authentication URL is formed using `root`/token.
+    /// The OAuth 2 authentication URL is formed using `self.root`/token.
     fn try_anonymous_login_with_fn(&self, on_unauthorized: impl Fn() + 'static) {
         if self.token.get_untracked().is_some() {
             self.token.set(None);
@@ -384,6 +446,8 @@ impl HttpClient {
     }
 }
 
+/// Module supporting the `demo` feature, which enables simulating a Tagger server locally in the browser so the
+/// user can experiment without affecting the state of a real server
 #[cfg(feature = "demo")]
 mod demo {
     use {
@@ -396,24 +460,43 @@ mod demo {
         tagger_shared::{tag_expression::Tag, Action, ImageData, ImagesResponseBuilder},
     };
 
+    /// Maximum number of media items to retrieve from the server
     const IMAGE_LIMIT: u32 = 10_000;
 
+    /// Represents the accumulated "add" and "remove" patch operations performed on a simulated server
     #[derive(Clone, Default)]
     struct DemoPatch {
+        /// Acculmuated "add" operations
         to_add: HashMap<Arc<str>, HashSet<Tag>>,
+
+        /// Acculmuated "remove" operations
         to_remove: HashMap<Arc<str>, HashSet<Tag>>,
     }
 
+    /// Represents the state of a simulated server
     #[derive(Clone)]
     struct DemoState {
+        /// The latest `ImagesResponse` received from the real server
         images: ReadSignal<ImagesResponse>,
+
+        /// The latest `TagsResponse` received from the real server
         tags: ReadSignal<TagsResponse>,
+
+        /// Accumulated "add" and "remove" patch operations performed on the simulated server
         patch: Signal<DemoPatch>,
     }
 
+    /// Type alias representing a map of categories to tags to counts of items having each tag
     type TagCounts = HashMap<Option<Arc<str>>, HashMap<Arc<str>, u32>>;
 
     impl DemoState {
+        /// Calculate an `ImagesResponse` and `TagCounts` according to the same logic the Tagger server uses.
+        ///
+        /// The `ImagesResponse` is calculated by starting with the `ImagesResponse` received from the real server,
+        /// applying `self.patch` to it, and finally using [tagger_shared::ImagesResponseBuilder] to filter and
+        /// paginate according to the query parameters just like the real server would.  At the same time, we
+        /// accumulate tag counts which can later be fed to the [tags] method to generate a simulated
+        /// `TagsResponse` if desired.
         fn images_and_tag_counts(
             &self,
             filter: &ReadSignal<TagTree>,
@@ -481,6 +564,11 @@ mod demo {
             (builder.build(), tag_counts)
         }
 
+        /// Calculate a `TagsResponse` according to the same logic the Tagger server uses.
+        ///
+        /// The result is calculated by starting with the `TagsResponse` received from the real server and then
+        /// filtering the result using `tag_counts` (presumably created by a prior call to the
+        /// [images_and_tag_counts] method).
         fn tags(&self, tag_counts: &TagCounts) -> TagsResponse {
             let tags = self.tags.get();
 
@@ -509,12 +597,17 @@ mod demo {
         }
     }
 
+    /// Return whether the specified `category` can be found in `tags` or a sub-response thereof.
     fn contains_category(tags: &TagsResponse, category: &str) -> bool {
         tags.categories
             .iter()
             .any(|(cat, tags)| cat.deref() == category || contains_category(tags, category))
     }
 
+    /// Return a clone of `tags`, except with the tag counts replaced by those found in `tag_counts`.
+    ///
+    /// This may lead to some entries being removed entirely when the corresponding `tag_counts` entries are not
+    /// present.
     fn filter_tags(
         category: Option<Arc<str>>,
         tags: &TagsResponse,
@@ -541,6 +634,8 @@ mod demo {
         }
     }
 
+    /// Composes an [HttpClient] with an [Option<DemoState>], implementing all the same methods but redirecting
+    /// any server communication to a simulated server when `demo_state` is non-empty.
     #[derive(Clone)]
     pub struct DemoClient {
         client: HttpClient,
@@ -548,6 +643,11 @@ mod demo {
     }
 
     impl DemoClient {
+        /// Create a new `DemoClient`.
+        ///
+        /// If `state.demo` is empty, the returned object will have an empty `demo_state` and pass all method calls
+        /// straight through to the underlying [HttpClient].  Otherwise, the returned object will have a non-empty
+        /// `demo_state` and redirect most method calls to the simulated server.
         pub fn new(
             state: Option<&State>,
             token: Signal<Option<String>>,
@@ -588,6 +688,8 @@ mod demo {
             }
         }
 
+        /// In demo mode, return a signal whose value is always `true`; otherwise, return
+        /// `self.client.may_select()`.
         pub fn may_select(&self) -> ReadSignal<bool> {
             if self.demo_state.is_some() {
                 Signal::new(true).into_handle()
@@ -596,6 +698,8 @@ mod demo {
             }
         }
 
+        /// In demo mode, accumulate the specified `patches` in the simulated server; otherwise, send the patches
+        /// to the real server.
         pub fn patch_tags(&self, patches: Vec<Patch>) {
             if let Some(demo_state) = self.demo_state.as_ref() {
                 let mut new = demo_state.patch.get_untracked().as_ref().clone();
@@ -650,6 +754,8 @@ mod demo {
             }
         }
 
+        /// In demo mode, return a signal that queries the simulated server for a `TagsResponse`; otherwise, query
+        /// the real server.
         pub fn watch_tags(&self, filter: ReadSignal<TagTree>) -> ReadSignal<TagsResponse> {
             if let Some(demo_state) = self.demo_state.as_ref() {
                 syc::create_selector({
@@ -674,6 +780,8 @@ mod demo {
             }
         }
 
+        /// In demo mode, return a signal that queries the simulated server for a `ImagesResponse`; otherwise,
+        /// query the real server.
         pub fn watch_images(
             &self,
             filter: ReadSignal<TagTree>,
@@ -701,6 +809,8 @@ mod demo {
             }
         }
 
+        /// In demo mode, attempt to log in using the credentials specified via the `state` parameter of
+        /// `DemoClient::new`; otherwise, call `self.client.try_login()`.
         pub fn try_login(&self) -> Result<()> {
             if self.demo_state.is_some() {
                 self.client.log_in();
@@ -710,6 +820,7 @@ mod demo {
             }
         }
 
+        /// Call `self.client.log_in()` if not in demo mode; otherwise, panic.
         pub fn log_in(&self) {
             if self.demo_state.is_none() {
                 self.client.log_in();
@@ -718,6 +829,7 @@ mod demo {
             }
         }
 
+        /// Call `self.client.try_anonymous_login()` if not in demo mode; otherwise, panic.
         pub fn try_anonymous_login(&self) {
             if self.demo_state.is_none() {
                 self.client.try_anonymous_login();
@@ -726,6 +838,7 @@ mod demo {
             }
         }
 
+        /// In demo mode, return `LoginStatus::Demo`; otherwise, return `self.client.login_status()`.
         pub fn login_status(&self) -> LoginStatus {
             if self.demo_state.is_none() {
                 self.client.login_status()
@@ -734,6 +847,7 @@ mod demo {
             }
         }
 
+        /// Call `self.client.open_login()` if not in demo mode; otherwise, panic.
         pub fn open_login(&self) {
             if self.demo_state.is_none() {
                 self.client.open_login();
@@ -749,6 +863,8 @@ mod demo {
 
         #[test]
         fn demo_client() -> Result<()> {
+            // Set up a simple test scenario with `image_count` media items and a few tags applied to those items.
+
             let image_count = 8;
 
             let tags = (0..image_count)
@@ -858,7 +974,7 @@ mod demo {
 
             assert_eq!(&tags, client_tags.get().deref());
 
-            // Now let's add a new tag to a couple of images and expect the client to include them
+            // Now let's add a new tag to a couple of images and expect the client to include them.
 
             let tag = Tag {
                 category: None,
@@ -890,7 +1006,7 @@ mod demo {
 
             assert_eq!(&tags, client_tags.get().deref());
 
-            // Now let's remove tags from a couple of images and expect the client to reflect that
+            // Now let's remove tags from a couple of images and expect the client to reflect that.
 
             client.patch_tags(vec![
                 Patch {
@@ -925,7 +1041,7 @@ mod demo {
 
             assert_eq!(&tags, client_tags.get().deref());
 
-            // Now add new tags with a new category
+            // Now add new tags with a new category.
 
             client.patch_tags(vec![
                 Patch {
