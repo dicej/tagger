@@ -292,19 +292,42 @@ pub struct ImagesResponse {
     pub images: Vec<ImageData>,
 }
 
+/// Represents the in-progress state of assembling an [ImagesResponse] based on an [ImagesQuery] and a backing
+/// store containing the server state
 pub struct ImagesResponseBuilder {
+    /// See [ImagesQuery::start]
     start_key: Option<ImageKey>,
+
+    /// See [ImagesQuery::limit]
     limit: usize,
+
+    /// Sequence of items (ordered newest to oldest) seen so far which satisfy the query and fall within
+    /// `start_key` and `limit`
     images: Vec<ImageData>,
+
+    /// Sequence of items seen so far which satisfy the query but fall before `start_key`
+    ///
+    /// This is treated as a FIFO queue, limited in size according to `limit`.
     later: VecDeque<ImageKey>,
+
+    /// Total number of (deduplicated) items seen so far which satisfy the query
     total: u32,
+
+    /// Total number of (deduplicated) items seen so far which satisfy the query but fall before `start_key`
     start: u32,
+
+    /// Item most recently seen, if any
     previous: Option<ImageKey>,
+
+    /// The newest item to be placed on the last page according to the pagination rules
     earliest_start: Option<ImageKey>,
+
+    /// Number of items seen so far which satisfy the query but fall before `start_key`, modulo `limit`
     earlier_count: usize,
 }
 
 impl ImagesResponseBuilder {
+    /// Create a fresh `ImagesResponseBuilder` with the specified query parameters.
     pub fn new(start_key: Option<ImageKey>, limit: usize) -> Self {
         Self {
             start_key,
@@ -319,6 +342,10 @@ impl ImagesResponseBuilder {
         }
     }
 
+    /// Consider the next item in the sequence as queried from the backing store, updating the state of this
+    /// builder according to the query parameters and pagination rules.
+    ///
+    /// Items are assumed to be considered from newest to oldest.
     pub fn consider<E, F: FnOnce() -> Result<ImageData, E>>(
         &mut self,
         key: &ImageKey,
@@ -356,6 +383,9 @@ impl ImagesResponseBuilder {
         Ok(())
     }
 
+    /// Convert this object into an `ImagesResponse` object.
+    ///
+    /// This should be called after all available items have been passed to the [consider] method.
     pub fn build(mut self) -> ImagesResponse {
         ImagesResponse {
             start: self.start,
