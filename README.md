@@ -15,6 +15,13 @@ and/or other devices are continuously synced to the server running the `Tagger`
 back end.  Items will appear in your collection automatically as they are added
 to the filesystem.
 
+## Demo
+
+[You can try it out
+here.](https://busa.crabdance.com/#demo=ZGVtbw%3D%3D:ZGVtbw%3D%3D) Note that the
+demo site is currently hosted on my home server via a cheap internet connection
+with modest bandwidth.
+
 ## Features
 
 * Supports JPEG images (including "motion photo" files with embedded videos
