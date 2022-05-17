@@ -243,13 +243,15 @@ async fn video_track_data(path: &Path, offset: i64) -> Result<VideoTrackData> {
 
 /// Calculate an approximation of the average absolute difference between the bytes of the specified arrays.
 fn average_absolute_difference(a: &[u8], b: &[u8], step: usize) -> usize {
-    let (sum, count) = a
-        .iter()
-        .step_by(step)
-        .zip(b.iter().step_by(step))
-        .fold((0, 0), |(sum, count), (&a, &b)| {
-            ((sum + ((a as i32) - (b as i32)).abs() as usize), count + 1)
-        });
+    let (sum, count) = a.iter().step_by(step).zip(b.iter().step_by(step)).fold(
+        (0, 0),
+        |(sum, count), (&a, &b)| {
+            (
+                (sum + ((a as i32) - (b as i32)).unsigned_abs() as usize),
+                count + 1,
+            )
+        },
+    );
 
     sum / count
 }

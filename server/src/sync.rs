@@ -611,6 +611,11 @@ pub async fn sync(
                 let month = data.datetime.month();
                 let datetime = data.datetime.to_string();
                 let video_offset = data.video_offset;
+                let medium = match video_offset {
+                    None => "image",
+                    Some(0) => "video",
+                    Some(_) => "image-with-video",
+                };
 
                 async move {
                     sqlx::query!("INSERT INTO paths (path, hash) VALUES (?1, ?2)", path, hash)
@@ -622,6 +627,14 @@ pub async fn sync(
                         hash,
                         datetime,
                         video_offset
+                    )
+                    .execute(&mut *conn)
+                    .await?;
+
+                    sqlx::query!(
+                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'medium', ?2)",
+                        hash,
+                        medium
                     )
                     .execute(&mut *conn)
                     .await?;

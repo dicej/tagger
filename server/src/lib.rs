@@ -109,15 +109,11 @@ impl Default for PreloadPolicy {
 impl Display for PreloadPolicy {
     /// Convert a `PreloadPolicy` to a string, e.g. "none", "new", or "all"
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::None => "none",
-                Self::New => "new",
-                Self::All => "all",
-            }
-        )
+        f.write_str(match self {
+            Self::None => "none",
+            Self::New => "new",
+            Self::All => "all",
+        })
     }
 }
 
@@ -658,6 +654,15 @@ mod test {
         Video,
     }
 
+    impl Display for TestMedium {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::Image => "image",
+                Self::Video => "video",
+            })
+        }
+    }
+
     #[derive(Copy, Clone)]
     struct MediumInfo {
         medium: TestMedium,
@@ -985,7 +990,7 @@ mod test {
             image_lock,
             image_dir,
             cache_dir,
-            ..
+            info,
         } = init().await?;
 
         // Missing authorization header should yield `UNAUTHORIZED` from /images.
@@ -1098,7 +1103,11 @@ mod test {
             (1..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
+                    hashset![
+                        "year:2021".parse()?,
+                        format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?
+                    ],
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1132,7 +1141,11 @@ mod test {
             ((MEDIA_COUNT - 1)..=MEDIA_COUNT)
                 .map(|number| Ok((
                     format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
+                    hashset![
+                        "year:2021".parse()?,
+                        format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1169,7 +1182,11 @@ mod test {
             (2..=3)
                 .map(|number| Ok((
                     format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
+                    hashset![
+                        "year:2021".parse()?,
+                        format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1211,18 +1228,27 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=MEDIA_COUNT)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    if number == 3 {
-                        hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?
-                        ]
-                    } else {
-                        hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        if number == 3 {
+                            hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?
+                            ]
+                        } else {
+                            hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?
+                            ]
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1255,6 +1281,7 @@ mod test {
                     hashset![
                         "year:2021".parse()?,
                         format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?,
                         "foo".parse()?
                     ]
                 )))
@@ -1313,23 +1340,28 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=3)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    if number == 3 {
-                        hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?,
-                            "bar".parse()?
-                        ]
-                    } else {
-                        hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?
-                        ]
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        if number == 3 {
+                            hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?,
+                                "bar".parse()?
+                            ]
+                        } else {
+                            hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?
+                            ]
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1357,23 +1389,29 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (3..=4)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    if number == 3 {
-                        hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?,
-                            "bar".parse()?
-                        ]
-                    } else {
-                        hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "bar".parse()?
-                        ]
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        if number == 3 {
+                            hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?,
+                                "bar".parse()?
+                            ]
+                        } else {
+                            hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "bar".parse()?
+                            ]
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1406,6 +1444,7 @@ mod test {
                     hashset![
                         "year:2021".parse()?,
                         format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?,
                         "foo".parse()?,
                         "bar".parse()?
                     ]
@@ -1437,28 +1476,35 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=4)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    match number {
-                        4 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "bar".parse()?
-                        ],
-                        3 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?,
-                            "bar".parse()?
-                        ],
-                        2 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?
-                        ],
-                        _ => unreachable!(),
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        match number {
+                            4 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "bar".parse()?
+                            ],
+                            3 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?,
+                                "bar".parse()?
+                            ],
+                            2 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?
+                            ],
+                            _ => unreachable!(),
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1490,28 +1536,39 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (2..=MEDIA_COUNT)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    match number {
-                        4 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "bar".parse()?
-                        ],
-                        3 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?,
-                            "bar".parse()?
-                        ],
-                        2 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?
-                        ],
-                        _ => hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        match number {
+                            4 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "bar".parse()?
+                            ],
+                            3 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?,
+                                "bar".parse()?
+                            ],
+                            2 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?
+                            ],
+                            _ => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?
+                            ],
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1552,24 +1609,30 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (3..=4)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    match number {
-                        4 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "bar".parse()?,
-                            "baz".parse()?
-                        ],
-                        3 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?,
-                            "bar".parse()?
-                        ],
-                        _ => unreachable!(),
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        match number {
+                            4 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "bar".parse()?,
+                                "baz".parse()?
+                            ],
+                            3 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?,
+                                "bar".parse()?
+                            ],
+                            _ => unreachable!(),
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1605,6 +1668,7 @@ mod test {
                     hashset![
                         "year:2021".parse()?,
                         format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?,
                         "bar".parse()?,
                         "baz".parse()?
                     ]
@@ -1644,6 +1708,7 @@ mod test {
                     hashset![
                         "year:2021".parse()?,
                         format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?,
                         "foo".parse()?,
                         "bar".parse()?
                     ]
@@ -1693,6 +1758,7 @@ mod test {
                     hashset![
                         "year:2021".parse()?,
                         format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?,
                         "bar".parse()?,
                         "baz".parse()?
                     ]
@@ -1724,23 +1790,33 @@ mod test {
                 .map(|data| (data.datetime, data.tags))
                 .collect::<HashMap<_, _>>(),
             (1..=MEDIA_COUNT)
-                .map(|number| Ok((
-                    format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    match number {
-                        4 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "bar".parse()?,
-                            "baz".parse()?
-                        ],
-                        3 | 2 => hashset![
-                            "year:2021".parse()?,
-                            format!("month:{number}").parse()?,
-                            "foo".parse()?
-                        ],
-                        _ => hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
-                    }
-                )))
+                .map(|number| {
+                    let medium = info.get(&number).unwrap().medium;
+
+                    Ok((
+                        format!("2021-{number:02}-01T00:00:00Z").parse()?,
+                        match number {
+                            4 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "bar".parse()?,
+                                "baz".parse()?
+                            ],
+                            3 | 2 => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?,
+                                "foo".parse()?
+                            ],
+                            _ => hashset![
+                                "year:2021".parse()?,
+                                format!("month:{number}").parse()?,
+                                format!("medium:{medium}").parse()?
+                            ],
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?
         );
 
@@ -1770,7 +1846,11 @@ mod test {
             iter::once(7)
                 .map(|number| Ok((
                     format!("2021-{number:02}-01T00:00:00Z").parse()?,
-                    hashset!["year:2021".parse()?, format!("month:{number}").parse()?]
+                    hashset![
+                        "year:2021".parse()?,
+                        format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?
+                    ]
                 )))
                 .collect::<Result<_>>()?
         );
@@ -1816,6 +1896,7 @@ mod test {
                     hashset![
                         "year:2021".parse()?,
                         format!("month:{number}").parse()?,
+                        format!("medium:{}", info.get(&number).unwrap().medium).parse()?,
                         "bar".parse()?,
                         "baz".parse()?,
                         "public".parse()?
@@ -1836,7 +1917,7 @@ mod test {
             image_lock,
             image_dir,
             cache_dir,
-            ..
+            info,
         } = init().await?;
 
         let token = make_token(&auth_key)?;
@@ -1880,7 +1961,11 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     (
-                        hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
+                        hashset![
+                            "year:2021".parse()?,
+                            format!("month:{number}").parse()?,
+                            format!("medium:{}", info.get(&number).unwrap().medium).parse()?
+                        ],
                         Vec::new()
                     )
                 )))
@@ -1927,7 +2012,11 @@ mod test {
                 .map(|number| Ok((
                     format!("2021-{number:02}-01T00:00:00Z").parse()?,
                     (
-                        hashset!["year:2021".parse()?, format!("month:{number}").parse()?],
+                        hashset![
+                            "year:2021".parse()?,
+                            format!("month:{number}").parse()?,
+                            format!("medium:{}", info.get(&number).unwrap().medium).parse()?
+                        ],
                         Vec::new()
                     )
                 )))
@@ -1936,7 +2025,8 @@ mod test {
                     (
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{primary_duplicate_image}").parse()?
+                            format!("month:{primary_duplicate_image}").parse()?,
+                            "medium:image".parse()?
                         ],
                         vec![
                             hashes
@@ -1967,7 +2057,8 @@ mod test {
                     (
                         hashset![
                             "year:2021".parse()?,
-                            format!("month:{primary_duplicate_video}").parse()?
+                            format!("month:{primary_duplicate_video}").parse()?,
+                            "medium:video".parse()?
                         ],
                         vec![
                             hashes
@@ -2071,6 +2162,8 @@ mod test {
             ("year", "2022", Action::Add),
             ("month", "3", Action::Remove),
             ("month", "4", Action::Add),
+            ("medium", "image", Action::Remove),
+            ("medium", "video", Action::Add),
         ] {
             let response = warp::test::request()
                 .method("PATCH")
@@ -2144,9 +2237,9 @@ mod test {
                 .is_none()
         );
 
-        // A PATCH /tags that tries to change the year or month should yield `UNAUTHORIZED`
+        // A PATCH /tags that tries to change the year, month, or medium should yield `UNAUTHORIZED`
 
-        for &category in &["year", "month"] {
+        for &category in &["year", "month", "medium"] {
             for &action in &[Action::Add, Action::Remove] {
                 let response = warp::test::request()
                     .method("PATCH")
@@ -2278,6 +2371,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 10
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 5, "image".into() => 5],
                     }
                 ],
                 tags: hashmap![
@@ -2341,6 +2439,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 10
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 5, "image".into() => 5],
                     }
                 ],
                 tags: hashmap![
@@ -2377,6 +2480,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 2
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 1, "image".into() => 1],
                     }
                 ],
                 tags: hashmap![
@@ -2413,6 +2521,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 2
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 1, "image".into() => 1],
                     }
                 ],
                 tags: hashmap![
@@ -2451,6 +2564,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 1
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["image".into() => 1],
                     }
                 ],
                 tags: hashmap![
@@ -2487,6 +2605,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 3
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 2, "image".into() => 1],
                     }
                 ],
                 tags: hashmap![
@@ -2537,6 +2660,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 2
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 1, "image".into() => 1],
                     }
                 ],
                 tags: hashmap![
@@ -2588,6 +2716,11 @@ mod test {
                         tags: hashmap![
                             "2021".into() => 1
                         ]
+                    },
+                    "medium".into() => TagsResponse {
+                        immutable: Some(true),
+                        categories: HashMap::new(),
+                        tags: hashmap!["video".into() => 1],
                     }
                 ],
                 tags: hashmap![
