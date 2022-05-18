@@ -20,6 +20,38 @@ use {
     },
 };
 
+/// Type alias for [demo::DemoClient]
+#[cfg(feature = "demo")]
+pub type Client = demo::DemoClient;
+
+/// Type alias for [HttpClient]
+#[cfg(not(feature = "demo"))]
+pub type Client = HttpClient;
+
+/// Indicates whether the user is currently logged in, or else in demo mode -- in which case no login is necessary
+/// or desired
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum LoginStatus {
+    /// User is logged in
+    In,
+
+    /// User is logged out
+    Out,
+
+    /// App is in demo mode, so no login is necessary
+    Demo,
+}
+
+/// Indicates whether to prompt the user for credentials, e.g. on 401 Unauthorized
+#[derive(Copy, Clone, Debug)]
+enum LoginPolicy {
+    /// Never prompt the user for credentials
+    Never,
+
+    /// Prompt the user for credentials if and when needed
+    AsNeeded,
+}
+
 /// Represents the state of a connection (or connection-to-be) to a Tagger server
 #[derive(Clone)]
 pub struct HttpClient {
@@ -44,28 +76,8 @@ pub struct HttpClient {
 
     /// Most recent password provided by user for login
     password: Signal<String>,
-}
 
-/// Type alias for [demo::DemoClient]
-#[cfg(feature = "demo")]
-pub type Client = demo::DemoClient;
-
-/// Type alias for [HttpClient]
-#[cfg(not(feature = "demo"))]
-pub type Client = HttpClient;
-
-/// Indicates whether the user is currently logged in, or else in demo mode -- in which case no login is necessary
-/// or desired
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum LoginStatus {
-    /// User is logged in
-    In,
-
-    /// User is logged out
-    Out,
-
-    /// App is in demo mode, so no login is necessary
-    Demo,
+    login_policy: LoginPolicy,
 }
 
 impl HttpClient {
@@ -73,6 +85,7 @@ impl HttpClient {
     ///
     /// In this implementation, the `_state` parameter is ignored.  It is present only to match the API provided by
     /// `demo::DemoClient` when the `demo` feature is enabled.
+    #[allow(dead_code)]
     pub fn new(
         _state: Option<&State>,
         token: Signal<Option<String>>,
@@ -90,6 +103,7 @@ impl HttpClient {
             log_in_error,
             user_name,
             password,
+            login_policy: LoginPolicy::AsNeeded,
         }
     }
 
@@ -236,6 +250,11 @@ impl HttpClient {
     /// This operation runs asynchronously; `self.token` is updated on success, and `self.log_in_error` is set on
     /// 401 Unauthorized.
     pub fn log_in(&self) {
+        match self.login_policy {
+            LoginPolicy::Never => return,
+            LoginPolicy::AsNeeded => (),
+        }
+
         wasm_bindgen_futures::spawn_local(
             {
                 let client = self.clone();
@@ -310,6 +329,11 @@ impl HttpClient {
     /// Set `self.user_name`, `self.password`, `self.log_in_error`, and `self.show_log_in` to empty, empty, `None`,
     /// and `true`, respectively.
     pub fn open_login(&self) {
+        match self.login_policy {
+            LoginPolicy::Never => return,
+            LoginPolicy::AsNeeded => (),
+        }
+
         self.user_name.set(String::new());
         self.password.set(String::new());
         self.log_in_error.set(None);
@@ -411,6 +435,11 @@ impl HttpClient {
     ///
     /// The OAuth 2 authentication URL is formed using `self.root`/token.
     fn try_anonymous_login_with_fn(&self, on_unauthorized: impl Fn() + 'static) {
+        match self.login_policy {
+            LoginPolicy::Never => return,
+            LoginPolicy::AsNeeded => (),
+        }
+
         if self.token.get_untracked().is_some() {
             self.token.set(None);
         }
@@ -657,15 +686,20 @@ mod demo {
             user_name: Signal<String>,
             password: Signal<String>,
         ) -> Self {
-            let client = HttpClient::new(
-                state,
+            let client = HttpClient {
+                client: reqwest::Client::new(),
                 token,
                 root,
                 show_log_in,
                 log_in_error,
-                user_name.clone(),
-                password.clone(),
-            );
+                user_name: user_name.clone(),
+                password: password.clone(),
+                login_policy: if state.and_then(|state| state.demo.as_ref()).is_some() {
+                    LoginPolicy::Never
+                } else {
+                    LoginPolicy::AsNeeded
+                },
+            };
 
             Self {
                 client: client.clone(),
@@ -937,6 +971,7 @@ mod demo {
                     log_in_error: Signal::new(None),
                     user_name: Signal::new(String::new()),
                     password: Signal::new(String::new()),
+                    login_policy: LoginPolicy::Never,
                 },
                 demo_state: Some(DemoState {
                     images: images.handle(),
