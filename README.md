@@ -71,7 +71,7 @@ Encrypt](https://letsencrypt.org/) make this easy.
 Each user account may include a tag query which limits the media items
 discoverable by that user to those which satisfy the query.
 
-*However*, media items URLs themselves are not subject to access control.  This
+*However*, media item URLs themselves are not subject to access control.  This
 makes it possible to share media item URLs without sharing session tokens, but
 it also means there's no way to restrict access to a given item after someone
 has the URL except by removing it from the server entirely.
