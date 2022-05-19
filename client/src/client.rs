@@ -250,11 +250,6 @@ impl HttpClient {
     /// This operation runs asynchronously; `self.token` is updated on success, and `self.log_in_error` is set on
     /// 401 Unauthorized.
     pub fn log_in(&self) {
-        match self.login_policy {
-            LoginPolicy::Never => return,
-            LoginPolicy::AsNeeded => (),
-        }
-
         wasm_bindgen_futures::spawn_local(
             {
                 let client = self.clone();
