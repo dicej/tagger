@@ -558,19 +558,19 @@ mod demo {
                     .cloned()
                     .collect::<HashSet<_>>();
 
-                for tag in &tags {
-                    *tag_counts
-                        .entry(tag.category.clone())
-                        .or_default()
-                        .entry(tag.value.clone())
-                        .or_default() += 1;
-                }
-
                 if filter
                     .as_ref()
                     .map(|filter| filter.evaluate_set(&tags))
                     .unwrap_or(true)
                 {
+                    for tag in &tags {
+                        *tag_counts
+                            .entry(tag.category.clone())
+                            .or_default()
+                            .entry(tag.value.clone())
+                            .or_default() += 1;
+                    }
+
                     assert!(builder
                         .consider::<Infallible, _>(&image.key(), || {
                             Ok(ImageData {

@@ -33,16 +33,14 @@ pub enum List<T> {
 fn find_categories<'a>(
     filter_chain: &List<Tag>,
     categories: &'a HashMap<Arc<str>, TagsResponse>,
-) -> Option<&'a HashMap<Arc<str>, TagsResponse>> {
-    if let List::Cons(cons) = filter_chain {
-        let next = find_categories(&cons.1, categories);
-        if let Some(category) = cons.0.category.as_deref() {
-            next.and_then(|next| next.get(category).map(|tags| &tags.categories))
+    result: &mut Vec<Arc<str>>,
+) {
+    for (category, tags) in categories {
+        if find_category(filter_chain, category.deref()).is_some() {
+            find_categories(filter_chain, &tags.categories, result);
         } else {
-            next
+            result.push(category.clone());
         }
-    } else {
-        Some(categories)
     }
 }
 
@@ -76,6 +74,7 @@ fn to_tree(filter_chain: &List<Tag>, filter: &TagTree) -> TagTree {
     ) -> (Option<&'a TagTree>, TagTree) {
         match filter_chain {
             List::Nil => (Some(filter), tree),
+
             List::Cons(cons) => {
                 let get_subtree = subtree;
                 let (filter, subtree) = recurse(&cons.1, filter, tree);
@@ -103,28 +102,32 @@ fn to_tree(filter_chain: &List<Tag>, filter: &TagTree) -> TagTree {
     recurse(filter_chain, filter, TagTree::default()).1
 }
 
-/// Given a `filter_chain`, which denotes the set of tags we're currently filtering by, identify which tags (if
-/// any) in `tags` are appropriate to list at the next level of the tree, i.e. which tags could be used to further
-/// filter a set of media items.
+/// Identify which tags (if any) in `tags` are appropriate to list at the next level of the tree, i.e. which tags
+/// could be used to further filter a set of media items.
 ///
 /// We use `category` to indicate whether we're building a submenu for a specific category or for uncategorized
-/// tags.  If a category is specified, but we can't find it, we return the tags in `default` instead.
+/// tags.
 ///
 /// See also [find_categories].
 fn tags_for_category<'a>(
     category: &Option<Arc<str>>,
-    filter_chain: &List<Tag>,
-    default: &'a TagsResponse,
     tags: &'a TagsResponse,
-) -> &'a HashMap<Arc<str>, u32> {
-    &if let Some(category) = category {
-        find_categories(filter_chain, &tags.categories)
-            .and_then(|categories| categories.get(category.deref()))
-            .unwrap_or(default)
+) -> Option<&'a TagsResponse> {
+    if let Some(inner) = category {
+        if let Some(tags) = tags.categories.get(inner) {
+            Some(tags)
+        } else {
+            for tags in tags.categories.values() {
+                if let Some(tags) = tags_for_category(category, tags) {
+                    return Some(tags);
+                }
+            }
+
+            None
+        }
     } else {
-        tags
+        Some(tags)
     }
-    .tags
 }
 
 /// Return a reference to the first `Tag` found in `filter_chain` which matches the specified `tag` name and
@@ -139,6 +142,23 @@ fn find_tag<'a>(
             List::Nil => break None,
             List::Cons(cons) => {
                 if cons.0.category.as_deref() == category && cons.0.value.deref() == tag {
+                    break Some(&cons.0);
+                } else {
+                    filter_chain = &cons.1;
+                }
+            }
+        }
+    }
+}
+
+/// Return a reference to the first `Tag` found in `filter_chain` which matches the specified `category`, if
+/// present.
+fn find_category<'a>(mut filter_chain: &'a List<Tag>, category: &str) -> Option<&'a Tag> {
+    loop {
+        match filter_chain {
+            List::Nil => break None,
+            List::Cons(cons) => {
+                if cons.0.category.as_deref() == Some(category) {
                     break Some(&cons.0);
                 } else {
                     filter_chain = &cons.1;
@@ -208,9 +228,6 @@ pub struct TagMenuCommonProps {
     /// The path which identifies the subtree of `filter` which this (sub)menu represents
     pub filter_chain: List<Tag>,
 
-    /// The most recent raw, unfiltered set of tags received from the server
-    pub unfiltered_tags: ReadSignal<TagsResponse>,
-
     pub show_menu: Signal<bool>,
 }
 
@@ -238,7 +255,6 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
                 client,
                 filter,
                 filter_chain,
-                unfiltered_tags,
                 show_menu,
             },
         tag,
@@ -257,10 +273,9 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
                     client: client.clone(),
                     filter: filter.clone(),
                     filter_chain: filter_chain.clone(),
-                    unfiltered_tags: unfiltered_tags.clone(),
                     show_menu: show_menu.clone(),
                 },
-                filtered_tags: client.watch_tags(
+                tags: client.watch_tags(
                     Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
                 ),
                 category: None,
@@ -299,15 +314,20 @@ fn compare_numeric(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Search `tags` for the specified `tag` and return the image count if found; zero otherwise.
+fn count_for_tag(tags: &TagsResponse, tag: &Tag) -> u32 {
+    *tags_for_category(&tag.category, tags)
+        .and_then(|tags| tags.tags.get(&tag.value))
+        .unwrap_or(&0)
+}
+
 /// Properties for populating and rendering the `TagMenu` component
 pub struct TagMenuProps {
     /// See [TagMenuCommonProps]
     pub common: TagMenuCommonProps,
 
-    /// The most recent set of tags received from the Tagger server, filtered by the filter provided by the user
-    ///
-    /// See also `TagMenuCommonProps::unfiltered_tags`.
-    pub filtered_tags: ReadSignal<TagsResponse>,
+    /// The most recent set of tags and associated image counts received from the server
+    pub tags: ReadSignal<TagsResponse>,
 
     /// The category for which we are displaying this menu, if any
     pub category: Option<Arc<str>>,
@@ -322,29 +342,24 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 client,
                 filter,
                 filter_chain,
-                unfiltered_tags,
                 show_menu,
             },
-        filtered_tags,
+        tags,
         category,
     } = props;
 
     let categories = if category.is_none() {
         let categories = KeyedProps {
             iterable: syc::create_selector({
-                let unfiltered_tags = unfiltered_tags.clone();
+                let tags = tags.clone();
                 let filter_chain = filter_chain.clone();
 
                 move || {
-                    let unfiltered_tags = unfiltered_tags.get();
+                    let tags = tags.get();
 
-                    let empty = HashMap::new();
+                    let mut vec = Vec::new();
 
-                    let mut vec = find_categories(&filter_chain, &unfiltered_tags.categories)
-                        .unwrap_or(&empty)
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>();
+                    find_categories(&filter_chain, &tags.categories, &mut vec);
 
                     vec.sort();
 
@@ -354,8 +369,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
 
             template: {
                 let filter_chain = filter_chain.clone();
-                let unfiltered_tags = unfiltered_tags.clone();
-                let filtered_tags = filtered_tags.clone();
+                let tags = tags.clone();
                 let client = client.clone();
                 let filter = filter.clone();
                 let show_menu = show_menu.clone();
@@ -366,10 +380,9 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                             client: client.clone(),
                             filter: filter.clone(),
                             filter_chain: filter_chain.clone(),
-                            unfiltered_tags: unfiltered_tags.clone(),
                             show_menu: show_menu.clone(),
                         },
-                        filtered_tags: filtered_tags.clone(),
+                        tags: tags.clone(),
                         category: Some(category.clone()),
                     };
 
@@ -394,25 +407,19 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
         view! {}
     };
 
-    let counts = syc::create_selector({
-        let category = category.clone();
-        let filter_chain = filter_chain.clone();
-        let empty = TagsResponse::default();
-
-        move || tags_for_category(&category, &filter_chain, &empty, &filtered_tags.get()).clone()
-    });
-
     let tags = KeyedProps {
         iterable: syc::create_selector({
-            let unfiltered_tags = unfiltered_tags.clone();
+            let tags = tags.clone();
             let category = category.clone();
             let filter_chain = filter_chain.clone();
             let empty = TagsResponse::default();
 
             move || {
-                let unfiltered_tags = unfiltered_tags.get();
+                let tags = tags.get();
 
-                let mut vec = tags_for_category(&category, &filter_chain, &empty, &unfiltered_tags)
+                let mut vec = tags_for_category(&category, &tags)
+                    .unwrap_or(&empty)
+                    .tags
                     .keys()
                     .filter(|tag| find_tag(&filter_chain, category.as_deref(), tag).is_none())
                     .cloned()
@@ -435,7 +442,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                     client: client.clone(),
                     filter: filter.clone(),
                     filter_chain: filter_chain.clone(),
-                    unfiltered_tags: unfiltered_tags.clone(),
                     show_menu: show_menu.clone(),
                 },
                 tag: tag.clone(),
@@ -476,6 +482,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let filter_chain = filter_chain.clone();
                 let filter = filter.clone();
                 let filter_state = filter_state.clone();
+                let tag = tag.clone();
                 let show_menu = show_menu.clone();
 
                 move |_| {
@@ -494,7 +501,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 }
             };
 
-            let counts = counts.clone();
+            let tags = tags.clone();
 
             let filter_state2 = filter_state.clone();
 
@@ -514,7 +521,7 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                                         ""
                                     }), on:click=toggle_excluded)
 
-                    " " (tag_value) " (" (*counts.get().get(&tag_value).unwrap_or(&0)) ")"
+                    " " (tag_value) " (" (count_for_tag(tags.get().deref(), &tag)) ")"
 
                     TagSubMenu(sub_menu)
                 }

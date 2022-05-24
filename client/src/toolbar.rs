@@ -84,7 +84,7 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
 
     // The `TagMenu` component needs to know the set of tags (across all media items accessible to this user)
     // available from the server.
-    let unfiltered_tags = client.watch_tags(Signal::new(TagTree::default()).into_handle());
+    let tags = client.watch_tags(Signal::new(TagTree::default()).into_handle());
 
     let pagination = PaginationProps {
         images: images.clone(),
@@ -186,20 +186,17 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
         template: {
             let client = client.clone();
             let images = images.clone();
-            let unfiltered_tags = unfiltered_tags.clone();
+            let tags = tags.clone();
 
             move |tag| {
                 let remove = {
                     let client = client.clone();
                     let tag = tag.clone();
-                    let unfiltered_tags = unfiltered_tags.clone();
+                    let tags = tags.clone();
                     let images = images.clone();
 
                     move |_| {
-                        if !is_immutable_category(
-                            unfiltered_tags.get().deref(),
-                            tag.category.as_deref(),
-                        ) {
+                        if !is_immutable_category(tags.get().deref(), tag.category.as_deref()) {
                             let images = images.get();
 
                             client.patch_tags(
@@ -228,14 +225,9 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
 
                 let immutable = syc::create_selector({
                     let tag = tag.clone();
-                    let unfiltered_tags = unfiltered_tags.clone();
+                    let tags = tags.clone();
 
-                    move || {
-                        is_immutable_category(
-                            unfiltered_tags.get().deref(),
-                            tag.category.as_deref(),
-                        )
-                    }
+                    move || is_immutable_category(tags.get().deref(), tag.category.as_deref())
                 });
 
                 view! {
@@ -262,17 +254,14 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
     let add_tag_key = {
         let add_tag_value = add_tag_value.clone();
         let client = client.clone();
-        let unfiltered_tags = unfiltered_tags.clone();
+        let tags = tags.clone();
 
         move |event: Event| {
             if let Ok(event) = event.dyn_into::<KeyboardEvent>() {
                 if event.key().deref() == "Enter" {
                     match add_tag_value.get().parse::<Tag>() {
                         Ok(tag) => {
-                            if is_immutable_category(
-                                unfiltered_tags.get().deref(),
-                                tag.category.as_deref(),
-                            ) {
+                            if is_immutable_category(tags.get().deref(), tag.category.as_deref()) {
                                 log::error!(
                                     "cannot add tag {tag} since it belongs to an immutable category",
                                 )
@@ -323,10 +312,9 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
             client,
             filter: filter.clone(),
             filter_chain: List::Nil,
-            unfiltered_tags: unfiltered_tags.clone(),
             show_menu: show_menu.clone(),
         },
-        filtered_tags: unfiltered_tags,
+        tags,
         category: None,
     };
 
