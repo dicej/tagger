@@ -10,13 +10,8 @@ use {
     sqlx::SqliteConnection,
     std::{ops::DerefMut, process, sync::Arc, time::Duration},
     structopt::StructOpt,
-    tagger_server::{FileData, ItemData, Options, PreloadPolicy},
-    tokio::{
-        fs::File,
-        io::AsyncReadExt,
-        sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
-        task, time,
-    },
+    tagger_server::{FileData, ItemData, LockMap, Options, PreloadPolicy},
+    tokio::{fs::File, io::AsyncReadExt, sync::Mutex as AsyncMutex, task, time},
     tracing::{error, info},
 };
 
@@ -36,7 +31,7 @@ async fn content(file_name: &str) -> Result<Vec<u8>> {
 async fn sync_loop(
     options: Arc<Options>,
     conn: Arc<AsyncMutex<SqliteConnection>>,
-    image_lock: Arc<AsyncRwLock<()>>,
+    image_locks: Arc<LockMap<Arc<str>, ()>>,
     mut restart_tx: Sender<()>,
 ) -> Result<()> {
     let mut cert_and_key =
@@ -60,7 +55,7 @@ async fn sync_loop(
     loop {
         tagger_server::sync(
             &conn,
-            &image_lock,
+            &image_locks,
             &options.image_directory,
             &options.cache_directory,
             match options.preload_policy {
@@ -72,6 +67,8 @@ async fn sync_loop(
         .await?;
 
         time::sleep(SYNC_INTERVAL).await;
+
+        image_locks.clean().await;
 
         if let Some((cert_file, old_cert, key_file, old_key)) = &mut cert_and_key {
             let new_cert = content(cert_file).await?;
@@ -109,12 +106,7 @@ async fn main() -> Result<()> {
         tagger_server::open(&options.state_file).await?,
     ));
 
-    // TODO: This lock is used to ensure no more than one task tries to read/write the same cache file
-    // concurrently.  However, it's way too conservative since it prevents more than one task from writing any
-    // cache files concurrently -- even unrelated ones.  We should use separate locks per image hash (or one lock
-    // which can provide simultaneous guards for distinct image hashes).
-    // [async-condvar-fair](https://crates.io/crates/async-condvar-fair) may be useful for that purpose.
-    let image_lock = Arc::new(AsyncRwLock::new(()));
+    let image_locks = Arc::new(LockMap::default());
 
     let (restart_tx, mut restart_rx) = mpsc::channel(2);
 
@@ -122,7 +114,7 @@ async fn main() -> Result<()> {
         {
             let conn = conn.clone();
             let options = options.clone();
-            let image_lock = image_lock.clone();
+            let image_locks = image_locks.clone();
 
             async move {
                 if let PreloadPolicy::All = options.preload_policy {
@@ -145,7 +137,7 @@ async fn main() -> Result<()> {
                     .await;
 
                     tagger_server::preload_cache_all(
-                        &image_lock,
+                        &image_locks,
                         &options.image_directory,
                         &options.cache_directory,
                         stream::iter(images),
@@ -153,7 +145,7 @@ async fn main() -> Result<()> {
                     .await?;
                 }
 
-                sync_loop(options, conn, image_lock, restart_tx).await
+                sync_loop(options, conn, image_locks, restart_tx).await
             }
         }
         .map_err(|e| {
@@ -167,7 +159,7 @@ async fn main() -> Result<()> {
 
     loop {
         future::select(
-            tagger_server::serve(&conn, &image_lock, &options, default_auth_key).boxed(),
+            tagger_server::serve(&conn, &image_locks, &options, default_auth_key).boxed(),
             restart_rx
                 .next()
                 .map(|o| o.ok_or_else(|| anyhow!("unexpected end of stream"))),

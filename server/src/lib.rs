@@ -41,7 +41,7 @@ use {
         convert::Infallible,
         fmt::{self, Display},
         net::SocketAddrV4,
-        ops::DerefMut,
+        ops::{Deref, DerefMut},
         panic::{self, AssertUnwindSafe},
         str::FromStr,
         sync::Arc,
@@ -52,11 +52,7 @@ use {
         tag_expression::TagExpression, Authorization, ImagesQuery, Patch, TagsQuery, TokenRequest,
         Variant,
     },
-    tokio::{
-        fs::File as AsyncFile,
-        io::AsyncReadExt,
-        sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
-    },
+    tokio::{fs::File as AsyncFile, io::AsyncReadExt, sync::Mutex as AsyncMutex},
     tracing::{info, warn},
     warp::{host::Authority, path::FullPath, Filter, Rejection, Reply},
 };
@@ -64,6 +60,7 @@ use {
 pub use {
     auth::hash_password,
     images::images,
+    lock_map::LockMap,
     media::{
         deduplicate, perceptual_hash, preload_cache, preload_cache_all, FileData, Item, ItemData,
         PerceptualHash, PerceptualOrdinal,
@@ -73,6 +70,7 @@ pub use {
 
 mod auth;
 mod images;
+mod lock_map;
 mod media;
 mod sync;
 mod tags;
@@ -262,17 +260,17 @@ fn response() -> response::Builder {
 ///
 /// * `conn`: used to access the Tagger database
 ///
-/// * `image_lock`: used to control concurrent access to the cache directory, e.g. to avoid simultaneous reads and
+/// * `image_locks`: used to control concurrent access to the cache directory, e.g. to avoid simultaneous reads and
 /// writes to cache files
 ///
 /// * `options`: server configuration -- see [Options] for details
 ///
 /// * `default_auth_key`: key used to sign access tokens if `options.auth_key_file` is `None`
 ///
-/// * `invalid_credentail_delay`: minimum interval to wait before responding to an invalid authentication request
+/// * `invalid_credential_delay`: minimum interval to wait before responding to an invalid authentication request
 async fn routes(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
-    image_lock: &Arc<AsyncRwLock<()>>,
+    image_locks: &Arc<LockMap<Arc<str>, ()>>,
     options: &Arc<Options>,
     default_auth_key: [u8; 32],
     invalid_credential_delay: Duration,
@@ -421,7 +419,7 @@ async fn routes(
                         .and_then({
                             let conn = conn.clone();
                             let options = options.clone();
-                            let image_lock = image_lock.clone();
+                            let image_locks = image_locks.clone();
 
                             move |variant: Variant,
                                   hash: String,
@@ -433,12 +431,12 @@ async fn routes(
                                     let hash = hash.clone();
                                     let conn = conn.clone();
                                     let options = options.clone();
-                                    let image_lock = image_lock.clone();
+                                    let image_locks = image_locks.clone();
 
                                     async move {
                                         media::image(
                                             &conn,
-                                            &image_lock,
+                                            image_locks.get(hash.clone()).await.deref(),
                                             &options.image_directory,
                                             &options.cache_directory,
                                             &hash,
@@ -521,17 +519,17 @@ fn catch_unwind<T>(fun: impl panic::UnwindSafe + FnOnce() -> T) -> Result<T> {
 
 /// Run a Warp server using a filter created by [routes], bound to the address(es) specified in `options`.
 ///
-/// `conn`, `image_lock`, and `default_auth_key` are all passed directly to [routes].  See that function's
+/// `conn`, `image_locks`, and `default_auth_key` are all passed directly to [routes].  See that function's
 /// documentation for details.
 pub async fn serve(
     conn: &Arc<AsyncMutex<SqliteConnection>>,
-    image_lock: &Arc<AsyncRwLock<()>>,
+    image_locks: &Arc<LockMap<Arc<str>, ()>>,
     options: &Arc<Options>,
     default_auth_key: [u8; 32],
 ) -> Result<()> {
     let routes = routes(
         conn,
-        image_lock,
+        image_locks,
         options,
         default_auth_key,
         Duration::from_secs(INVALID_CREDENTIAL_DELAY_SECS),
@@ -674,7 +672,7 @@ mod test {
         conn: Arc<AsyncMutex<SqliteConnection>>,
         routes: F,
         auth_key: [u8; 32],
-        image_lock: Arc<AsyncRwLock<()>>,
+        image_locks: Arc<LockMap<Arc<str>, ()>>,
         image_dir: &'static str,
         cache_dir: &'static str,
         info: Arc<HashMap<u32, MediumInfo>>,
@@ -803,7 +801,7 @@ mod test {
         }
 
         lazy_static! {
-            static ref IMAGE_LOCK: Arc<AsyncRwLock<()>> = Arc::new(AsyncRwLock::new(()));
+            static ref IMAGE_LOCKS: Arc<LockMap<Arc<str>, ()>> = Arc::new(LockMap::default());
             static ref IMAGE_DIR: TempDir = TempDir::new().unwrap();
             static ref CACHE_DIR: TempDir = TempDir::new().unwrap();
             static ref INFO: Arc<HashMap<u32, MediumInfo>> = Arc::new(info());
@@ -830,11 +828,12 @@ mod test {
         let mut auth_key = [0u8; 32];
         rand::thread_rng().fill(&mut auth_key);
 
-        let routes = make_routes(&conn, IMAGE_LOCK.deref(), image_dir, cache_dir, auth_key).await?;
+        let routes =
+            make_routes(&conn, IMAGE_LOCKS.deref(), image_dir, cache_dir, auth_key).await?;
 
         Ok(TestState {
             conn,
-            image_lock: IMAGE_LOCK.clone(),
+            image_locks: IMAGE_LOCKS.clone(),
             auth_key,
             routes,
             image_dir,
@@ -845,14 +844,14 @@ mod test {
 
     async fn make_routes(
         conn: &Arc<AsyncMutex<SqliteConnection>>,
-        image_lock: &Arc<AsyncRwLock<()>>,
+        image_locks: &Arc<LockMap<Arc<str>, ()>>,
         image_dir: &str,
         cache_dir: &str,
         auth_key: [u8; 32],
     ) -> Result<impl Filter<Extract = (impl Reply,), Error = Infallible> + Clone> {
         routes(
             conn,
-            image_lock,
+            image_locks,
             &Arc::new(Options {
                 http_address: Some("0.0.0.0:0".parse()?),
                 https_address: None,
@@ -988,7 +987,7 @@ mod test {
             auth_key,
             conn,
             routes,
-            image_lock,
+            image_locks,
             image_dir,
             cache_dir,
             info,
@@ -1038,7 +1037,7 @@ mod test {
         assert_eq!(response.earliest_start, None);
         assert!(response.images.is_empty());
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
+        sync::sync(&conn, &image_locks, image_dir, cache_dir, false, false).await?;
 
         // Let's add an anonymous user to to DB.
 
@@ -1048,7 +1047,7 @@ mod test {
 
         // Re-generate routes since that's what checks the DB for an anonymous user.
 
-        let routes = make_routes(&conn, &image_lock, image_dir, cache_dir, auth_key).await?;
+        let routes = make_routes(&conn, &image_locks, image_dir, cache_dir, auth_key).await?;
 
         // Now that we've added an anonymous user to the DB, missing authorization header should `OK` yield from
         // /images, but with an empty response since no images have been tagged "public" yet.
@@ -1915,7 +1914,7 @@ mod test {
             auth_key,
             conn,
             routes,
-            image_lock,
+            image_locks,
             image_dir,
             cache_dir,
             info,
@@ -1925,7 +1924,7 @@ mod test {
 
         // Sync with the filesystem, specifying `deduplicate = false`
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
+        sync::sync(&conn, &image_locks, image_dir, cache_dir, false, false).await?;
 
         // GET /images with no query parameters and with a filter-less token should yield all the images, with no
         // images marked as duplicates
@@ -1975,7 +1974,7 @@ mod test {
 
         // Sync with the filesystem again, specifying `deduplicate = true` this time
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, true).await?;
+        sync::sync(&conn, &image_locks, image_dir, cache_dir, false, true).await?;
 
         // This time, GET /images should yield all the images, with the last `DUPLICATE_IMAGE_COUNT +
         // DUPLICATE_VIDEO_COUNT` items deduplicated (i.e. all duplicates with lower resolutions become subordinate
@@ -2097,13 +2096,13 @@ mod test {
             auth_key,
             conn,
             routes,
-            image_lock,
+            image_locks,
             image_dir,
             cache_dir,
             ..
         } = init().await?;
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
+        sync::sync(&conn, &image_locks, image_dir, cache_dir, false, false).await?;
 
         let token = make_token(&auth_key)?;
 
@@ -2273,13 +2272,13 @@ mod test {
             auth_key,
             conn,
             routes,
-            image_lock,
+            image_locks,
             image_dir,
             cache_dir,
             ..
         } = init().await?;
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
+        sync::sync(&conn, &image_locks, image_dir, cache_dir, false, false).await?;
 
         let token = make_token(&auth_key)?;
 
@@ -2328,7 +2327,7 @@ mod test {
 
         // Re-generate routes since that's what checks the DB for an anonymous user.
 
-        let routes = make_routes(&conn, &image_lock, image_dir, cache_dir, auth_key).await?;
+        let routes = make_routes(&conn, &image_locks, image_dir, cache_dir, auth_key).await?;
 
         // Now that we've added an anonymous user to the DB, GET /tags with no authorization header should yield
         // `OK` but no tags since no images have been tagged "public" yet.
@@ -2741,13 +2740,13 @@ mod test {
             auth_key,
             conn,
             routes,
-            image_lock,
+            image_locks,
             image_dir,
             cache_dir,
             info,
         } = init().await?;
 
-        sync::sync(&conn, &image_lock, image_dir, cache_dir, false, false).await?;
+        sync::sync(&conn, &image_locks, image_dir, cache_dir, false, false).await?;
 
         let token = make_token(&auth_key)?;
 

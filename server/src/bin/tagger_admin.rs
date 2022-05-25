@@ -3,10 +3,10 @@
 use {
     anyhow::Result,
     futures::stream::TryStreamExt,
+    std::{ops::Deref, sync::Arc},
     structopt::StructOpt,
-    tagger_server::{FileData, Item, ItemData},
+    tagger_server::{FileData, Item, ItemData, LockMap},
     tagger_shared::{tag_expression::TagExpression, ImageKey, ImagesQuery},
-    tokio::sync::RwLock as AsyncRwLock,
 };
 
 #[derive(StructOpt, Debug)]
@@ -122,11 +122,11 @@ async fn main() -> Result<()> {
         } => {
             let mut conn = tagger_server::open(&state_file).await?;
 
-            let image_lock = AsyncRwLock::new(());
+            let image_locks = LockMap::default();
 
             if let Some(hash) = hash {
                 tagger_server::preload_cache_all(
-                    &image_lock,
+                    &image_locks,
                     &image_directory,
                     &cache_directory,
                     sqlx::query!(
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
                 .await
             } else {
                 tagger_server::preload_cache_all(
-                    &image_lock,
+                    &image_locks,
                     &image_directory,
                     &cache_directory,
                     sqlx::query!(
@@ -183,7 +183,7 @@ async fn main() -> Result<()> {
         } => {
             let mut conn = tagger_server::open(&state_file).await?;
 
-            let image_lock = AsyncRwLock::new(());
+            let image_locks = LockMap::default();
 
             let mut items = Vec::new();
 
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
                 .await?
                 {
                     let perceptual_hash = tagger_server::perceptual_hash(
-                        &image_lock,
+                        image_locks.get(Arc::from(hash.as_str())).await.deref(),
                         &image_directory,
                         &cache_directory,
                         &hash,
@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
             }
 
             let groups = tagger_server::deduplicate(
-                &image_lock,
+                &image_locks,
                 &image_directory,
                 &cache_directory,
                 &items.iter().collect(),

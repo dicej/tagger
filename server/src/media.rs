@@ -4,6 +4,7 @@
 
 use {
     crate::{
+        lock_map::LockMap,
         warp_util::{HttpDate, HttpError, Ranges},
         BUFFER_SIZE,
     },
@@ -26,9 +27,10 @@ use {
         hash::{Hash, Hasher},
         io::{Seek, SeekFrom, Write},
         mem,
-        ops::DerefMut,
+        ops::{Deref, DerefMut},
         path::{Path, PathBuf},
         str::FromStr,
+        sync::Arc,
         time::Duration,
     },
     tagger_shared::{Size, Variant},
@@ -337,7 +339,7 @@ pub fn group_similar<'a>(similar: HashMap<&'a Item, HashSet<&'a Item>>) -> Vec<H
 ///
 /// Each group in the result will be sorted from highest quality to lowest quality.
 pub async fn deduplicate<'a>(
-    image_lock: &AsyncRwLock<()>,
+    image_locks: &LockMap<Arc<str>, ()>,
     image_dir: &str,
     cache_dir: &str,
     potential_duplicates: &HashSet<&'a Item>,
@@ -357,7 +359,12 @@ pub async fn deduplicate<'a>(
                     &webp::Decoder::new(
                         &content(
                             &mut thumbnail(
-                                Some(image_lock),
+                                Some(
+                                    image_locks
+                                        .get(Arc::from(item.data.hash.as_str()))
+                                        .await
+                                        .deref(),
+                                ),
                                 image_dir,
                                 &item.data.file.path,
                                 cache_dir,
@@ -600,14 +607,20 @@ pub async fn perceptual_hash(
 ///
 /// See also [preload_cache].
 pub async fn preload_cache_all(
-    image_lock: &AsyncRwLock<()>,
+    image_locks: &LockMap<Arc<str>, ()>,
     image_dir: &str,
     cache_dir: &str,
     mut images: impl Stream<Item = Result<ItemData, sqlx::Error>> + Unpin,
 ) -> Result<()> {
     while let Some(item) = images.try_next().await? {
-        if let Err(e) =
-            preload_cache(image_lock, image_dir, &item.file, cache_dir, &item.hash).await
+        if let Err(e) = preload_cache(
+            image_locks.get(Arc::from(item.hash.as_str())).await.deref(),
+            image_dir,
+            &item.file,
+            cache_dir,
+            &item.hash,
+        )
+        .await
         {
             tracing::warn!("error preloading cache for {}: {e:?}", item.hash);
         }

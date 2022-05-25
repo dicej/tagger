@@ -3,6 +3,7 @@
 
 use {
     crate::{
+        lock_map::LockMap,
         media::{
             self, FileData, Item, ItemData, PerceptualHash, JPEG_EXTENSIONS, MPEG4_EXTENSIONS,
             PERCEPTUAL_HASH_LENGTH,
@@ -21,15 +22,16 @@ use {
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         convert::{TryFrom, TryInto},
         fs::File,
-        ops::DerefMut,
+        ops::{Deref, DerefMut},
         path::{Path, PathBuf},
         str::FromStr,
+        sync::Arc,
         time::Instant,
     },
     tokio::{
         fs::{self, File as AsyncFile},
         io::{AsyncRead, AsyncReadExt},
-        sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock},
+        sync::Mutex as AsyncMutex,
         task,
     },
     tracing::{info, warn},
@@ -290,7 +292,7 @@ fn group_similar(items: &[Item]) -> Vec<HashSet<&Item>> {
 /// least one `dirty` item in it, recording the results in the database.
 async fn deduplicate_dirty(
     conn: &AsyncMutex<SqliteConnection>,
-    image_lock: &AsyncRwLock<()>,
+    image_locks: &LockMap<Arc<str>, ()>,
     image_dir: &str,
     cache_dir: &str,
     mut dirty: HashMap<String, Item>,
@@ -334,7 +336,7 @@ async fn deduplicate_dirty(
                 .join(", ")
         );
 
-        let duplicates = media::deduplicate(image_lock, image_dir, cache_dir, &similar)
+        let duplicates = media::deduplicate(image_locks, image_dir, cache_dir, &similar)
             .await
             .unwrap_or_else(|e| {
                 warn!(
@@ -433,7 +435,7 @@ async fn deduplicate_dirty(
 /// newly added), calculate their p-hashes, and look for duplicates among all files which have similar p-hashes.
 async fn deduplicate(
     conn: &AsyncMutex<SqliteConnection>,
-    image_lock: &AsyncRwLock<()>,
+    image_locks: &LockMap<Arc<str>, ()>,
     image_dir: &str,
     cache_dir: &str,
 ) -> Result<DeduplicationSummary> {
@@ -478,7 +480,7 @@ async fn deduplicate(
 
             (
                 media::perceptual_hash(
-                    image_lock,
+                    image_locks.get(Arc::from(row.hash.as_str())).await.deref(),
                     image_dir,
                     cache_dir,
                     &row.hash,
@@ -531,7 +533,7 @@ async fn deduplicate(
         })
     } else {
         // Found new items -- recalculate duplicates accordingly.
-        deduplicate_dirty(conn, image_lock, image_dir, cache_dir, dirty, all).await
+        deduplicate_dirty(conn, image_locks, image_dir, cache_dir, dirty, all).await
     }
 }
 
@@ -548,7 +550,7 @@ async fn deduplicate(
 /// * Optionally comparing new files with each other and existing files to identify duplicates
 pub async fn sync(
     conn: &AsyncMutex<SqliteConnection>,
-    image_lock: &AsyncRwLock<()>,
+    image_locks: &LockMap<Arc<str>, ()>,
     image_dir: &str,
     cache_dir: &str,
     preload: bool,
@@ -661,7 +663,7 @@ pub async fn sync(
 
             if preload {
                 if let Err(e) = media::preload_cache(
-                    image_lock,
+                    image_locks.get(Arc::from(hash.as_str())).await.deref(),
                     image_dir,
                     &FileData {
                         path,
@@ -737,7 +739,7 @@ pub async fn sync(
 
         let then = Instant::now();
 
-        let summary = crate::sync::deduplicate(conn, image_lock, image_dir, cache_dir).await?;
+        let summary = crate::sync::deduplicate(conn, image_locks, image_dir, cache_dir).await?;
 
         info!(
             "deduplication took {:?} (checked {} items; found {} duplicates)",
