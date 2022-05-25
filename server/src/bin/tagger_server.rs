@@ -136,13 +136,17 @@ async fn main() -> Result<()> {
                     .collect::<Vec<_>>()
                     .await;
 
-                    tagger_server::preload_cache_all(
+                    let errors = tagger_server::preload_cache_all(
                         &image_locks,
                         &options.image_directory,
                         &options.cache_directory,
                         stream::iter(images),
                     )
                     .await?;
+
+                    for (item, _) in errors {
+                        tagger_server::mark_bad(&conn, &item.hash).await?;
+                    }
                 }
 
                 sync_loop(options, conn, image_locks, restart_tx).await

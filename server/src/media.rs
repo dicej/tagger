@@ -611,7 +611,9 @@ pub async fn preload_cache_all(
     image_dir: &str,
     cache_dir: &str,
     mut images: impl Stream<Item = Result<ItemData, sqlx::Error>> + Unpin,
-) -> Result<()> {
+) -> Result<Vec<(ItemData, Error)>> {
+    let mut errors = Vec::new();
+
     while let Some(item) = images.try_next().await? {
         if let Err(e) = preload_cache(
             image_locks.get(Arc::from(item.hash.as_str())).await.deref(),
@@ -623,10 +625,12 @@ pub async fn preload_cache_all(
         .await
         {
             tracing::warn!("error preloading cache for {}: {e:?}", item.hash);
+
+            errors.push((item, e));
         }
     }
 
-    Ok(())
+    Ok(errors)
 }
 
 /// Generate any missing thumbnail and preview artifacts for each of the specified item.

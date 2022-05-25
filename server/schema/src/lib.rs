@@ -12,10 +12,6 @@
 #![deny(warnings)]
 
 pub static DDL_STATEMENTS: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS paths (
-       path            TEXT NOT NULL PRIMARY KEY,
-       hash            TEXT NOT NULL
-     )",
     "CREATE TABLE IF NOT EXISTS bad_paths (
        path            TEXT NOT NULL PRIMARY KEY
      )",
@@ -26,6 +22,12 @@ pub static DDL_STATEMENTS: &[&str] = &[
        perceptual_hash TEXT,
        duplicate_group TEXT,
        duplicate_index INTEGER
+     )",
+    "CREATE TABLE IF NOT EXISTS paths (
+       path            TEXT NOT NULL PRIMARY KEY,
+       hash            TEXT NOT NULL,
+
+       FOREIGN KEY (hash) REFERENCES images(hash) ON DELETE CASCADE
      )",
     "CREATE TABLE IF NOT EXISTS tags (
        hash            TEXT NOT NULL,

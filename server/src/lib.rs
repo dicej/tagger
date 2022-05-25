@@ -65,7 +65,7 @@ pub use {
         deduplicate, perceptual_hash, preload_cache, preload_cache_all, FileData, Item, ItemData,
         PerceptualHash, PerceptualOrdinal,
     },
-    sync::sync,
+    sync::{mark_bad, sync},
 };
 
 mod auth;

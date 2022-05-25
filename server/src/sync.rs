@@ -11,17 +11,24 @@ use {
         BUFFER_SIZE,
     },
     anyhow::{anyhow, Error, Result},
-    chrono::{DateTime, Datelike, NaiveDateTime, Utc},
-    futures::{future::BoxFuture, FutureExt, TryStreamExt},
+    chrono::{DateTime, Datelike, Duration, NaiveDateTime, Utc},
+    futures::{
+        future::{self, BoxFuture},
+        FutureExt, TryStreamExt,
+    },
     lazy_static::lazy_static,
     regex::Regex,
     rexiv2::Metadata as ExifMetadata,
+    serde::{Deserialize as _, Deserializer},
+    serde_derive::Deserialize,
     sha2::{Digest, Sha256},
     sqlx::{Connection, SqliteConnection},
     std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         convert::{TryFrom, TryInto},
+        fmt::Display,
         fs::File,
+        io::BufReader,
         ops::{Deref, DerefMut},
         path::{Path, PathBuf},
         str::FromStr,
@@ -36,6 +43,50 @@ use {
     },
     tracing::{info, warn},
 };
+
+lazy_static! {
+    /// Timestamp to use when either none can be found in the file's metadata or when the metadata one is clearly
+    /// wrong (e.g. far in the future)
+    static ref DEFAULT_DATETIME: DateTime<Utc> =
+        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc);
+}
+
+/// Deserialize a `T` from the specified `deserializer` by expecting a string and parsing that string.
+fn from_string<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    <T as FromStr>::Err: Display,
+{
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+/// Represents a timestamp object from metadata found in a Google Photos [export](https://takeout.google.com/)
+///
+/// See also [GooglePhotoMetadata].
+#[derive(Deserialize, Debug, Copy, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTimestamp {
+    /// Number of seconds since 1970 UTC
+    #[serde(deserialize_with = "from_string")]
+    timestamp: i64,
+}
+
+/// Represents metadata found in a Google Photos [export](https://takeout.google.com/)
+///
+/// The metadata for each item in a Google Photos export is stored in a JSON file.  For the time being, we only
+/// care about the timestamp(s) in that file.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GooglePhotoMetadata {
+    /// When the photo was taken, if known
+    photo_taken_time: Option<GoogleTimestamp>,
+
+    /// When the file was created, which may be later than `photo_taken_time` if the file has been copied
+    creation_time: Option<GoogleTimestamp>,
+}
 
 /// Calculate the SHA-256 hash of the specified `input` and return the result as a hex-encoded string.
 async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<String> {
@@ -61,7 +112,7 @@ async fn hash(input: &mut (dyn AsyncRead + Unpin + Send + 'static)) -> Result<St
 }
 
 /// Represents metadata for a given media item
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct Metadata {
     /// Creation time for the item (e.g. Exif.Image.DateTimeOriginal)
     datetime: DateTime<Utc>,
@@ -151,6 +202,48 @@ fn mp4_metadata(path: &Path) -> Result<Metadata> {
     })
 }
 
+/// Attempt to find the timestamp for the specified `path` in a Google Photo export metadata file.
+///
+/// See also [GooglePhotoMetadata].
+fn google_datetime(path: &Path) -> Option<DateTime<Utc>> {
+    let mut path = path.to_path_buf();
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(".json");
+    path.set_file_name(name);
+
+    let metadata =
+        serde_json::from_reader::<_, GooglePhotoMetadata>(BufReader::new(File::open(&path).ok()?))
+            .ok()?;
+
+    metadata
+        .photo_taken_time
+        .or(metadata.creation_time)
+        .map(|GoogleTimestamp { timestamp }| {
+            DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc)
+        })
+}
+
+/// Check the specified `metadata` for an obviously incorrect timestamp and change it to 1970-01-01 if so,
+/// returning the result.
+///
+/// A timestamp is considered obviously incorrect if e.g. it is in the far future.
+fn validate_metadata(mut metadata: Metadata) -> Metadata {
+    // Currently, we consider any date in 1970 and any date more than a year in the future to be invalid.
+    if metadata.datetime != *DEFAULT_DATETIME
+        && (metadata.datetime.year() == 1970
+            || metadata.datetime > (Utc::now() + Duration::days(366)))
+    {
+        warn!(
+            "metadata datetime {} out of range; using default: {}",
+            metadata.datetime, *DEFAULT_DATETIME
+        );
+
+        metadata.datetime = *DEFAULT_DATETIME;
+    }
+
+    metadata
+}
+
 /// Recursively search the specified `dir` directory for JPEG and MPEG-4 media items, identifying any that aren't
 /// already in the database and attempting to extract metadata from them to be recorded in the database later.
 ///
@@ -161,7 +254,7 @@ fn mp4_metadata(path: &Path) -> Result<Metadata> {
 fn find_new<'a>(
     conn: &'a AsyncMutex<SqliteConnection>,
     root: &'a str,
-    result: &'a mut Vec<(String, Option<Metadata>)>,
+    result: &'a mut Vec<(String, Metadata)>,
     dir: impl AsRef<Path> + 'a + Send,
 ) -> BoxFuture<'a, Result<()>> {
     let dir_buf = dir.as_ref().to_path_buf();
@@ -206,29 +299,39 @@ fn find_new<'a>(
                             .is_some();
 
                             if !found_bad {
-                                let metadata = task::block_in_place(|| {
-                                    if MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext))
-                                    {
+                                let is_video =
+                                    MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext));
+
+                                let metadata = validate_metadata(task::block_in_place(|| {
+                                    if is_video {
                                         mp4_metadata(&path)
                                     } else {
                                         exif_metadata(&path)
                                     }
-                                });
+                                    .unwrap_or_else(|e| {
+                                        warn!(
+                                            "unable to get metadata for {}: {e:?}",
+                                            path.to_string_lossy()
+                                        );
 
-                                result.push((
-                                    stripped.to_string(),
-                                    match metadata {
-                                        Ok(data) => Some(data),
-                                        Err(e) => {
-                                            warn!(
-                                                "unable to get metadata for {}: {e:?}",
-                                                path.to_string_lossy()
-                                            );
+                                        Metadata {
+                                            datetime: google_datetime(&path)
+                                                .map(|value| {
+                                                    warn!(
+                                                        "using google metadata for {}: {value}",
+                                                        path.to_string_lossy()
+                                                    );
 
-                                            None
+                                                    value
+                                                })
+                                                .unwrap_or(*DEFAULT_DATETIME),
+
+                                            video_offset: if is_video { Some(0) } else { None },
                                         }
-                                    },
-                                ));
+                                    })
+                                }));
+
+                                result.push((stripped.to_string(), metadata));
                             }
                         }
                     }
@@ -593,45 +696,64 @@ pub async fn sync(
 
     // For each new file, atomically record it in the database.
 
-    for (index, (path, data)) in new.into_iter().enumerate() {
-        if let Some(data) = data {
-            let hash =
-                hash(&mut AsyncFile::open([image_dir, &path].iter().collect::<PathBuf>()).await?)
-                    .await?;
+    for (index, (path, mut data)) in new.into_iter().enumerate() {
+        let hash =
+            hash(&mut AsyncFile::open([image_dir, &path].iter().collect::<PathBuf>()).await?)
+                .await?;
 
-            info!(
-                "({} of {new_len}) insert {path} (hash {hash}; data {data:?})",
-                index + 1
-            );
+        info!(
+            "({} of {new_len}) insert {path} (hash {hash}; data {data:?})",
+            index + 1
+        );
 
-            conn.lock()
+        conn.lock()
             .await
             .transaction(|conn| {
                 let path = path.clone();
                 let hash = hash.clone();
-                let year = data.datetime.year();
-                let month = data.datetime.month();
-                let datetime = data.datetime.to_string();
-                let video_offset = data.video_offset;
-                let medium = match video_offset {
-                    None => "image",
-                    Some(0) => "video",
-                    Some(_) => "image-with-video",
-                };
 
                 async move {
+                    // If this image already exists in the database, use whichever timestamp is most recent.
+                    if let Some(row)
+                        = sqlx::query!("SELECT datetime FROM images WHERE hash = ?1", hash)
+                        .fetch_optional(&mut *conn).await?
+                    {
+                        let row_datetime = DateTime::<Utc>::from_str(&row.datetime)?;
+
+                        if row_datetime < data.datetime {
+                            let datetime = data.datetime.to_string();
+
+                            sqlx::query!(
+                                "UPDATE images SET datetime = ?1 WHERE hash = ?2", datetime, hash
+                            )
+                            .execute(&mut *conn)
+                            .await?;
+                        } else {
+                            data.datetime = row_datetime;
+                        }
+                    } else {
+                        let datetime = data.datetime.to_string();
+                        let video_offset = data.video_offset;
+
+                        sqlx::query!(
+                            "INSERT INTO images (hash, datetime, video_offset) VALUES (?1, ?2, ?3)",
+                            hash,
+                            datetime,
+                            video_offset
+                        )
+                        .execute(&mut *conn)
+                        .await?;
+                    }
+
                     sqlx::query!("INSERT INTO paths (path, hash) VALUES (?1, ?2)", path, hash)
                         .execute(&mut *conn)
                         .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO images (hash, datetime, video_offset) VALUES (?1, ?2, ?3)",
-                        hash,
-                        datetime,
-                        video_offset
-                    )
-                    .execute(&mut *conn)
-                    .await?;
+                    let medium = match data.video_offset {
+                        None => "image",
+                        Some(0) => "video",
+                        Some(_) => "image-with-video",
+                    };
 
                     sqlx::query!(
                         "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'medium', ?2)",
@@ -641,52 +763,67 @@ pub async fn sync(
                     .execute(&mut *conn)
                     .await?;
 
+                    // Given the logic above, we may need to change the year and month tags to a latter date.
+
                     sqlx::query!(
-                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'year', ?2)",
-                        hash,
-                        year
+                        "DELETE FROM tags WHERE (category = 'year' OR category = 'month') AND hash = ?1",
+                        hash
                     )
                     .execute(&mut *conn)
                     .await?;
 
-                    sqlx::query!(
-                        "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'month', ?2)",
-                        hash,
-                        month
-                    )
-                    .execute(&mut *conn)
-                    .await
+                    if data.datetime != *DEFAULT_DATETIME {
+                        let year = data.datetime.year();
+
+                        sqlx::query!(
+                            "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'year', ?2)",
+                            hash,
+                            year
+                        )
+                        .execute(&mut *conn)
+                        .await?;
+
+                        let month = data.datetime.month();
+
+                        sqlx::query!(
+                            "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'month', ?2)",
+                            hash,
+                            month
+                        )
+                        .execute(&mut *conn)
+                        .await?;
+                    } else {
+                        sqlx::query!(
+                            "INSERT OR IGNORE INTO tags (hash, category, tag) VALUES (?1, 'year', 'unknown')",
+                            hash
+                        )
+                        .execute(&mut *conn)
+                        .await?;
+                    }
+
+                    Ok::<_, Error>(())
                 }
                 .boxed()
             })
-                .await?;
+            .await?;
 
-            if preload {
-                if let Err(e) = media::preload_cache(
-                    image_locks.get(Arc::from(hash.as_str())).await.deref(),
-                    image_dir,
-                    &FileData {
-                        path,
-                        video_offset: data.video_offset,
-                    },
-                    cache_dir,
-                    &hash,
-                )
-                .await
-                {
-                    warn!("error preloading cache for {hash}: {e:?}");
-                }
+        if preload {
+            if let Err(e) = media::preload_cache(
+                image_locks.get(Arc::from(hash.as_str())).await.deref(),
+                image_dir,
+                &FileData {
+                    path,
+                    video_offset: data.video_offset,
+                },
+                cache_dir,
+                &hash,
+            )
+            .await
+            {
+                warn!("error preloading cache for {hash}: {e:?}");
+
+                mark_bad(conn, &hash).await?;
             }
-        } else {
-            // Files for which we could not extract metadata are excluded from further consideration, i.e. we
-            // assume they will never change and thus will never have the metadata we need to sort and display them
-            // in this application.
-
-            info!("({} of {new_len}) insert bad path {path}", index + 1);
-
-            sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
-                .execute(conn.lock().await.deref_mut())
-                .await?;
         }
     }
 
@@ -750,4 +887,41 @@ pub async fn sync(
     }
 
     Ok(())
+}
+
+/// Move any and all paths for the specified item from the `paths` table to the `bad_paths` table and delete the
+/// item from the `images` table.
+///
+/// This is the appropriate function to call if a file cannot be parsed; it ensures that we won't try again later,
+/// e.g. on server restart.
+pub async fn mark_bad(conn: &AsyncMutex<SqliteConnection>, hash: &str) -> Result<()> {
+    warn!("marking {hash} as bad");
+
+    conn.lock()
+        .await
+        .transaction(|conn| {
+            let hash = hash.to_owned();
+
+            async move {
+                let paths = sqlx::query!("SELECT path FROM paths WHERE hash = ?1", hash)
+                    .fetch(&mut *conn)
+                    .and_then(|row| future::ok(row.path))
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                sqlx::query!("DELETE FROM images WHERE hash = ?1", hash)
+                    .execute(&mut *conn)
+                    .await?;
+
+                for path in paths {
+                    sqlx::query!("INSERT INTO bad_paths (path) VALUES (?1)", path)
+                        .execute(&mut *conn)
+                        .await?;
+                }
+
+                Ok::<_, Error>(())
+            }
+            .boxed()
+        })
+        .await
 }
