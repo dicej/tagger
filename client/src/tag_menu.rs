@@ -227,8 +227,6 @@ pub struct TagMenuCommonProps {
 
     /// The path which identifies the subtree of `filter` which this (sub)menu represents
     pub filter_chain: List<Tag>,
-
-    pub show_menu: Signal<bool>,
 }
 
 /// Properties for populating and rendering the `TagSubMenu` component
@@ -255,7 +253,6 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
                 client,
                 filter,
                 filter_chain,
-                show_menu,
             },
         tag,
     } = props;
@@ -273,7 +270,6 @@ fn tag_sub_menu(props: TagSubMenuProps) -> View<G> {
                     client: client.clone(),
                     filter: filter.clone(),
                     filter_chain: filter_chain.clone(),
-                    show_menu: show_menu.clone(),
                 },
                 tags: client.watch_tags(
                     Signal::new(to_tree(&filter_chain, filter.get().deref())).into_handle(),
@@ -342,7 +338,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 client,
                 filter,
                 filter_chain,
-                show_menu,
             },
         tags,
         category,
@@ -372,7 +367,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let tags = tags.clone();
                 let client = client.clone();
                 let filter = filter.clone();
-                let show_menu = show_menu.clone();
 
                 move |category| {
                     let tag_menu = TagMenuProps {
@@ -380,7 +374,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                             client: client.clone(),
                             filter: filter.clone(),
                             filter_chain: filter_chain.clone(),
-                            show_menu: show_menu.clone(),
                         },
                         tags: tags.clone(),
                         category: Some(category.clone()),
@@ -442,7 +435,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                     client: client.clone(),
                     filter: filter.clone(),
                     filter_chain: filter_chain.clone(),
-                    show_menu: show_menu.clone(),
                 },
                 tag: tag.clone(),
             };
@@ -460,7 +452,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let filter = filter.clone();
                 let filter_state = filter_state.clone();
                 let tag = tag.clone();
-                let show_menu = show_menu.clone();
 
                 move |_| {
                     let mut new_filter = filter.get().deref().clone();
@@ -473,8 +464,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
 
                         filter.set(new_filter);
                     }
-
-                    show_menu.set(false);
                 }
             };
 
@@ -483,7 +472,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
                 let filter = filter.clone();
                 let filter_state = filter_state.clone();
                 let tag = tag.clone();
-                let show_menu = show_menu.clone();
 
                 move |_| {
                     let mut new_filter = filter.get().deref().clone();
@@ -496,8 +484,6 @@ pub fn tag_menu(props: TagMenuProps) -> View<G> {
 
                         filter.set(new_filter);
                     }
-
-                    show_menu.set(false);
                 }
             };
 

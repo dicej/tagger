@@ -312,7 +312,6 @@ pub fn toolbar(props: ToolbarProps) -> View<G> {
             client,
             filter: filter.clone(),
             filter_chain: List::Nil,
-            show_menu: show_menu.clone(),
         },
         tags,
         category: None,
