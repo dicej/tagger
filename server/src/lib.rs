@@ -63,6 +63,7 @@ use {
 
 pub use {
     auth::hash_password,
+    images::images,
     media::{
         deduplicate, perceptual_hash, preload_cache, preload_cache_all, FileData, Item, ItemData,
         PerceptualHash, PerceptualOrdinal,

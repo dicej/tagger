@@ -5,7 +5,7 @@ use {
     futures::stream::TryStreamExt,
     structopt::StructOpt,
     tagger_server::{FileData, Item, ItemData},
-    tagger_shared::tag_expression::TagExpression,
+    tagger_shared::{tag_expression::TagExpression, ImageKey, ImagesQuery},
     tokio::sync::RwLock as AsyncRwLock,
 };
 
@@ -62,6 +62,24 @@ enum Command {
 
         /// Image hashes to analyze
         hashes: Vec<String>,
+    },
+
+    /// Query for media items using the same logic as the GET /images route of the HTTP server
+    Images {
+        /// SQLite database to create or reuse
+        state_file: String,
+
+        /// See [tagger_shared::ImagesQuery::start]
+        #[structopt(long)]
+        start: Option<ImageKey>,
+
+        /// See [tagger_shared::ImagesQuery::limit]
+        #[structopt(long)]
+        limit: Option<u32>,
+
+        /// See [tagger_shared::ImagesQuery::filter]
+        #[structopt(long)]
+        filter: Option<TagExpression>,
     },
 }
 
@@ -223,6 +241,28 @@ async fn main() -> Result<()> {
             .await?;
 
             println!("{groups:#?}");
+        }
+
+        Command::Images {
+            state_file,
+            start,
+            limit,
+            filter,
+        } => {
+            let mut conn = tagger_server::open(&state_file).await?;
+
+            println!(
+                "{:#?}",
+                tagger_server::images(
+                    &mut conn,
+                    &ImagesQuery {
+                        start,
+                        limit,
+                        filter
+                    }
+                )
+                .await?
+            );
         }
     }
 

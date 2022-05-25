@@ -105,29 +105,42 @@ pub async fn images(conn: &mut SqliteConnection, query: &ImagesQuery) -> Result<
 
     let mut builder = ImagesResponseBuilder::new(query.start.clone(), limit);
 
-    for (mut key, (ref row, duplicate_group)) in row_map.iter().rev() {
+    for (key, (ref row, duplicate_group)) in row_map.iter().rev() {
         let mut row = row;
         let mut my_duplicates = Vec::new();
+        let mut key = key.clone();
 
         if let Some(duplicate_group) = &duplicate_group {
+            // If this item is part of a duplicate group, only consider the highest quality file of the group.
+
             if duplicates_seen.contains(duplicate_group) {
+                // We've already considered this duplicate group -- don't look at it again.
                 continue;
             } else if let Some(duplicates) = duplicates.get(duplicate_group) {
+                // This is the first time we've considered this duplicate group -- use the highest quality file,
+                // but use the most recent timestamp if the timestamps differ among the files.
+
                 duplicates_seen.insert(duplicate_group.clone());
 
                 let mut iter = duplicates.values();
 
-                key = iter.next().unwrap();
+                let best_key = iter.next().unwrap();
 
-                row = &row_map.get(key).unwrap().0;
+                key = ImageKey {
+                    hash: best_key.hash.clone(),
+                    datetime: key.datetime,
+                };
 
+                row = &row_map.get(best_key).unwrap().0;
+
+                // Remember that we've already seen this duplicate group so we don't try to look at it again.
                 my_duplicates = iter
                     .map(|key| key.hash.clone().unwrap())
                     .collect::<Vec<_>>();
             }
         }
 
-        builder.consider::<Error, _>(key, || {
+        builder.consider::<Error, _>(&key, || {
             Ok(ImageData {
                 hash: key.hash.clone().unwrap(),
 
