@@ -223,25 +223,61 @@ fn google_datetime(path: &Path) -> Option<DateTime<Utc>> {
         })
 }
 
-/// Check the specified `metadata` for an obviously incorrect timestamp and change it to 1970-01-01 if so,
-/// returning the result.
+/// Generate a [Metadata] object for the specified file.
 ///
-/// A timestamp is considered obviously incorrect if e.g. it is in the far future.
-fn validate_metadata(mut metadata: Metadata) -> Metadata {
-    // Currently, we consider any date in 1970 and any date more than a year in the future to be invalid.
-    if metadata.datetime != *DEFAULT_DATETIME
-        && (metadata.datetime.year() == 1970
-            || metadata.datetime > (Utc::now() + Duration::days(366)))
-    {
-        warn!(
-            "metadata datetime {} out of range; using default: {}",
-            metadata.datetime, *DEFAULT_DATETIME
-        );
+/// We attempt to determine the creation timestamp in the following order:
+///
+/// 1. Check the metadata inside the file (e.g. EXIF or MPEG-4 metadata).
+///
+/// 2. Check for Google Photo metadata (see [GooglePhotoMetadata]).
+///
+/// 3. Try to extract the date from the filename.
+///
+/// 4. If all else fails, use [DEFAULT_DATETIME], which will result in a "year:unknown" tag being added later.
+fn metadata_for(path: &Path) -> Metadata {
+    let lowercase = path.file_name().unwrap().to_str().unwrap().to_lowercase();
 
-        metadata.datetime = *DEFAULT_DATETIME;
+    let is_video = MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext));
+
+    lazy_static! {
+        static ref DATE_TIME_PATTERN: Regex =
+            Regex::new(r".*(?:(?:img)|(?:vid))[-_](\d{4})(\d{2})(\d{2})[-_].*").unwrap();
     }
 
-    metadata
+    fn validate(datetime: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        // Currently, we consider any date in 1970 and any date more than a year in the future to be invalid.
+        if datetime.year() == 1970 || datetime > (Utc::now() + Duration::days(366)) {
+            None
+        } else {
+            Some(datetime)
+        }
+    }
+
+    task::block_in_place(|| {
+        let mut metadata = if is_video {
+            mp4_metadata(path)
+        } else {
+            exif_metadata(path)
+        }
+        .unwrap_or(Metadata {
+            datetime: *DEFAULT_DATETIME,
+            video_offset: if is_video { Some(0) } else { None },
+        });
+
+        metadata.datetime = validate(metadata.datetime)
+            .or_else(|| google_datetime(path))
+            .and_then(validate)
+            .or_else(|| {
+                DATE_TIME_PATTERN
+                    .captures(&lowercase)
+                    .map(|c| format!("{}-{}-{}T00:00:00Z", &c[1], &c[2], &c[3]))
+                    .and_then(|string| string.parse().ok())
+            })
+            .and_then(validate)
+            .unwrap_or(*DEFAULT_DATETIME);
+
+        metadata
+    })
 }
 
 /// Recursively search the specified `dir` directory for JPEG and MPEG-4 media items, identifying any that aren't
@@ -260,6 +296,10 @@ fn find_new<'a>(
     let dir_buf = dir.as_ref().to_path_buf();
 
     async move {
+        if dir_buf.ends_with(".thumbnails") {
+            return Ok(());
+        }
+
         let mut dir = fs::read_dir(dir).await?;
 
         while let Some(entry) = dir.next_entry().await? {
@@ -271,7 +311,9 @@ fn find_new<'a>(
 
                     // Some android phones "hide" files which have been "deleted" by prepending a ".trashed-"
                     // prefix to them.  We assume here that users don't want to see those.
-                    if !lowercase.starts_with(".trashed-")
+                    //
+                    // Also, we assume files named "cover.jpg" are part of an e-book collection and should be skipped.
+                    if !(lowercase.starts_with(".trashed-") || lowercase == "cover.jpg")
                         && (MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext))
                             || JPEG_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext)))
                     {
@@ -299,39 +341,7 @@ fn find_new<'a>(
                             .is_some();
 
                             if !found_bad {
-                                let is_video =
-                                    MPEG4_EXTENSIONS.iter().any(|&ext| lowercase.ends_with(ext));
-
-                                let metadata = validate_metadata(task::block_in_place(|| {
-                                    if is_video {
-                                        mp4_metadata(&path)
-                                    } else {
-                                        exif_metadata(&path)
-                                    }
-                                    .unwrap_or_else(|e| {
-                                        warn!(
-                                            "unable to get metadata for {}: {e:?}",
-                                            path.to_string_lossy()
-                                        );
-
-                                        Metadata {
-                                            datetime: google_datetime(&path)
-                                                .map(|value| {
-                                                    warn!(
-                                                        "using google metadata for {}: {value}",
-                                                        path.to_string_lossy()
-                                                    );
-
-                                                    value
-                                                })
-                                                .unwrap_or(*DEFAULT_DATETIME),
-
-                                            video_offset: if is_video { Some(0) } else { None },
-                                        }
-                                    })
-                                }));
-
-                                result.push((stripped.to_string(), metadata));
+                                result.push((stripped.to_string(), metadata_for(&path)));
                             }
                         }
                     }
