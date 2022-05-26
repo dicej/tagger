@@ -32,8 +32,14 @@ impl<K, V> LockMap<K, V> {
             return lock.clone();
         }
 
+        let mut write = self.0.write().await;
+
+        if let Some(lock) = write.get(&key) {
+            return lock.clone();
+        }
+
         let lock = Arc::<RwLock<V>>::default();
-        self.0.write().await.insert(key, lock.clone());
+        write.insert(key, lock.clone());
         lock
     }
 
