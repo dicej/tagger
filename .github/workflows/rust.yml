@@ -10,12 +10,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  check:
 
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v3
+    - name: Install gexiv2
+      run: |
+        apt update
+        apt install libgexiv2-dev libgexiv2-2
     - name: Clippy
       run: cargo clippy --all-features --all-targets
     - name: Run tests
