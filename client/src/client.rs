@@ -10,6 +10,7 @@ use {
     crate::State,
     anyhow::{anyhow, Error, Result},
     futures::TryFutureExt,
+    jsonwebtoken::{DecodingKey, Validation},
     reqwest::StatusCode,
     std::{ops::Deref, rc::Rc},
     sycamore::prelude::{self as syc, ReadSignal, Signal},
@@ -117,9 +118,16 @@ impl HttpClient {
 
             move || {
                 if let Some(token) = token.get().deref() {
-                    jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
-                        .map(|data| data.claims.may_patch)
-                        .unwrap_or(false)
+                    let mut validation = Validation::default();
+                    validation.insecure_disable_signature_validation();
+
+                    jsonwebtoken::decode::<Authorization>(
+                        token,
+                        &DecodingKey::from_secret(&[]),
+                        &validation,
+                    )
+                    .map(|data| data.claims.may_patch)
+                    .unwrap_or(false)
                 } else {
                     false
                 }
@@ -307,9 +315,16 @@ impl HttpClient {
     /// we may have a token with no subject claim, which means we aren't really logged in yet.
     pub fn login_status(&self) -> LoginStatus {
         let logged_in = if let Some(token) = self.token.get().deref() {
-            jsonwebtoken::dangerous_insecure_decode::<Authorization>(token)
-                .map(|data| data.claims.subject.is_some())
-                .unwrap_or(false)
+            let mut validation = Validation::default();
+            validation.insecure_disable_signature_validation();
+
+            jsonwebtoken::decode::<Authorization>(
+                token,
+                &DecodingKey::from_secret(&[]),
+                &validation,
+            )
+            .map(|data| data.claims.subject.is_some())
+            .unwrap_or(false)
         } else {
             false
         };
@@ -534,7 +549,14 @@ mod demo {
             let mut filter = Option::<TagExpression>::from(filter.get().deref());
 
             if let Some(token) = token.get().deref() {
-                if let Ok(auth) = jsonwebtoken::dangerous_insecure_decode::<Authorization>(token) {
+                let mut validation = Validation::default();
+                validation.insecure_disable_signature_validation();
+
+                if let Ok(auth) = jsonwebtoken::decode::<Authorization>(
+                    token,
+                    &DecodingKey::from_secret(&[]),
+                    &validation,
+                ) {
                     tagger_shared::maybe_wrap_filter(&mut filter, &auth.claims);
                 }
             }

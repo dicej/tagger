@@ -6,16 +6,16 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-anyhow = "1"
-serde = { version = "1", features = [ "rc" ] }
-serde_derive = "1"
-lalrpop-util = "0.19"
-regex-syntax = "0.6"
-lazy_static = "1"
-chrono = { version = "0.4", features = [ "serde" ] }
+anyhow = "1.0.58"
+serde = { version = "1.0.137", features = [ "rc" ] }
+serde_derive = "1.0.137"
+lalrpop-util = "0.19.8"
+regex-syntax = "0.6.26"
+lazy_static = "1.4.0"
+chrono = { version = "0.4.19", features = [ "serde" ] }
 
 [dev-dependencies]
-maplit = "1"
+maplit = "1.0.2"
 
 [build-dependencies]
-lalrpop = "0.19"
+lalrpop = "0.19.8"
