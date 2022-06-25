@@ -1,6 +1,6 @@
 use {
     anyhow::{anyhow, Result},
-    sqlx::{sqlite::SqliteConnectOptions, ConnectOptions},
+    sqlx::{sqlite::SqliteConnectOptions, ConnectOptions, Connection as _},
     std::env,
     tokio::fs,
 };
@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
     let mut path = env::current_dir()?;
     path.push("target");
 
-    let _ = fs::create_dir(&path);
+    let _ = fs::create_dir(&path).await;
 
     path.push("schema.dat");
 
@@ -27,6 +27,8 @@ async fn main() -> Result<()> {
     for statement in schema::DDL_STATEMENTS {
         sqlx::query(statement).execute(&mut conn).await?;
     }
+
+    conn.close().await?;
 
     println!("cargo:rustc-env=DATABASE_URL=sqlite://{db}");
 

@@ -16,11 +16,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Install gexiv2
+    - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libgexiv2-dev
+        sudo apt-get install -y libgexiv2-dev ffmpeg
     - name: Clippy
-      run: cargo clippy --all-features --all-targets
+      run: cargo clippy --release --all-features --all-targets
     - name: Run tests
-      run: cargo test --release
+      run: cargo test --release --all-features --all-targets
