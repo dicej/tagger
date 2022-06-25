@@ -7,7 +7,12 @@ use {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    for (key, value) in env::vars() {
+        eprintln!("env {key}: {value}");
+    }
+
     let mut path = env::current_dir()?;
+    eprintln!("current dir is {}", path.to_string_lossy());
     path.push("target");
 
     let _ = fs::create_dir(&path);
