@@ -25,7 +25,7 @@ serde = "1.0.138"
 serde_derive = "1.0.137"
 serde_json = "1.0.82"
 sha2 = "0.10.2"
-sqlx = { version = "0.5.13", features = [ "runtime-tokio-native-tls", "sqlite" ] }
+sqlx = { version = "0.6.0", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 structopt = "0.3.26"
 thiserror = "1.0.31"
 ring = "0.16.20"
@@ -48,5 +48,5 @@ maplit = "1.0.2"
 [build-dependencies]
 anyhow = "1.0.58"
 schema = { path = "./schema" }
-sqlx = { version = "0.5.13", features = [ "runtime-tokio-native-tls", "sqlite" ] }
+sqlx = { version = "0.6.0", features = [ "runtime-tokio-native-tls", "sqlite" ] }
 tokio = { version = "1.19.2", features = [ "macros", "rt-multi-thread", "fs" ] }
