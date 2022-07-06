@@ -10,7 +10,7 @@ anyhow = "1.0.58"
 serde = { version = "1.0.144", features = [ "rc" ] }
 serde_derive = "1.0.137"
 lalrpop-util = "0.19.8"
-regex-syntax = "0.6.26"
+regex-syntax = "0.6.27"
 lazy_static = "1.4.0"
 chrono = { version = "0.4.19", features = [ "serde" ] }
 
