@@ -138,7 +138,6 @@ pub struct FileData {
 /// Find and return `FileData` for one of the files where the item with the specified `hash` was found.
 ///
 /// There may be more than one such file in the database; this function will pick one arbitrarily.
-#[allow(clippy::eval_order_dependence)]
 async fn file_data(conn: &mut SqliteConnection, hash: &str) -> Result<FileData> {
     if let (Some(path), Some(image)) = (
         sqlx::query!("SELECT path FROM paths WHERE hash = ?1 LIMIT 1", hash)

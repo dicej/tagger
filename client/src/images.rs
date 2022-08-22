@@ -67,7 +67,7 @@ fn reset_video(event: Event) {
             // We (re)load the video here to force the poster image to be displayed (again)
             //
             // See https://stackoverflow.com/questions/14245644/html5-video-end-of-a-video-poster for details.
-            let _ = video.load();
+            video.load();
         }
     }
 }
