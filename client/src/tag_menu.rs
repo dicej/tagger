@@ -30,9 +30,9 @@ pub enum List<T> {
 /// For example, if the current filter is "year:2017 and state:hawaii", and some of the matching items also have
 /// tags like "city:honolulu" and "city:kailua-kona", then "city" would be one of the categories we'd return here,
 /// but "year" and "state" would not be since we're already filtering by those categories.
-fn find_categories<'a>(
+fn find_categories(
     filter_chain: &List<Tag>,
-    categories: &'a HashMap<Arc<str>, TagsResponse>,
+    categories: &HashMap<Arc<str>, TagsResponse>,
     result: &mut Vec<Arc<str>>,
 ) {
     for (category, tags) in categories {

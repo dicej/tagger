@@ -15,7 +15,7 @@
 //! * [images]: Container for viewing and interacting with media item previews
 //!
 //! * [image_overlay]: Overlay for viewing one high resolution media item at a time and browsing items sequentially
-//! (e.g. a lightbox)
+//!   (e.g. a lightbox)
 //!
 //! Additionally, there is the [client] module, which provides an API for communicating with the Tagger server.
 //!
@@ -236,10 +236,10 @@ pub struct State {
 /// This will do all of the following:
 ///
 /// * Attempt to authenticate with the Tagger server (which is assumed to be the same as the host from which the
-/// app was loaded)
+///   app was loaded)
 ///
 /// * Instantiate and wire up the reactive state for this app, using the "hash" portion of the URI to decode
-/// routing state, if present
+///   routing state, if present
 ///
 /// * Bind handlers for global keyboard events
 ///
