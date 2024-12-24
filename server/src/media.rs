@@ -979,7 +979,7 @@ async fn video_preview(
         let video_data = get_video_data(task::block_in_place(|| {
             let mut file = File::open(&full_path)?;
 
-            file.seek(SeekFrom::Start(offset.try_into().unwrap()))?;
+            file.seek(SeekFrom::Start(offset.try_into()?))?;
 
             mp4parse::read_mp4(&mut file).map_err(Error::from)
         })?);

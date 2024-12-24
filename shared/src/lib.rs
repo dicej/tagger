@@ -26,12 +26,12 @@ use {
 pub mod tag_expression;
 
 lalrpop_mod!(
-    #[allow(clippy::all)]
+    #[allow(clippy::all, dead_code)]
     tag_expression_grammar
 );
 
 lalrpop_mod!(
-    #[allow(clippy::all)]
+    #[allow(clippy::all, dead_code)]
     tag_tree_grammar
 );
 

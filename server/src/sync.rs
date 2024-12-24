@@ -11,7 +11,7 @@ use {
         BUFFER_SIZE,
     },
     anyhow::{anyhow, Error, Result},
-    chrono::{DateTime, Datelike, Duration, NaiveDateTime, Utc},
+    chrono::{DateTime, Datelike, Duration, Utc},
     futures::{
         future::{self, BoxFuture},
         FutureExt, TryStreamExt,
@@ -48,7 +48,7 @@ lazy_static! {
     /// Timestamp to use when either none can be found in the file's metadata or when the metadata one is clearly
     /// wrong (e.g. far in the future)
     static ref DEFAULT_DATETIME: DateTime<Utc> =
-        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc);
+        DateTime::<Utc>::from_naive_utc_and_offset(DateTime::from_timestamp(0, 0).unwrap().naive_utc(), Utc);
 }
 
 /// Deserialize a `T` from the specified `deserializer` by expecting a string and parsing that string.
@@ -185,8 +185,8 @@ fn mp4_metadata(path: &Path) -> Result<Metadata> {
     const SECONDS_FROM_1904_TO_1970: u64 = 2_082_844_800;
 
     Ok(Metadata {
-        datetime: DateTime::<Utc>::from_utc(
-            NaiveDateTime::from_timestamp(
+        datetime: DateTime::<Utc>::from_naive_utc_and_offset(
+            DateTime::from_timestamp(
                 mp4parse::read_mp4(&mut File::open(path)?)?
                     .creation
                     .ok_or_else(|| anyhow!("missing creation time"))?
@@ -195,7 +195,9 @@ fn mp4_metadata(path: &Path) -> Result<Metadata> {
                     .try_into()
                     .unwrap(),
                 0,
-            ),
+            )
+            .unwrap()
+            .naive_utc(),
             Utc,
         ),
         video_offset: Some(0),
@@ -219,7 +221,10 @@ fn google_datetime(path: &Path) -> Option<DateTime<Utc>> {
         .photo_taken_time
         .or(metadata.creation_time)
         .map(|GoogleTimestamp { timestamp }| {
-            DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp, 0), Utc)
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                DateTime::from_timestamp(timestamp, 0).unwrap().naive_utc(),
+                Utc,
+            )
         })
 }
 

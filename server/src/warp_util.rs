@@ -85,7 +85,7 @@ impl FromStr for Bearer {
 
 /// Represents a date parsed from e.g. an HTTP if-modified-since request header
 #[derive(Copy, Clone)]
-pub struct HttpDate(DateTime<Utc>);
+pub struct HttpDate(#[allow(dead_code)] DateTime<Utc>);
 
 impl FromStr for HttpDate {
     type Err = Error;
