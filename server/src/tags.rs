@@ -1,7 +1,7 @@
 //! This module provides two functions:
 //!
 //! * [tags]: handles GET /tags requests, which retrieve an optionally filtered list of tags currently applied to
-//! at least one media item
+//!   at least one media item
 //!
 //! * [apply]: handles PATCH /tags requests, which add and/or remove tags to/from media items
 

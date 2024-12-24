@@ -261,7 +261,7 @@ fn response() -> response::Builder {
 /// * `conn`: used to access the Tagger database
 ///
 /// * `image_locks`: used to control concurrent access to the cache directory, e.g. to avoid simultaneous reads and
-/// writes to cache files
+///   writes to cache files
 ///
 /// * `options`: server configuration -- see [Options] for details
 ///
@@ -937,7 +937,7 @@ mod test {
         let response = warp::test::request()
             .method("POST")
             .path("/token")
-            .body(&format!(
+            .body(format!(
                 "grant_type=password&username={user}&password=invalid+password"
             ))
             .reply(&routes)
@@ -952,7 +952,7 @@ mod test {
         let response = warp::test::request()
             .method("POST")
             .path("/token")
-            .body(&format!(
+            .body(format!(
                 "grant_type=password&username={user}&password={password}"
             ))
             .reply(&routes)
@@ -2830,7 +2830,7 @@ mod test {
                             .arg("-frames:v")
                             .arg("1")
                             .arg("-f")
-                            .arg("singlejpeg")
+                            .arg("mjpeg")
                             .arg("-")
                             .output()
                             .await?;

@@ -203,7 +203,7 @@ async fn still_image(image_dir: &str, path: &str) -> Result<(Vec<u8>, ImageForma
             .arg("-frames:v")
             .arg("1")
             .arg("-f")
-            .arg("singlejpeg")
+            .arg("mjpeg")
             .arg("-")
             .output()
             .await?;
@@ -331,7 +331,7 @@ pub fn group_similar<'a>(similar: HashMap<&'a Item, HashSet<&'a Item>>) -> Vec<H
         }
     }
 
-    groups_to_items.into_iter().map(|(_, v)| v).collect()
+    groups_to_items.into_values().collect()
 }
 
 /// Group `potential_duplicates` according to which ones appear to be duplicates of each other.
@@ -1133,11 +1133,10 @@ async fn thumbnail(
 
         {
             let orientation = ExifMetadata::new_from_buffer(&image)
-                .map(|metadata| {
+                .inspect(|metadata| {
                     let orientation = metadata.get_orientation();
                     metadata.clear();
                     metadata.set_orientation(orientation);
-                    metadata
                 })
                 .as_ref()
                 .map(|m| m.get_orientation())

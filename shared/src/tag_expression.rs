@@ -6,8 +6,8 @@
 //! * [TagExpression]: A boolean expression which may combine tags with AND, OR, and NOT operators
 //!
 //! * [TagTree]: A tree expression representing a disjunction of conjuctions, which may be converted to a
-//! `TagExpression` when needed.  This form is used in the Tagger client to allow the user to incrementally refine
-//! a filter using a hierarchical menu of tags.
+//!   `TagExpression` when needed.  This form is used in the Tagger client to allow the user to incrementally
+//!   refine a filter using a hierarchical menu of tags.
 
 use {
     crate::tag_expression_grammar::TagExpressionParser,

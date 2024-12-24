@@ -35,7 +35,7 @@ pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
         &mut hash,
     );
 
-    base64::encode(&hash)
+    base64::encode(hash)
 }
 
 /// Attempt to authenticate a user based on the credentials specified in `request`.
@@ -47,8 +47,8 @@ pub fn hash_password(salt: &[u8], secret: &[u8]) -> String {
 /// * `mutex`: used to bottleneck all calls to this method in order to mitigate parallel brute force attacks
 ///
 /// * `invalid_credential_delay`: minimum delay added to responses to invalid authentication requests.  Note that
-/// these delays will stack up if invalid requests are received more often than once per this interval, so the
-/// actual delay experienced by a given request may be much longer.
+///   these delays will stack up if invalid requests are received more often than once per this interval, so the
+///   actual delay experienced by a given request may be much longer.
 pub async fn authenticate(
     conn: &AsyncMutex<SqliteConnection>,
     request: &TokenRequest,
