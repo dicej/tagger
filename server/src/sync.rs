@@ -965,7 +965,7 @@ mod test {
     #[test]
     fn metadata_for_whatsapp_file() -> Result<()> {
         assert_eq!(
-            metadata_for(&Path::new("/does-not-exist/IMG-20210515-WA0004.jpg")).datetime,
+            metadata_for(Path::new("/does-not-exist/IMG-20210515-WA0004.jpg")).datetime,
             "2021-05-15T00:00:00Z".parse::<DateTime<Utc>>()?
         );
         Ok(())
@@ -974,7 +974,7 @@ mod test {
     #[test]
     fn metadata_for_kraken_sports_file() -> Result<()> {
         assert_eq!(
-            metadata_for(&Path::new("/does-not-exist/IMG-1748014806987.jpg")).datetime,
+            metadata_for(Path::new("/does-not-exist/IMG-1748014806987.jpg")).datetime,
             "2025-05-23T15:40:06.987Z".parse::<DateTime<Utc>>()?
         );
         Ok(())

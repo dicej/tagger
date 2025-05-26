@@ -782,9 +782,7 @@ fn audio_supported(entry: &SampleEntry) -> bool {
     static SUPPORTED_AUDIO_CODECS: &[CodecType] = &[CodecType::AAC, CodecType::MP3];
 
     if let SampleEntry::Audio(entry) = entry {
-        SUPPORTED_AUDIO_CODECS
-            .iter()
-            .any(|&codec| codec == entry.codec_type)
+        SUPPORTED_AUDIO_CODECS.contains(&entry.codec_type)
     } else {
         false
     }

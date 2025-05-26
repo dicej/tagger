@@ -781,20 +781,20 @@ mod test {
                         .try_into()
                         .unwrap(),
                 )
-                .chain(
-                    iter::repeat(MediumInfo {
+                .chain(iter::repeat_n(
+                    MediumInfo {
                         medium: TestMedium::Image,
                         color: duplicate_color,
-                    })
-                    .take(DUPLICATE_IMAGE_COUNT.try_into().unwrap()),
-                )
-                .chain(
-                    iter::repeat(MediumInfo {
+                    },
+                    DUPLICATE_IMAGE_COUNT.try_into().unwrap(),
+                ))
+                .chain(iter::repeat_n(
+                    MediumInfo {
                         medium: TestMedium::Video,
                         color: duplicate_color,
-                    })
-                    .take(DUPLICATE_VIDEO_COUNT.try_into().unwrap()),
-                )
+                    },
+                    DUPLICATE_VIDEO_COUNT.try_into().unwrap(),
+                ))
                 .enumerate()
                 .map(|(index, info)| ((index + 1).try_into().unwrap(), info))
                 .collect()
