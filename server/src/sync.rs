@@ -247,6 +247,8 @@ fn metadata_for(path: &Path) -> Metadata {
     lazy_static! {
         static ref DATE_TIME_PATTERN: Regex =
             Regex::new(r".*(?:(?:img)|(?:vid))[-_](\d{4})(\d{2})(\d{2})[-_].*").unwrap();
+        static ref UNIX_EPOCH_PATTERN: Regex =
+            Regex::new(r".*(?:(?:img)|(?:vid))[-_](\d{13})\..*").unwrap();
     }
 
     fn validate(datetime: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -277,6 +279,21 @@ fn metadata_for(path: &Path) -> Metadata {
                     .captures(&lowercase)
                     .map(|c| format!("{}-{}-{}T00:00:00Z", &c[1], &c[2], &c[3]))
                     .and_then(|string| string.parse().ok())
+            })
+            .and_then(validate)
+            .or_else(|| {
+                UNIX_EPOCH_PATTERN.captures(&lowercase).and_then(|c| {
+                    let millis = c[1].parse::<i64>().ok()?;
+                    Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                        DateTime::from_timestamp(
+                            millis / 1000,
+                            u32::try_from((millis % 1000) * 1_000_000).unwrap(),
+                        )
+                        .unwrap()
+                        .naive_utc(),
+                        Utc,
+                    ))
+                })
             })
             .and_then(validate)
             .unwrap_or(*DEFAULT_DATETIME);
@@ -939,4 +956,27 @@ pub async fn mark_bad(conn: &AsyncMutex<SqliteConnection>, hash: &str) -> Result
             .boxed()
         })
         .await
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn metadata_for_whatsapp_file() -> Result<()> {
+        assert_eq!(
+            metadata_for(&Path::new("/does-not-exist/IMG-20210515-WA0004.jpg")).datetime,
+            "2021-05-15T00:00:00Z".parse::<DateTime<Utc>>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_for_kraken_sports_file() -> Result<()> {
+        assert_eq!(
+            metadata_for(&Path::new("/does-not-exist/IMG-1748014806987.jpg")).datetime,
+            "2025-05-23T15:40:06.987Z".parse::<DateTime<Utc>>()?
+        );
+        Ok(())
+    }
 }
